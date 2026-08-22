@@ -1,21 +1,14 @@
-<p align="center">
-  <img src="docs/assets/hero.png" alt="Kiln" width="100%" />
-</p>
+![Kiln](https://raw.githubusercontent.com/Proxeno/kiln/main/docs/assets/hero.png)
 
-<h1 align="center">Kiln</h1>
+# Kiln
 
-<p align="center">
-  A pure-managed, SIMD-accelerated <b>H.264 baseline-profile encoder</b> for .NET,<br/>
-  built for real-time game streaming.
-</p>
+A pure-managed, SIMD-accelerated **H.264 baseline-profile encoder** for .NET, built for real-time game streaming.
 
-<p align="center">
-  <a href="https://github.com/Proxeno/kiln/actions/workflows/ci.yml"><img src="https://github.com/Proxeno/kiln/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://www.nuget.org/packages/Proxeno.Kiln"><img src="https://img.shields.io/nuget/v/Proxeno.Kiln" alt="NuGet version" /></a>
-  <a href="https://www.nuget.org/packages/Proxeno.Kiln"><img src="https://img.shields.io/nuget/dt/Proxeno.Kiln" alt="NuGet downloads" /></a>
-  <img src="https://img.shields.io/badge/license-Apache--2.0-e8912d" alt="Apache-2.0" />
-  <img src="https://img.shields.io/badge/.NET-10-e8912d" alt=".NET 10" />
-</p>
+[![CI](https://github.com/Proxeno/kiln/actions/workflows/ci.yml/badge.svg)](https://github.com/Proxeno/kiln/actions/workflows/ci.yml)
+[![NuGet version](https://img.shields.io/nuget/v/Proxeno.Kiln)](https://www.nuget.org/packages/Proxeno.Kiln)
+[![NuGet downloads](https://img.shields.io/nuget/dt/Proxeno.Kiln)](https://www.nuget.org/packages/Proxeno.Kiln)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-e8912d)](https://github.com/Proxeno/kiln/blob/main/LICENSE)
+[![.NET 10](https://img.shields.io/badge/.NET-10-e8912d)](https://dotnet.microsoft.com)
 
 ---
 
