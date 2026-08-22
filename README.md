@@ -2,57 +2,50 @@
 
 # Kiln
 
-A pure-managed, SIMD-accelerated **H.264 baseline-profile encoder** for .NET, built for real-time game streaming.
-
 [![CI](https://github.com/Proxeno/kiln/actions/workflows/ci.yml/badge.svg)](https://github.com/Proxeno/kiln/actions/workflows/ci.yml)
 [![NuGet version](https://img.shields.io/nuget/v/Proxeno.Kiln)](https://www.nuget.org/packages/Proxeno.Kiln)
 [![NuGet downloads](https://img.shields.io/nuget/dt/Proxeno.Kiln)](https://www.nuget.org/packages/Proxeno.Kiln)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-e8912d)](https://github.com/Proxeno/kiln/blob/main/LICENSE)
 [![.NET 10](https://img.shields.io/badge/.NET-10-e8912d)](https://dotnet.microsoft.com)
 
----
+**A from-scratch H.264 encoder for .NET.** Pure managed, SIMD-accelerated C#, zero native
+dependencies, Apache-2.0. Feed it raw frames and it hands back a standards-compliant H.264 baseline
+bitstream — the whole codec (bitstream, transforms, intra/inter prediction, motion search, entropy
+coding, deblocking) is implemented here, in this repository, against the ITU-T H.264 specification.
+No native codec to cross-compile, ship, or keep patched.
 
-Kiln is a pure-managed **H.264 encoder for .NET / C#** with **no native dependencies** —
-the entire codec is C# on .NET 10 using hardware intrinsics: NEON/AdvSimd on arm64, AVX2
-and SSSE3 on x64, with a scalar fallback everywhere else. It targets **real-time**,
-low-latency use — game streaming, screen capture, and **WebRTC**/RTP pipelines — where a
-managed, dependency-free encoder beats bundling a native codec. Kernel selection happens
-at runtime; every SIMD path is covered by parity tests against the scalar reference, and
-CI runs the full suite on Linux, Windows and macOS so both architectures stay green.
+> **Status: pre-release (0.x).** APIs will change. Every capability listed here is backed by a test
+> in this repository — including smoke tests that decode every produced stream with an independent
+> reference decoder as an oracle — and the [What Kiln is not](#what-kiln-is-not) section says plainly
+> what isn't here.
 
-## Spec-cited and clean-licensed
+## What you can build
 
-Kiln is original work, written against the ITU-T H.264 (ISO/IEC 14496-10)
-specification. Every numeric table that originates in the spec carries its
-clause/table citation in the source (`Table 9-4`, `§8.5.9`, `§9.2.1`, …). It has
-no codec dependencies and links no copyleft code, so it embeds cleanly under
-**Apache-2.0** in commercial products where GPL/LGPL codec linkage is a problem —
-which is exactly why it exists.
+Kiln is the **encode** step: one .NET process turns rendered or captured frames into an H.264 stream
+you can send anywhere, with no native runtime on the box. It's built for low-latency, real-time
+video, such as:
 
-## What it is
+- **Game & cloud-gaming streaming** — render and encode on a server, play in a browser or thin
+  client with well-under-a-second glass-to-glass latency.
+- **Screen capture & remote desktop** — a headless host encoding its own output frame by frame.
+- **Camera & robotics video** — live feeds from cameras, drones, or robots to an operator's screen.
+- **A source for a WebRTC / RTP pipeline** — Kiln emits Annex B access units that drop straight into
+  a stack like [Keryx](https://www.nuget.org/packages/Proxeno.Keryx) or any RTP packetizer.
+- **Anywhere** you need low-latency managed H.264 inside a .NET process without bundling a native
+  codec or taking on GPL/LGPL linkage.
 
-- **Real-time first**: constrained baseline profile, IDR + P-frames, CAVLC, Annex B
-  output that streams straight into WebRTC or an RTP packetizer. Predictable
-  per-frame latency over exhaustive search.
-- **A real encoder**: Intra_4x4 / Intra_16x16 with RD mode selection, P-slice inter
-  prediction with sub-pel SATD motion search, P_Skip, multi-slice frames (parallel
-  slice encoding), multiple reference frames, in-loop deblocking, optional greedy
-  trellis quantization, spatial adaptive QP, per-frame rate control.
-- **Operations-grade**: `Kiln.RateControl` (low-latency rate controller with network
-  feedback) and `Kiln.Recovery` (IDR budgeting / keyframe recovery policy) are public
-  companion namespaces, production-used in a streaming server.
-- **Verified**: 2,174 tests — spec-roundtrip decoding, SIMD/scalar parity on NEON and
-  AVX2/SSSE3, golden-frame regression, PSNR fidelity floors, adversarial
-  neighbour-availability sweeps, and smoke tests that decode every produced stream
-  with an independent reference decoder as an oracle.
+## Goals
 
-## What it is not
-
-Not an x264 competitor. No B-frames, no CABAC, no 8x8 transform, no interlace;
-4:2:0 8-bit only; dimensions must be multiples of 16. If you need maximum
-compression at any CPU cost, use a full-profile encoder. If you need clean-licensed,
-dependency-free, low-latency encoding inside a .NET process, you are in the right
-place.
+- **Pure managed.** 100% C# on .NET 10 with hardware intrinsics — NEON/AdvSimd on arm64, AVX2 and
+  SSSE3 on x64, scalar fallback everywhere else. No native library to cross-compile, ship, or patch.
+- **Genuinely open.** Apache-2.0, original work that links no copyleft code — embed it in commercial
+  or proprietary products where GPL/LGPL codec linkage is a problem. That's exactly why it exists.
+- **Faithful to the spec.** Written against ITU-T H.264 (ISO/IEC 14496-10); every numeric table that
+  originates in the spec carries its clause/table citation in the source (`Table 9-4`, `§8.5.9`,
+  `§9.2.1`, …).
+- **Real-time first.** Predictable per-frame latency over maximum compression: a steady stream of
+  low-latency frames beats a slow exhaustive search.
+- **Honest about scope.** A 0.x that tells you exactly what is proven and what isn't here yet.
 
 ## Quick start
 
@@ -73,6 +66,29 @@ var written = encoder.EncodeFrame(y, u, v, strideY: 1280, strideUv: 640, annexB)
 var wasIdr = encoder.LastFrameWasIdr;
 // annexB[0..written] is a complete Annex B access unit (SPS/PPS included on IDR).
 ```
+
+## What you get
+
+A real encoder, not a toy — the parts a low-latency streaming server actually needs:
+
+- **Baseline bitstream that just plays.** Constrained baseline profile, IDR + P-frames, CAVLC
+  entropy coding, Annex B output (SPS/PPS carried on every IDR) that streams straight into a WebRTC
+  or RTP packetizer and decodes on browsers and hardware decoders.
+- **Genuine coding tools.** Intra 4×4 / 16×16 with RD mode selection, P-slice inter prediction with
+  sub-pel SATD motion search, P_Skip, and multiple reference frames.
+- **Quality knobs.** In-loop deblocking, optional greedy trellis quantization, variance-based
+  spatial adaptive QP, and per-frame rate control.
+- **Parallelism built in.** Multi-slice frames encode their slices in parallel and bound the region a
+  lost packet can damage.
+- **SIMD with a safety net.** NEON/AdvSimd, AVX2 and SSSE3 kernels selected at runtime, each covered
+  by parity tests against a scalar reference; CI runs the full suite on Linux, Windows and macOS so
+  both architectures stay green.
+- **Streaming companions.** `Kiln.RateControl` (a low-latency rate controller with network feedback)
+  and `Kiln.Recovery` (IDR budgeting / keyframe recovery policy) are public companion namespaces for
+  server use.
+- **Verified.** 2,174 tests — spec-roundtrip decoding, SIMD/scalar parity, golden-frame regression,
+  PSNR fidelity floors, adversarial neighbour-availability sweeps, and independent-decoder smoke
+  tests over every produced stream.
 
 ## Options reference
 
@@ -97,8 +113,8 @@ var wasIdr = encoder.LastFrameWasIdr;
 
 ## Performance
 
-Measured on Apple M5 Max (arm64, NEON/AdvSimd), .NET 10, BenchmarkDotNet, quiet
-machine — these are the committed perf-gate baseline numbers (`perf/`):
+Measured on Apple M5 Max (arm64, NEON/AdvSimd), .NET 10, BenchmarkDotNet, quiet machine — the
+committed perf-gate baseline numbers (`perf/`).
 
 | Benchmark | Mean | Min |
 |---|---:|---:|
@@ -109,29 +125,27 @@ machine — these are the committed perf-gate baseline numbers (`perf/`):
 | Full-MB 16x16 ME search, range 8 | 76.4 us | 76.1 us |
 | Steady P-frame encode, 1280x720, 1 slice | 2.24 ms | 2.20 ms |
 
-A ~2.2 ms steady-state P-frame at 720p on one slice leaves comfortable headroom
-for 60 fps game streaming; `SliceCount > 1` parallelizes further. During
-extraction the motion-estimation path also got a measured targeted win: two
-structurally dead caches (0.0% hit rate under production instrumentation) were
-removed, making the textured-content sub-partition search ~5% faster (paired
-A/B, median of 6 rounds, faster in 6/6) with bit-identical output.
-
-Perf discipline is part of the repo: `bench/Kiln.Benchmarks` (BenchmarkDotNet),
-`scripts/h264-simd-capture-baseline.sh` and `scripts/h264-simd-perf-gate.sh` gate
-changes against the committed baseline in `perf/`. See
+A ~2.2 ms steady-state P-frame at 720p on one slice leaves comfortable headroom for 60 fps game
+streaming; `SliceCount > 1` parallelizes further. Perf discipline is part of the repo:
+`bench/Kiln.Benchmarks` (BenchmarkDotNet) plus `scripts/h264-simd-capture-baseline.sh` and
+`scripts/h264-simd-perf-gate.sh` gate changes against the committed baseline in `perf/`. See
 [docs/perf-gate.md](docs/perf-gate.md).
 
-## Experimental subsystems
+## What Kiln is not
 
-`Adaptation` (resolution/fps ladders) and `Queue` (latest-frame dropping) ship inside
-the library, fully tested but not wired into the encoder — **experimental**, APIs may
+Not an x264 competitor. No B-frames, no CABAC, no 8×8 transform, no interlace; 4:2:0 8-bit only;
+dimensions must be multiples of 16. If you need maximum compression at any CPU cost, use a
+full-profile encoder. If you need clean-licensed, dependency-free, low-latency H.264 inside a .NET
+process, you are in the right place.
+
+The `Adaptation` (resolution/fps ladders) and `Queue` (latest-frame dropping) namespaces ship inside
+the library, fully tested but not yet wired into the encoder — **experimental**, and their APIs may
 change or move without notice. See [docs/architecture.md](docs/architecture.md).
 
 ## Installing
 
-Published on [nuget.org](https://www.nuget.org/packages/Proxeno.Kiln) as `Proxeno.Kiln`.
-The package id is `Proxeno.Kiln`; the assembly and namespace stay `Kiln`, so code uses
-`using Kiln;`.
+Published on [nuget.org](https://www.nuget.org/packages/Proxeno.Kiln) as `Proxeno.Kiln`. The package
+id is `Proxeno.Kiln`; the assembly and namespace stay `Kiln`, so code uses `using Kiln;`.
 
 ```
 dotnet add package Proxeno.Kiln
@@ -146,4 +160,4 @@ dotnet add package Proxeno.Kiln
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE). Copyright the Kiln contributors.
+Apache-2.0 — see [LICENSE](LICENSE). © Kiln contributors.
