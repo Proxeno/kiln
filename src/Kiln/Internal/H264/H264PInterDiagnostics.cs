@@ -1,0 +1,352 @@
+using System.Text;
+using System.Threading;
+using System.Collections.Concurrent;
+
+namespace Kiln.Internal.H264;
+
+/// <summary>
+/// Optional diagnostics for P-slice macroblock costing in <see cref="H264BaselineSliceEncoder"/>.
+/// Enables phase counters (test/benchmark instrumentation) and A/B disables for Phase 2b (§7.3.5 intra-in-P scoring after ME).
+/// </summary>
+/// <remarks>
+/// Set <see cref="DisablePhase2bManual"/> from benchmarks/tests, or set environment variable
+/// <c>KILN_H264_DIAG_DISABLE_P_INTER_PHASE2B=1</c> once per process (read at type init; no per-MB env read).
+/// </remarks>
+internal static class H264PInterDiagnostics
+{
+    private static readonly bool EnvDisablePhase2b = string.Equals(
+        Environment.GetEnvironmentVariable("KILN_H264_DIAG_DISABLE_P_INTER_PHASE2B"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool EnvCollectPhase2Timing = string.Equals(
+        Environment.GetEnvironmentVariable("KILN_H264_P_INTER_TIMING"),
+        "1",
+        StringComparison.Ordinal);
+
+    private static long s_phase1Skip;
+    private static long s_phase2Entered;
+    private static long s_phase2bIntraWin;
+
+    private static long s_phase2bEvalCount;
+    private static long s_phase2bChooseInterCount;
+    private static long s_phase2bChooseIntraCount;
+    private static long s_phase2bInterDistortionSum;
+    private static long s_phase2bInterBitsSum;
+    private static long s_phase2bInterRdSum;
+    private static long s_phase2bIntraDistortionSum;
+    private static long s_phase2bIntraBitsSum;
+    private static long s_phase2bIntraRdSum;
+    private static long s_phase2TimingCount;
+    private static long s_phase2TimingTotalTicks;
+    private static long s_phase2TimingMeTicks;
+    private static long s_phase2TimingPredTicks;
+    private static long s_phase2TimingLumaTicks;
+    private static long s_phase2TimingChromaTicks;
+    private static long s_phase2TimingWriteTicks;
+    private static readonly ConcurrentQueue<string> s_mbTraceLines = new();
+    private static int s_mbTraceLineCount;
+    private const int MaxMbTraceLines = 4096;
+
+    private readonly record struct MbTraceTarget(int FrameNum, int MbX, int MbY);
+    private static readonly MbTraceTarget[] EnvTraceMbTargets = ParseTraceMbTargets();
+    private static volatile MbTraceTarget[] s_runtimeTraceMbTargets = [];
+
+    /// <summary>
+    /// Add a runtime trace target (frameNum=-1 for all frames). Takes effect immediately.
+    /// </summary>
+    public static void AddRuntimeTraceMbTarget(int frameNum, int mbX, int mbY)
+    {
+        var existing = s_runtimeTraceMbTargets;
+        var updated = new MbTraceTarget[existing.Length + 1];
+        existing.CopyTo(updated, 0);
+        updated[^1] = new MbTraceTarget(frameNum, mbX, mbY);
+        s_runtimeTraceMbTargets = updated;
+    }
+
+    /// <summary>Clears all runtime trace targets added via <see cref="AddRuntimeTraceMbTarget"/>.</summary>
+    public static void ClearRuntimeTraceMbTargets() => s_runtimeTraceMbTargets = [];
+
+    /// <summary>
+    /// Manual kill switch for diagnostics/bench runs. Keep false in normal operation; use
+    /// <see cref="Kiln.H264BaselineEncoderOptions.EnableExperimentalPhase2b"/> for explicit opt-in.
+    /// </summary>
+    public static bool DisablePhase2bManual { get; set; }
+
+    /// <summary>When true, <see cref="NotifyPhase1Skip"/> / <see cref="NotifyPhase2Entered"/> / <see cref="NotifyPhase2bIntraWin"/> count (Interlocked; safe for parallel slice encoders).</summary>
+    public static bool CollectPhaseCounts { get; set; }
+
+    /// <summary>
+    /// When true, collects per-MB Phase2b candidate RD accounting (inter vs intra estimated D/R/J).
+    /// </summary>
+    public static bool CollectPhase2bRdAccounting { get; set; }
+
+    public static bool CollectPhase2Timing { get; set; }
+
+    public static bool IsPhase2TimingEnabled =>
+        CollectPhase2Timing || EnvCollectPhase2Timing || H264MotionSatdDagDiagnostics.IsEnabled;
+
+    public static bool ShouldDisablePhase2b() => DisablePhase2bManual || EnvDisablePhase2b;
+
+    public static bool ShouldTraceMb(int frameNum, int mbX, int mbY)
+    {
+        static bool Check(MbTraceTarget[] targets, int frameNum, int mbX, int mbY)
+        {
+            foreach (var target in targets)
+            {
+                if (target.MbX != mbX || target.MbY != mbY) continue;
+                if (target.FrameNum < 0 || target.FrameNum == frameNum) return true;
+            }
+            return false;
+        }
+        return Check(EnvTraceMbTargets, frameNum, mbX, mbY)
+            || Check(s_runtimeTraceMbTargets, frameNum, mbX, mbY);
+    }
+
+    public static void TraceMbDecision(int frameNum, int codedFrameIndex, int mbX, int mbY, string message)
+    {
+        if (!ShouldTraceMb(frameNum, mbX, mbY))
+            return;
+        var line = $"[H264PInter MBTrace] frameNum={frameNum} codedFrame={codedFrameIndex} mb=({mbX},{mbY}) {message}";
+        s_mbTraceLines.Enqueue(line);
+        var newCount = Interlocked.Increment(ref s_mbTraceLineCount);
+        while (newCount > MaxMbTraceLines && s_mbTraceLines.TryDequeue(out _))
+            newCount = Interlocked.Decrement(ref s_mbTraceLineCount);
+    }
+
+    public static string BuildMbTraceReportAndReset()
+    {
+        if (Volatile.Read(ref s_mbTraceLineCount) == 0)
+            return string.Empty;
+        var sb = new StringBuilder(1024);
+        while (s_mbTraceLines.TryDequeue(out var line))
+        {
+            sb.AppendLine(line);
+            Interlocked.Decrement(ref s_mbTraceLineCount);
+        }
+        return sb.ToString();
+    }
+
+    public static void ResetPhaseCounts()
+    {
+        Interlocked.Exchange(ref s_phase1Skip, 0);
+        Interlocked.Exchange(ref s_phase2Entered, 0);
+        Interlocked.Exchange(ref s_phase2bIntraWin, 0);
+    }
+
+    public static void ResetPhase2bRdAccounting()
+    {
+        Interlocked.Exchange(ref s_phase2bEvalCount, 0);
+        Interlocked.Exchange(ref s_phase2bChooseInterCount, 0);
+        Interlocked.Exchange(ref s_phase2bChooseIntraCount, 0);
+        Interlocked.Exchange(ref s_phase2bInterDistortionSum, 0);
+        Interlocked.Exchange(ref s_phase2bInterBitsSum, 0);
+        Interlocked.Exchange(ref s_phase2bInterRdSum, 0);
+        Interlocked.Exchange(ref s_phase2bIntraDistortionSum, 0);
+        Interlocked.Exchange(ref s_phase2bIntraBitsSum, 0);
+        Interlocked.Exchange(ref s_phase2bIntraRdSum, 0);
+    }
+
+    public static void ResetPhase2Timing()
+    {
+        Interlocked.Exchange(ref s_phase2TimingCount, 0);
+        Interlocked.Exchange(ref s_phase2TimingTotalTicks, 0);
+        Interlocked.Exchange(ref s_phase2TimingMeTicks, 0);
+        Interlocked.Exchange(ref s_phase2TimingPredTicks, 0);
+        Interlocked.Exchange(ref s_phase2TimingLumaTicks, 0);
+        Interlocked.Exchange(ref s_phase2TimingChromaTicks, 0);
+        Interlocked.Exchange(ref s_phase2TimingWriteTicks, 0);
+    }
+
+    public static (long Phase1Skip, long Phase2Entered, long Phase2bIntraWin) ReadPhaseCounts() =>
+        (
+            Volatile.Read(ref s_phase1Skip),
+            Volatile.Read(ref s_phase2Entered),
+            Volatile.Read(ref s_phase2bIntraWin));
+
+    public readonly record struct Phase2bRdSnapshot(
+        long EvaluatedMacroblocks,
+        long ChosenInterCount,
+        long ChosenIntraCount,
+        long SumInterDistortion,
+        long SumInterBits,
+        long SumInterRd,
+        long SumIntraDistortion,
+        long SumIntraBits,
+        long SumIntraRd);
+
+    public static Phase2bRdSnapshot ReadPhase2bRdAccounting() => new(
+        EvaluatedMacroblocks: Volatile.Read(ref s_phase2bEvalCount),
+        ChosenInterCount: Volatile.Read(ref s_phase2bChooseInterCount),
+        ChosenIntraCount: Volatile.Read(ref s_phase2bChooseIntraCount),
+        SumInterDistortion: Volatile.Read(ref s_phase2bInterDistortionSum),
+        SumInterBits: Volatile.Read(ref s_phase2bInterBitsSum),
+        SumInterRd: Volatile.Read(ref s_phase2bInterRdSum),
+        SumIntraDistortion: Volatile.Read(ref s_phase2bIntraDistortionSum),
+        SumIntraBits: Volatile.Read(ref s_phase2bIntraBitsSum),
+        SumIntraRd: Volatile.Read(ref s_phase2bIntraRdSum));
+
+    public static string BuildPhase2bRdReport()
+    {
+        var s = ReadPhase2bRdAccounting();
+        if (s.EvaluatedMacroblocks <= 0)
+            return "Phase2b RD report: no candidate macroblocks evaluated.";
+
+        static double Avg(long sum, long n) => n <= 0 ? 0.0 : (double)sum / n;
+        var n = s.EvaluatedMacroblocks;
+        var avgInterDist = Avg(s.SumInterDistortion, n);
+        var avgInterBits = Avg(s.SumInterBits, n);
+        var avgInterRd = Avg(s.SumInterRd, n);
+        var avgIntraDist = Avg(s.SumIntraDistortion, n);
+        var avgIntraBits = Avg(s.SumIntraBits, n);
+        var avgIntraRd = Avg(s.SumIntraRd, n);
+        var intraChoosePct = (double)s.ChosenIntraCount * 100.0 / n;
+
+        var sb = new StringBuilder(320);
+        sb.Append("Phase2b RD report: n=").Append(n)
+            .Append(", chooseIntra=").Append(s.ChosenIntraCount)
+            .Append(" (").Append(intraChoosePct.ToString("F1")).Append("%)")
+            .Append(", chooseInter=").Append(s.ChosenInterCount).AppendLine();
+        sb.Append("  avgInter: D=").Append(avgInterDist.ToString("F1"))
+            .Append(" R=").Append(avgInterBits.ToString("F1"))
+            .Append(" J=").Append(avgInterRd.ToString("F1")).AppendLine();
+        sb.Append("  avgIntra: D=").Append(avgIntraDist.ToString("F1"))
+            .Append(" R=").Append(avgIntraBits.ToString("F1"))
+            .Append(" J=").Append(avgIntraRd.ToString("F1")).AppendLine();
+        sb.Append("  delta (intra-inter): D=").Append((avgIntraDist - avgInterDist).ToString("F1"))
+            .Append(" R=").Append((avgIntraBits - avgInterBits).ToString("F1"))
+            .Append(" J=").Append((avgIntraRd - avgInterRd).ToString("F1"));
+        return sb.ToString();
+    }
+
+    public static string BuildPhase2TimingReport(bool reset = false)
+    {
+        var count = Volatile.Read(ref s_phase2TimingCount);
+        if (count <= 0)
+            return "P-Inter Phase2 timing: no macroblocks recorded.";
+
+        var totalTicks = Volatile.Read(ref s_phase2TimingTotalTicks);
+        var meTicks = Volatile.Read(ref s_phase2TimingMeTicks);
+        var predTicks = Volatile.Read(ref s_phase2TimingPredTicks);
+        var lumaTicks = Volatile.Read(ref s_phase2TimingLumaTicks);
+        var chromaTicks = Volatile.Read(ref s_phase2TimingChromaTicks);
+        var writeTicks = Volatile.Read(ref s_phase2TimingWriteTicks);
+        var accountedTicks = meTicks + predTicks + lumaTicks + chromaTicks + writeTicks;
+        var otherTicks = Math.Max(0, totalTicks - accountedTicks);
+
+        static double Ms(long ticks) => ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        static string AvgMs(long ticks, long count) => (Ms(ticks) / count).ToString("F4");
+        static string Pct(long ticks, long total) => total <= 0 ? "0.0%" : ((double)ticks * 100.0 / total).ToString("F1") + "%";
+
+        var sb = new StringBuilder(512);
+        sb.Append("P-Inter Phase2 timing: mb=").Append(count)
+            .Append(" totalMs=").Append(Ms(totalTicks).ToString("F1"))
+            .Append(" avgMs=").Append(AvgMs(totalTicks, count)).AppendLine();
+        sb.Append("  ME avgMs=").Append(AvgMs(meTicks, count)).Append(" pct=").Append(Pct(meTicks, totalTicks))
+            .Append(" pred avgMs=").Append(AvgMs(predTicks, count)).Append(" pct=").Append(Pct(predTicks, totalTicks))
+            .Append(" luma avgMs=").Append(AvgMs(lumaTicks, count)).Append(" pct=").Append(Pct(lumaTicks, totalTicks)).AppendLine();
+        sb.Append("  chroma avgMs=").Append(AvgMs(chromaTicks, count)).Append(" pct=").Append(Pct(chromaTicks, totalTicks))
+            .Append(" write avgMs=").Append(AvgMs(writeTicks, count)).Append(" pct=").Append(Pct(writeTicks, totalTicks))
+            .Append(" other avgMs=").Append(AvgMs(otherTicks, count)).Append(" pct=").Append(Pct(otherTicks, totalTicks));
+
+        if (reset)
+            ResetPhase2Timing();
+        return sb.ToString();
+    }
+
+    internal static void NotifyPhase1Skip()
+    {
+        if (CollectPhaseCounts)
+        {
+            Interlocked.Increment(ref s_phase1Skip);
+        }
+    }
+
+    internal static void NotifyPhase2Entered()
+    {
+        if (CollectPhaseCounts)
+        {
+            Interlocked.Increment(ref s_phase2Entered);
+        }
+    }
+
+    internal static void NotifyPhase2bIntraWin()
+    {
+        if (CollectPhaseCounts)
+        {
+            Interlocked.Increment(ref s_phase2bIntraWin);
+        }
+    }
+
+    internal static void NotifyPhase2bCandidateRd(
+        int interDistortion,
+        int interBits,
+        int interRd,
+        int intraDistortion,
+        int intraBits,
+        int intraRd,
+        bool chooseIntra)
+    {
+        if (!CollectPhase2bRdAccounting)
+            return;
+
+        Interlocked.Increment(ref s_phase2bEvalCount);
+        if (chooseIntra)
+            Interlocked.Increment(ref s_phase2bChooseIntraCount);
+        else
+            Interlocked.Increment(ref s_phase2bChooseInterCount);
+
+        Interlocked.Add(ref s_phase2bInterDistortionSum, interDistortion);
+        Interlocked.Add(ref s_phase2bInterBitsSum, interBits);
+        Interlocked.Add(ref s_phase2bInterRdSum, interRd);
+        Interlocked.Add(ref s_phase2bIntraDistortionSum, intraDistortion);
+        Interlocked.Add(ref s_phase2bIntraBitsSum, intraBits);
+        Interlocked.Add(ref s_phase2bIntraRdSum, intraRd);
+    }
+
+    internal static void NotifyPhase2Timing(
+        long totalTicks,
+        long meTicks,
+        long predTicks,
+        long lumaTicks,
+        long chromaTicks,
+        long writeTicks)
+    {
+        if (!IsPhase2TimingEnabled)
+            return;
+
+        Interlocked.Increment(ref s_phase2TimingCount);
+        Interlocked.Add(ref s_phase2TimingTotalTicks, totalTicks);
+        Interlocked.Add(ref s_phase2TimingMeTicks, meTicks);
+        Interlocked.Add(ref s_phase2TimingPredTicks, predTicks);
+        Interlocked.Add(ref s_phase2TimingLumaTicks, lumaTicks);
+        Interlocked.Add(ref s_phase2TimingChromaTicks, chromaTicks);
+        Interlocked.Add(ref s_phase2TimingWriteTicks, writeTicks);
+    }
+
+    private static MbTraceTarget[] ParseTraceMbTargets()
+    {
+        var raw = Environment.GetEnvironmentVariable("KILN_H264_DIAG_TRACE_MB");
+        if (string.IsNullOrWhiteSpace(raw))
+            return [];
+
+        var groups = raw.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var targets = new List<MbTraceTarget>(groups.Length);
+        foreach (var group in groups)
+        {
+            var parts = group.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length != 3)
+                continue;
+
+            if (!int.TryParse(parts[0], out var frameNum))
+                continue;
+            if (!int.TryParse(parts[1], out var mbX))
+                continue;
+            if (!int.TryParse(parts[2], out var mbY))
+                continue;
+
+            targets.Add(new MbTraceTarget(frameNum, mbX, mbY));
+        }
+
+        return targets.ToArray();
+    }
+}

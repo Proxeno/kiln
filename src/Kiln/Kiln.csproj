@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!-- NuGet package: Kiln is consumed as a package (GitHub Packages today, nuget.org later). -->
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>Kiln</PackageId>
+    <Authors>Kiln contributors</Authors>
+    <Description>Pure-managed SIMD H.264 baseline-profile encoder for real-time streaming. No native dependencies; NEON, AVX2 and SSSE3 accelerated.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Proxeno/kiln</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Proxeno/kiln</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>h264;avc;encoder;video;simd;realtime;streaming</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <!-- SourceLink + symbols -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <!-- SemVer 0.x from git tags (MinVer), tag prefix "v" -->
+    <MinVerTagPrefix>v</MinVerTagPrefix>
+    <MinVerDefaultPreReleaseIdentifiers>preview.0</MinVerDefaultPreReleaseIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+    <PackageReference Include="MinVer" Version="6.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Kiln.Tests" />
+    <InternalsVisibleTo Include="Kiln.Benchmarks" />
+  </ItemGroup>
+
+</Project>

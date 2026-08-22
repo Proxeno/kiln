@@ -1,0 +1,42 @@
+name: Release
+
+# Pack and publish the Kiln NuGet package on version tags (v*).
+# Feed: GitHub Packages today. Moving to nuget.org later is a one-line
+# change of the --source URL (plus an API key secret).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  pack-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # MinVer derives the package version from the tag
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Build
+        run: dotnet build -c Release src/Kiln/Kiln.csproj
+        env:
+          CI: "true"
+      - name: Test (quick gate on tag)
+        run: dotnet test -c Release tests/Kiln.Tests/Kiln.Tests.csproj
+      - name: Pack
+        run: dotnet pack -c Release --no-build src/Kiln/Kiln.csproj -o artifacts/pkg
+        env:
+          CI: "true"
+      - name: Push to GitHub Packages
+        run: |
+          for f in artifacts/pkg/*.nupkg; do
+            dotnet nuget push "$f" \
+              --source "https://nuget.pkg.github.com/Proxeno/index.json" \
+              --api-key "${{ secrets.GITHUB_TOKEN }}" \
+              --skip-duplicate
+          done

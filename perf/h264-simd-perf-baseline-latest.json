@@ -1,0 +1,78 @@
+{
+  "capturedAtUtc": "2026-08-21T17:42:40Z",
+  "machine": "Darwin macbook-pro-2.lan 25.6.0 Darwin Kernel Version 25.6.0: Sat Jul 11 15:27:04 PDT 2026; root:xnu-12377.161.13~4/RELEASE_ARM64_T6050 arm64",
+  "benchmarks": [
+    {
+      "suite": "H264SadKernelMicroBenchmarks",
+      "method": "Satd4x4_Once",
+      "parameters": "PreferHardwareIntrinsics=False",
+      "full_name": "Kiln.Benchmarks.H264SadKernelMicroBenchmarks.Satd4x4_Once(PreferHardwareIntrinsics: False)",
+      "mean_ns": 15.988248487313589,
+      "stddev_ns": 0.7039326267646637
+    },
+    {
+      "suite": "H264SadKernelMicroBenchmarks",
+      "method": "SatdMany4x4_9Modes",
+      "parameters": "PreferHardwareIntrinsics=False",
+      "full_name": "Kiln.Benchmarks.H264SadKernelMicroBenchmarks.SatdMany4x4_9Modes(PreferHardwareIntrinsics: False)",
+      "mean_ns": 158.38013768196106,
+      "stddev_ns": 0.6079838253448197
+    },
+    {
+      "suite": "H264SadKernelMicroBenchmarks",
+      "method": "Satd4x4_Once",
+      "parameters": "PreferHardwareIntrinsics=True",
+      "full_name": "Kiln.Benchmarks.H264SadKernelMicroBenchmarks.Satd4x4_Once(PreferHardwareIntrinsics: True)",
+      "mean_ns": 11.182465280095736,
+      "stddev_ns": 0.038029240834916093
+    },
+    {
+      "suite": "H264SadKernelMicroBenchmarks",
+      "method": "SatdMany4x4_9Modes",
+      "parameters": "PreferHardwareIntrinsics=True",
+      "full_name": "Kiln.Benchmarks.H264SadKernelMicroBenchmarks.SatdMany4x4_9Modes(PreferHardwareIntrinsics: True)",
+      "mean_ns": 99.33676660060883,
+      "stddev_ns": 0.15489095099250938
+    },
+    {
+      "suite": "H264MotionEstimatorBenchmarks",
+      "method": "Sad8x8_Dispatch",
+      "parameters": "",
+      "full_name": "Kiln.Benchmarks.H264MotionEstimatorBenchmarks.Sad8x8_Dispatch",
+      "mean_ns": 3.4927441719919443,
+      "stddev_ns": 0.06788981236278575
+    },
+    {
+      "suite": "H264MotionEstimatorBenchmarks",
+      "method": "Sad16x16_Dispatch_Stride720",
+      "parameters": "",
+      "full_name": "Kiln.Benchmarks.H264MotionEstimatorBenchmarks.Sad16x16_Dispatch_Stride720",
+      "mean_ns": 6.441264273864882,
+      "stddev_ns": 0.05000707210239635
+    },
+    {
+      "suite": "H264MotionEstimatorBenchmarks",
+      "method": "SearchMb16x16_SearchRange8",
+      "parameters": "",
+      "full_name": "Kiln.Benchmarks.H264MotionEstimatorBenchmarks.SearchMb16x16_SearchRange8",
+      "mean_ns": 76360.64733886719,
+      "stddev_ns": 150.51443144006493
+    },
+    {
+      "suite": "H264PInterPhase2bAblationBenchmarks",
+      "method": "Encode_primmed_P",
+      "parameters": "EnableIntraInPFallback=False",
+      "full_name": "Kiln.Benchmarks.H264PInterPhase2bAblationBenchmarks.Encode_primmed_P(EnableIntraInPFallback: False)",
+      "mean_ns": 2290059.285714286,
+      "stddev_ns": 28140.86419375618
+    },
+    {
+      "suite": "H264PInterPhase2bAblationBenchmarks",
+      "method": "Encode_primmed_P",
+      "parameters": "EnableIntraInPFallback=True",
+      "full_name": "Kiln.Benchmarks.H264PInterPhase2bAblationBenchmarks.Encode_primmed_P(EnableIntraInPFallback: True)",
+      "mean_ns": 2235368.714285714,
+      "stddev_ns": 23746.208432184747
+    }
+  ]
+}
