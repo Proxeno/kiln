@@ -1,8 +1,10 @@
 name: Release
 
-# Pack and publish the Kiln NuGet package on version tags (v*).
-# Feed: GitHub Packages today. Moving to nuget.org later is a one-line
-# change of the --source URL (plus an API key secret).
+# Pack and publish the Proxeno.Kiln NuGet package on version tags (v*).
+# Feed: nuget.org (public) via Trusted Publishing (OIDC) — NO stored API key.
+# Prereq: a Trusted Publishing policy on nuget.org (Repository Owner: Proxeno,
+# Repository: kiln, Workflow File: release.yml). No repo secrets required —
+# `user: retrotom` is the nuget.org profile name (public, not a credential).
 
 on:
   push:
@@ -10,7 +12,7 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  id-token: write # mint the GitHub OIDC token nuget.org exchanges for a short-lived key
 
 jobs:
   pack-publish:
@@ -32,11 +34,20 @@ jobs:
         run: dotnet pack -c Release --no-build src/Kiln/Kiln.csproj -o artifacts/pkg
         env:
           CI: "true"
-      - name: Push to GitHub Packages
+      # Exchange the GitHub OIDC token for a short-lived nuget.org API key (~1h).
+      # Request it immediately before the push so it can't expire first.
+      - name: NuGet login (OIDC -> short-lived API key)
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: retrotom
+      - name: Push to nuget.org
+        # Push both the package and its symbol package. The previous *.nupkg glob
+        # never matched .snupkg, so symbols were silently dropped.
         run: |
-          for f in artifacts/pkg/*.nupkg; do
+          for f in artifacts/pkg/*.nupkg artifacts/pkg/*.snupkg; do
             dotnet nuget push "$f" \
-              --source "https://nuget.pkg.github.com/Proxeno/index.json" \
-              --api-key "${{ secrets.GITHUB_TOKEN }}" \
+              --source "https://api.nuget.org/v3/index.json" \
+              --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
               --skip-duplicate
           done

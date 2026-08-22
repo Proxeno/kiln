@@ -11,17 +11,21 @@
 
 <p align="center">
   <a href="https://github.com/Proxeno/kiln/actions/workflows/ci.yml"><img src="https://github.com/Proxeno/kiln/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://www.nuget.org/packages/Proxeno.Kiln"><img src="https://img.shields.io/nuget/v/Proxeno.Kiln" alt="NuGet version" /></a>
+  <a href="https://www.nuget.org/packages/Proxeno.Kiln"><img src="https://img.shields.io/nuget/dt/Proxeno.Kiln" alt="NuGet downloads" /></a>
   <img src="https://img.shields.io/badge/license-Apache--2.0-e8912d" alt="Apache-2.0" />
   <img src="https://img.shields.io/badge/.NET-10-e8912d" alt=".NET 10" />
 </p>
 
 ---
 
-No native dependencies. The entire codec is C# on .NET 10 using hardware intrinsics —
-NEON/AdvSimd on arm64, AVX2 and SSSE3 on x64, with a scalar fallback everywhere else.
-Kernel selection happens at runtime; every SIMD path is covered by parity tests against
-the scalar reference, and CI runs the full suite on Linux, Windows and macOS so both
-architectures stay green.
+Kiln is a pure-managed **H.264 encoder for .NET / C#** with **no native dependencies** —
+the entire codec is C# on .NET 10 using hardware intrinsics: NEON/AdvSimd on arm64, AVX2
+and SSSE3 on x64, with a scalar fallback everywhere else. It targets **real-time**,
+low-latency use — game streaming, screen capture, and **WebRTC**/RTP pipelines — where a
+managed, dependency-free encoder beats bundling a native codec. Kernel selection happens
+at runtime; every SIMD path is covered by parity tests against the scalar reference, and
+CI runs the full suite on Linux, Windows and macOS so both architectures stay green.
 
 ## Spec-cited and clean-licensed
 
@@ -132,11 +136,12 @@ change or move without notice. See [docs/architecture.md](docs/architecture.md).
 
 ## Installing
 
-Published to GitHub Packages as `Kiln`:
+Published on [nuget.org](https://www.nuget.org/packages/Proxeno.Kiln) as `Proxeno.Kiln`.
+The package id is `Proxeno.Kiln`; the assembly and namespace stay `Kiln`, so code uses
+`using Kiln;`.
 
 ```
-dotnet nuget add source https://nuget.pkg.github.com/Proxeno/index.json -n kiln
-dotnet add package Kiln
+dotnet add package Proxeno.Kiln
 ```
 
 ## Documentation

@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a defect in the Kiln encoder
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. For **security** issues, please do
+        not open a public issue — use a private advisory instead:
+        https://github.com/Proxeno/kiln/security/advisories/new
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: Encoding a 1280x720 frame with SliceCount=4 produces ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        Minimal steps or code. Include input dimensions, the
+        `H264BaselineEncoderOptions` used, and whether the input depends on
+        specific frame content.
+      render: csharp
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Kiln version
+      description: Package version (Proxeno.Kiln) or commit SHA.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform / SIMD kernel
+      description: SIMD-specific bugs often don't reproduce across kernel sets.
+      options:
+        - x64 AVX2
+        - x64 SSSE3
+        - arm64 NEON
+        - scalar fallback
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and .NET version
+      placeholder: macOS 15 (arm64), .NET 10.0.x
+    validations:
+      required: true
+  - type: textarea
+    id: intrinsics
+    attributes:
+      label: Does PreferHardwareIntrinsics true vs false change the behavior?
+      description: If you've checked, tell us — it narrows the bug to a SIMD path.
+    validations:
+      required: false

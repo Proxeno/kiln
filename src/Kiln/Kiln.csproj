@@ -4,17 +4,23 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
-  <!-- NuGet package: Kiln is consumed as a package (GitHub Packages today, nuget.org later). -->
+  <!--
+    NuGet package: published to nuget.org as "Proxeno.Kiln".
+    Package-ID-only rename: AssemblyName/RootNamespace stay "Kiln" (set from the
+    project name in Directory.Build.props), so consumers keep `using Kiln;`.
+  -->
   <PropertyGroup>
     <IsPackable>true</IsPackable>
-    <PackageId>Kiln</PackageId>
+    <PackageId>Proxeno.Kiln</PackageId>
     <Authors>Kiln contributors</Authors>
     <Description>Pure-managed SIMD H.264 baseline-profile encoder for real-time streaming. No native dependencies; NEON, AVX2 and SSSE3 accelerated.</Description>
+    <Copyright>Copyright (c) Kiln contributors</Copyright>
+    <PackageReleaseNotes>First public release. Pure-managed H.264 baseline-profile encoder for .NET 10 with runtime SIMD kernel selection (NEON/AVX2/SSSE3), P-frames, rate control and keyframe recovery.</PackageReleaseNotes>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/Proxeno/kiln</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Proxeno/kiln</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>h264;avc;encoder;video;simd;realtime;streaming</PackageTags>
+    <PackageTags>h264;avc;encoder;video;simd;realtime;streaming;csharp;dotnet;codec;video-encoding;webrtc;h264-encoder</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <!-- SourceLink + symbols -->
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
@@ -33,6 +39,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
     <PackageReference Include="MinVer" Version="6.0.0" PrivateAssets="All" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
 
   <ItemGroup>

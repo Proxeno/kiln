@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest an enhancement for Kiln
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Kiln is a constrained-baseline, real-time-first H.264 encoder. Requests that
+        move it toward a full-profile encoder (B-frames, CABAC, 8x8 transform, interlace)
+        are generally out of scope — see the "What it is not" section of the README.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case, not just the proposed API.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Kiln to do? Sketch the API or behavior if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you've tried or other approaches you weighed.
+    validations:
+      required: false
