@@ -22,6 +22,8 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Kiln/Kiln.csproj" />
+    <!-- The capture sample owns the MP4 muxer; these tests exercise it without a camera. -->
+    <ProjectReference Include="../../samples/Kiln.Capture/Kiln.Capture.csproj" />
   </ItemGroup>
 
   <ItemGroup>
