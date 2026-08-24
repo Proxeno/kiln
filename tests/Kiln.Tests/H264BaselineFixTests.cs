@@ -33,7 +33,7 @@ public sealed class H264BaselineFixTests
     [Fact]
     public void WriteSpsRbsp_emits_max_num_ref_frames_ue_equals_MaxNumRefFrames()
     {
-        var rbsp = H264ParameterSets.WriteSpsRbsp(width: 32, height: 32, profileIdc: 66, levelIdc: 31);
+        var rbsp = H264ParameterSets.WriteSpsRbsp(codedWidth: 32, codedHeight: 32, profileIdc: 66, levelIdc: 31);
         var br = new H264CavlcSpecDecode.BitReader(rbsp);
         br.ReadBits(8); // profile_idc
         br.ReadBits(8); // constraint_set0..5 + reserved_zero_2bits
@@ -50,7 +50,7 @@ public sealed class H264BaselineFixTests
     public void WriteSpsRbsp_throws_for_non_baseline_profile()
     {
         // BL-005: profile_idc != 66 should throw NotSupportedException.
-        Action act = () => H264ParameterSets.WriteSpsRbsp(width: 32, height: 32, profileIdc: 100, levelIdc: 31);
+        Action act = () => H264ParameterSets.WriteSpsRbsp(codedWidth: 32, codedHeight: 32, profileIdc: 100, levelIdc: 31);
         act.Should().Throw<NotSupportedException>()
             .WithMessage("*profile_idc 66*");
     }
@@ -58,7 +58,7 @@ public sealed class H264BaselineFixTests
     [Fact]
     public void WriteSpsRbsp_succeeds_for_baseline_profile()
     {
-        var bytes = H264ParameterSets.WriteSpsRbsp(width: 32, height: 32, profileIdc: 66, levelIdc: 31);
+        var bytes = H264ParameterSets.WriteSpsRbsp(codedWidth: 32, codedHeight: 32, profileIdc: 66, levelIdc: 31);
         bytes.Should().NotBeEmpty();
     }
 

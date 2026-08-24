@@ -145,8 +145,17 @@ public sealed class H264BaselineEncoder : IDisposable
     private readonly H264FrameSharedState _frameShared;
     private readonly int _width;
     private readonly int _height;
+    private readonly int _codedWidth;
+    private readonly int _codedHeight;
     private readonly int _mbW;
     private readonly int _mbH;
+    /// <summary>
+    /// Coded-size scratch planes for source extension when display ≠ coded dimensions; null on the
+    /// aligned fast path so aligned encodes stay allocation- and byte-identical to earlier releases.
+    /// </summary>
+    private readonly byte[]? _extendedY;
+    private readonly byte[]? _extendedU;
+    private readonly byte[]? _extendedV;
     private readonly int _picInitQpMinus26;
     /// <summary>
     /// Pool of slice encoder instances (one per parallel slice). All instances share a single
@@ -168,23 +177,39 @@ public sealed class H264BaselineEncoder : IDisposable
         int height,
         H264BaselineEncoderOptions? options = null)
     {
-        if ((width & 15) != 0 || (height & 15) != 0)
+        if (width < 2 || height < 2 || (width & 1) != 0 || (height & 1) != 0)
         {
-            throw new ArgumentException("Width and height must be multiples of 16.");
+            // 4:2:0 crop offsets move in CropUnitX = CropUnitY = 2 luma-sample units (§7.4.2.1.1,
+            // Table 6-1), and the planar I420 contract halves both axes for chroma — odd display
+            // extents are unrepresentable. Reject rather than round: silently rounding would make
+            // Width disagree with what the caller passed and what the decoder outputs.
+            throw new ArgumentException("Width and height must be even (4:2:0 chroma is subsampled 2×2).");
         }
 
         _options = options ?? new H264BaselineEncoderOptions();
         var qp = Math.Clamp(_options.QuantizationParameter, 0, 51);
         _width = width;
         _height = height;
-        _mbW = width / 16;
-        _mbH = height / 16;
+        // Coded picture covers the full macroblock grid (§7.4.2.1.1): round display dimensions up
+        // to multiples of 16; the SPS frame-cropping block signals the display size back down.
+        _codedWidth = (width + 15) & ~15;
+        _codedHeight = (height + 15) & ~15;
+        _mbW = _codedWidth / 16;
+        _mbH = _codedHeight / 16;
+        if (_codedWidth != width || _codedHeight != height)
+        {
+            _extendedY = new byte[_codedWidth * _codedHeight];
+            _extendedU = new byte[_codedWidth / 2 * (_codedHeight / 2)];
+            _extendedV = new byte[_codedWidth / 2 * (_codedHeight / 2)];
+        }
+
         _picInitQpMinus26 = qp - 26;
         var chromaRd = _options.ChromaDcRdLambda ?? H264ChromaDcScale.DefaultChromaDcRdLambdaFromLumaQp(qp);
 
         // One shared frame state owns the picture-sized buffers; each slice encoder sees the same
         // reconstruction & reference arrays, so disjoint per-slice writes assemble into one frame.
-        var sharedState = new H264FrameSharedState(width, height);
+        // Everything below the public API operates on coded (macroblock-aligned) dimensions.
+        var sharedState = new H264FrameSharedState(_codedWidth, _codedHeight);
         sharedState.MaxReferenceFrames = Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize);
         _frameShared = sharedState;
         var kernels = _options.PreferHardwareIntrinsics ? H264KernelSet.CreateBest() : new ScalarKernelSet();
@@ -193,8 +218,8 @@ public sealed class H264BaselineEncoder : IDisposable
         for (var i = 0; i < encoderCount; i++)
         {
             _sliceEncoders[i] = new H264BaselineSliceEncoder(
-                width,
-                height,
+                _codedWidth,
+                _codedHeight,
                 qp,
                 chromaRd,
                 _options.Intra4x4SadLambda,
@@ -212,23 +237,82 @@ public sealed class H264BaselineEncoder : IDisposable
                 _options.SubPartitionRangeCap);
         }
         _spsRbsp = H264ParameterSets.WriteSpsRbsp(
-            width, height, _options.ProfileIdc, _options.LevelIdc,
-            Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize));
+            _codedWidth, _codedHeight, _options.ProfileIdc, _options.LevelIdc,
+            Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize),
+            displayWidth: width, displayHeight: height);
         _ppsRbsp = H264ParameterSets.WritePpsRbsp(_picInitQpMinus26);
-        _ebspScratch = new byte[H264RbspEmulation.GetEmulationPreventionBufferSize(checked(width * height * 2 + 65_536))];
+        _ebspScratch = new byte[H264RbspEmulation.GetEmulationPreventionBufferSize(checked(_codedWidth * _codedHeight * 2 + 65_536))];
     }
 
+    /// <summary>Display width as passed to the constructor — what the decoder outputs after SPS cropping.</summary>
     public int Width => _width;
+
+    /// <summary>Display height as passed to the constructor — what the decoder outputs after SPS cropping.</summary>
     public int Height => _height;
 
-    /// <summary>Encoder reconstruction (Y) after the last <see cref="EncodeFrame"/> — same layout as input: row-major, width stride.</summary>
+    /// <summary>
+    /// Coded picture width: <see cref="Width"/> rounded up to a multiple of 16 (the macroblock grid).
+    /// Equals <see cref="Width"/> when it is already aligned; the difference is signalled as
+    /// <c>frame_crop_right_offset</c> in the SPS (§7.3.2.1.1).
+    /// </summary>
+    public int CodedWidth => _codedWidth;
+
+    /// <summary>
+    /// Coded picture height: <see cref="Height"/> rounded up to a multiple of 16. Equals
+    /// <see cref="Height"/> when already aligned; the difference is signalled as
+    /// <c>frame_crop_bottom_offset</c> in the SPS (§7.3.2.1.1).
+    /// </summary>
+    public int CodedHeight => _codedHeight;
+
+    /// <summary>
+    /// Encoder reconstruction (Y) after the last <see cref="EncodeFrame"/> — the <em>uncropped coded</em>
+    /// plane: row-major, <see cref="CodedWidth"/> stride, <see cref="CodedHeight"/> rows. This is what
+    /// must match a decoder's DPB. For a display-sized (cropped) copy use <see cref="CopyLastReconstructedTo"/>.
+    /// </summary>
     public ReadOnlySpan<byte> LastReconstructedY => _sliceEncoders[0].ReconstructedYPlane;
 
-    /// <summary>Encoder reconstruction (U) after the last <see cref="EncodeFrame"/> — half resolution, row-major, width/2 stride.</summary>
+    /// <summary>
+    /// Encoder reconstruction (U) after the last <see cref="EncodeFrame"/> — the uncropped coded plane
+    /// at half resolution: row-major, <see cref="CodedWidth"/>/2 stride, <see cref="CodedHeight"/>/2 rows.
+    /// </summary>
     public ReadOnlySpan<byte> LastReconstructedU => _sliceEncoders[0].ReconstructedUPlane;
 
-    /// <summary>Encoder reconstruction (V) after the last <see cref="EncodeFrame"/> — half resolution, row-major, width/2 stride.</summary>
+    /// <summary>
+    /// Encoder reconstruction (V) after the last <see cref="EncodeFrame"/> — the uncropped coded plane
+    /// at half resolution: row-major, <see cref="CodedWidth"/>/2 stride, <see cref="CodedHeight"/>/2 rows.
+    /// </summary>
     public ReadOnlySpan<byte> LastReconstructedV => _sliceEncoders[0].ReconstructedVPlane;
+
+    /// <summary>
+    /// Copy the last reconstruction cropped to display size (<see cref="Width"/> × <see cref="Height"/>)
+    /// into caller planes — the escape hatch when the uncropped coded planes of
+    /// <see cref="LastReconstructedY"/>/<see cref="LastReconstructedU"/>/<see cref="LastReconstructedV"/>
+    /// are inconvenient. Layout mirrors <see cref="EncodeFrame"/>: planar I420, chroma at half dimensions.
+    /// </summary>
+    /// <param name="y">Destination luma plane; must hold <paramref name="strideY"/> × <see cref="Height"/> bytes.</param>
+    /// <param name="u">Destination U plane; must hold <paramref name="strideUv"/> × <see cref="Height"/>/2 bytes.</param>
+    /// <param name="v">Destination V plane; must hold <paramref name="strideUv"/> × <see cref="Height"/>/2 bytes.</param>
+    /// <param name="strideY">Destination luma stride (≥ <see cref="Width"/>).</param>
+    /// <param name="strideUv">Destination chroma stride (≥ <see cref="Width"/>/2).</param>
+    public void CopyLastReconstructedTo(Span<byte> y, Span<byte> u, Span<byte> v, int strideY, int strideUv)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentOutOfRangeException.ThrowIfLessThan(strideY, _width);
+        ArgumentOutOfRangeException.ThrowIfLessThan(strideUv, _width / 2);
+
+        CopyCropped(LastReconstructedY, _codedWidth, y, strideY, _width, _height);
+        CopyCropped(LastReconstructedU, _codedWidth / 2, u, strideUv, _width / 2, _height / 2);
+        CopyCropped(LastReconstructedV, _codedWidth / 2, v, strideUv, _width / 2, _height / 2);
+
+        static void CopyCropped(
+            ReadOnlySpan<byte> src, int srcStride, Span<byte> dst, int dstStride, int width, int height)
+        {
+            for (var row = 0; row < height; row++)
+            {
+                src.Slice(row * srcStride, width).CopyTo(dst.Slice(row * dstStride, width));
+            }
+        }
+    }
 
     /// <summary>Test support: per-MB luma QP after the most recent <see cref="EncodeFrame"/>.</summary>
     internal ReadOnlySpan<int> TestHookLastEncodedQpY => _frameShared.QpY;
@@ -238,7 +322,10 @@ public sealed class H264BaselineEncoder : IDisposable
 
     /// <summary>
     /// Encode one frame into Annex B. Returns number of bytes written.
-    /// Planar I420: <paramref name="u"/> / <paramref name="v"/> are half dimensions; strides may exceed width/2.
+    /// Planar I420 at <em>display</em> size (<see cref="Width"/> × <see cref="Height"/>):
+    /// <paramref name="u"/> / <paramref name="v"/> are half dimensions; strides may exceed width/2.
+    /// When display ≠ coded dimensions the encoder extends the planes to the macroblock grid
+    /// internally (edge replication); callers never supply padded planes.
     /// </summary>
     /// <param name="sliceLumaQp">
     /// When set, coded slice luma QP for this picture (via slice <c>slice_qp_delta</c>). When null,
@@ -255,6 +342,28 @@ public sealed class H264BaselineEncoder : IDisposable
         int? sliceLumaQp = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+
+        // Unaligned display size: extend the caller's planes to the coded (macroblock-aligned) size
+        // by edge replication before any slice sees them. Skipped entirely on the aligned fast path
+        // so existing streams stay byte-identical and no per-frame copy is introduced.
+        if (_extendedY is not null)
+        {
+            H264SourcePlaneExtender.Extend(
+                y, strideY, _width, _height,
+                _extendedY, _codedWidth, _codedWidth, _codedHeight);
+            H264SourcePlaneExtender.Extend(
+                u, strideUv, _width / 2, _height / 2,
+                _extendedU!, _codedWidth / 2, _codedWidth / 2, _codedHeight / 2);
+            H264SourcePlaneExtender.Extend(
+                v, strideUv, _width / 2, _height / 2,
+                _extendedV!, _codedWidth / 2, _codedWidth / 2, _codedHeight / 2);
+            y = _extendedY;
+            u = _extendedU;
+            v = _extendedV;
+            strideY = _codedWidth;
+            strideUv = _codedWidth / 2;
+        }
+
         var interval = Math.Max(1, _options.KeyframeIntervalFrames);
         var isIdr = _codedFrameIndex == 0 || forceKeyframe || (_codedFrameIndex % interval == 0);
         if (isIdr)
