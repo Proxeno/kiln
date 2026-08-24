@@ -21,6 +21,26 @@ it owns:
 - The SPS/PPS RBSP, built once at construction by `H264ParameterSets` from
   width/height/profile/level/`MaxReferenceFrames`.
 
+**Coded vs display dimensions.** The public API speaks *display* size
+(`Width`/`Height`, what the caller passed and what decoders output); everything
+below the orchestrator speaks *coded* size (`CodedWidth`/`CodedHeight`, the
+display size rounded up to the 16×16 macroblock grid). When they differ, the
+constructor sizes all internal state from the coded dimensions and the SPS
+carries a frame-cropping block (§7.3.2.1.1) signalling the display size —
+right/bottom offsets only, in 2-luma-sample crop units (§7.4.2.1.1, Table 6-1),
+which is why dimensions must be even. Per `EncodeFrame`,
+`H264SourcePlaneExtender` extends the caller's display-sized I420 planes to
+coded size by replicating the last real column/row (not zero-fill: the padding
+is coded, deblocked, and stored in the DPB, and the §8.7 loop filter reads it
+into activity tests that update *visible* samples across the crop edge;
+replication also lets the padding MBs collapse to CBP=0/P_Skip). The extension
+step is skipped entirely for aligned dimensions, so those streams remain
+byte-identical to earlier releases. Cropping is display-stage-only in H.264:
+reconstruction, ME, deblocking, and the DPB all operate on the uncropped coded
+picture — exactly as a conformant decoder does — so `LastReconstructedY/U/V`
+return the coded plane (stride `CodedWidth`);
+`CopyLastReconstructedTo` provides a display-sized crop.
+
 Per `EncodeFrame` call it decides whether the picture is IDR — frame 0,
 `forceKeyframe`, or `codedFrameIndex % KeyframeIntervalFrames == 0` — resets
 `h264FrameNum` on IDR, emits SPS+PPS ahead of IDR NALs only (not every P
