@@ -3,34 +3,38 @@ using FlashCap;
 namespace Kiln.Capture;
 
 /// <summary>
-/// Converts the raw frame formats a camera delivers into the planar I420 that Kiln consumes.
+/// Converts the raw frames a camera delivers into the planar I420 that Kiln consumes.
 /// </summary>
 /// <remarks>
 /// Kiln takes three separate 8-bit planes: full-resolution luma plus half-resolution Cb and Cr
-/// (see <c>H264BaselineEncoder.EncodeFrame</c>). Cameras hand back packed 4:2:2 or interleaved
-/// formats, so every frame needs a repack, and 4:2:2 sources additionally need their chroma
-/// subsampled vertically to reach 4:2:0.
+/// (see <c>H264BaselineEncoder.EncodeFrame</c>). Cameras hand back packed 4:2:2, interleaved or
+/// RGB data, so every frame needs a repack, and non-4:2:0 sources also need chroma subsampled.
 /// </remarks>
 internal sealed class FrameConverter
 {
-    private readonly PixelFormats _format;
+    private readonly CapturedFrameFormat _format;
     private readonly int _width;
     private readonly int _height;
 
-    internal FrameConverter(PixelFormats format, int width, int height)
+    internal FrameConverter(CapturedFrameFormat format)
     {
-        if (!IsSupported(format))
+        ArgumentNullException.ThrowIfNull(format);
+
+        if (!format.IsRgb && !IsSupportedPackedFormat(format.PackedFormat))
         {
-            throw new ArgumentException($"Unsupported capture format {format}.", nameof(format));
+            throw new ArgumentException(
+                $"Unsupported capture format {format.PackedFormat}.", nameof(format));
         }
 
         _format = format;
-        _width = width;
-        _height = height;
 
-        Y = new byte[width * height];
-        U = new byte[width / 2 * (height / 2)];
-        V = new byte[width / 2 * (height / 2)];
+        // Kiln needs even dimensions for 4:2:0 chroma, so trim an odd edge row or column.
+        _width = format.Width & ~1;
+        _height = format.Height & ~1;
+
+        Y = new byte[_width * _height];
+        U = new byte[_width / 2 * (_height / 2)];
+        V = new byte[_width / 2 * (_height / 2)];
     }
 
     /// <summary>Luma plane, stride <see cref="StrideY"/>.</summary>
@@ -42,34 +46,28 @@ internal sealed class FrameConverter
     /// <summary>Cr plane, stride <see cref="StrideUv"/>.</summary>
     internal byte[] V { get; }
 
+    internal int Width => _width;
+
+    internal int Height => _height;
+
     internal int StrideY => _width;
 
     internal int StrideUv => _width / 2;
 
-    /// <summary>Formats this converter can turn into I420.</summary>
-    internal static bool IsSupported(PixelFormats format) => format is
-        PixelFormats.YUYV or PixelFormats.UYVY or PixelFormats.NV12 or
-        PixelFormats.RGB32 or PixelFormats.ARGB32 or PixelFormats.RGB24;
+    /// <summary>Packed formats this converter can turn into I420 when no bitmap header is present.</summary>
+    internal static bool IsSupportedPackedFormat(PixelFormats format) => format is
+        PixelFormats.YUYV or PixelFormats.UYVY or PixelFormats.NV12;
 
     /// <summary>Converts one captured frame into <see cref="Y"/>, <see cref="U"/> and <see cref="V"/>.</summary>
     internal void Convert(ReadOnlySpan<byte> source)
     {
-        // Some backends return a full DIB regardless of the format the characteristics advertise,
-        // so sniff the buffer before trusting _format.
-        if (Dib.TryParse(source, out var dib))
+        if (_format.IsRgb)
         {
-            if (dib.Width != _width || dib.Height != _height)
-            {
-                throw new ArgumentException(
-                    $"Captured bitmap is {dib.Width}x{dib.Height} but the encoder expects {_width}x{_height}.",
-                    nameof(source));
-            }
-
-            ConvertPackedRgb(source[dib.PixelOffset..], dib.Stride, dib.BytesPerPixel, dib.BottomUp);
+            ConvertRgb(source[_format.PixelOffset..]);
             return;
         }
 
-        switch (_format)
+        switch (_format.PackedFormat)
         {
             case PixelFormats.YUYV:
                 // Packed 4:2:2, byte order Y0 Cb Y1 Cr.
@@ -82,15 +80,8 @@ internal sealed class FrameConverter
             case PixelFormats.NV12:
                 ConvertNv12(source);
                 break;
-            case PixelFormats.RGB24:
-                ConvertPackedRgb(source, _width * 3, bytesPerPixel: 3, bottomUp: false);
-                break;
-            case PixelFormats.RGB32:
-            case PixelFormats.ARGB32:
-                ConvertPackedRgb(source, _width * 4, bytesPerPixel: 4, bottomUp: false);
-                break;
             default:
-                throw new InvalidOperationException($"Unsupported capture format {_format}.");
+                throw new InvalidOperationException($"Unsupported capture format {_format.PackedFormat}.");
         }
     }
 
@@ -100,7 +91,7 @@ internal sealed class FrameConverter
     /// </summary>
     private void ConvertPackedYuv422(ReadOnlySpan<byte> source, int lumaOffset, int cbOffset, int crOffset)
     {
-        var sourceStride = _width * 2;
+        var sourceStride = _format.Width * 2;
         RequireLength(source, sourceStride * _height);
 
         for (var row = 0; row < _height; row++)
@@ -133,16 +124,20 @@ internal sealed class FrameConverter
     /// <summary>Splits NV12's interleaved chroma plane into separate Cb and Cr planes.</summary>
     private void ConvertNv12(ReadOnlySpan<byte> source)
     {
+        var sourceStride = _format.Width;
         var chromaWidth = _width / 2;
         var chromaHeight = _height / 2;
-        RequireLength(source, (_width * _height) + (_width * chromaHeight));
+        RequireLength(source, sourceStride * (_format.Height + (_format.Height / 2)));
 
-        source[..(_width * _height)].CopyTo(Y);
+        for (var row = 0; row < _height; row++)
+        {
+            source.Slice(row * sourceStride, _width).CopyTo(Y.AsSpan(row * _width));
+        }
 
-        var uv = source[(_width * _height)..];
+        var uv = source[(sourceStride * _format.Height)..];
         for (var cy = 0; cy < chromaHeight; cy++)
         {
-            var src = cy * _width;
+            var src = cy * sourceStride;
             var dst = cy * chromaWidth;
             for (var cx = 0; cx < chromaWidth; cx++)
             {
@@ -153,26 +148,30 @@ internal sealed class FrameConverter
     }
 
     /// <summary>
-    /// Converts packed RGB to I420 using the BT.601 studio-swing coefficients, box-averaging each
-    /// 2x2 pixel group down to one chroma sample. Byte order follows the DIB convention (B, G, R),
-    /// and <paramref name="bottomUp"/> handles DIBs whose first stored row is the bottom one.
+    /// Converts an RGB bitmap to I420 with the BT.601 studio-swing coefficients, box-averaging
+    /// each 2x2 pixel group down to one chroma sample.
     /// </summary>
-    private void ConvertPackedRgb(ReadOnlySpan<byte> source, int sourceStride, int bytesPerPixel, bool bottomUp)
+    private void ConvertRgb(ReadOnlySpan<byte> pixels)
     {
-        RequireLength(source, sourceStride * _height);
+        var stride = _format.Stride;
+        var bytesPerPixel = _format.BytesPerPixel;
+        var red = _format.RedLane;
+        var green = _format.GreenLane;
+        var blue = _format.BlueLane;
+        RequireLength(pixels, stride * _format.Height);
 
         for (var row = 0; row < _height; row++)
         {
-            var src = SourceRow(row, bottomUp) * sourceStride;
+            var src = SourceRow(row) * stride;
             var dst = row * _width;
             for (var x = 0; x < _width; x++)
             {
                 var p = src + (x * bytesPerPixel);
-                int b = source[p];
-                int g = source[p + 1];
-                int r = source[p + 2];
+                int r = pixels[p + red];
+                int g = pixels[p + green];
+                int b = pixels[p + blue];
 
-                // Y = 16 + (65.738 R + 129.057 G + 25.064 B) / 256, in 16.16 fixed point.
+                // Y = 16 + (65.738 R + 129.057 G + 25.064 B) / 256, rounded, in fixed point.
                 Y[dst + x] = (byte)(16 + (((66 * r) + (129 * g) + (25 * b) + 128) >> 8));
             }
         }
@@ -187,13 +186,13 @@ internal sealed class FrameConverter
                 int sumR = 0, sumG = 0, sumB = 0;
                 for (var dy = 0; dy < 2; dy++)
                 {
-                    var src = SourceRow((cy * 2) + dy, bottomUp) * sourceStride;
+                    var src = SourceRow((cy * 2) + dy) * stride;
                     for (var dx = 0; dx < 2; dx++)
                     {
                         var p = src + (((cx * 2) + dx) * bytesPerPixel);
-                        sumB += source[p];
-                        sumG += source[p + 1];
-                        sumR += source[p + 2];
+                        sumR += pixels[p + red];
+                        sumG += pixels[p + green];
+                        sumB += pixels[p + blue];
                     }
                 }
 
@@ -209,15 +208,15 @@ internal sealed class FrameConverter
 
     private static byte Average(byte a, byte b) => (byte)((a + b + 1) >> 1);
 
-    /// <summary>Maps an output row to its stored row, accounting for bottom-up DIB ordering.</summary>
-    private int SourceRow(int row, bool bottomUp) => bottomUp ? _height - 1 - row : row;
+    /// <summary>Maps an output row to its stored row, accounting for bottom-up bitmaps.</summary>
+    private int SourceRow(int row) => _format.TopDown ? row : _format.Height - 1 - row;
 
     private static void RequireLength(ReadOnlySpan<byte> source, int required)
     {
         if (source.Length < required)
         {
             throw new ArgumentException(
-                $"Captured frame is {source.Length} bytes but the selected format needs {required}.",
+                $"Captured frame is {source.Length} bytes but the resolved format needs {required}.",
                 nameof(source));
         }
     }

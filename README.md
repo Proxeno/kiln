@@ -157,8 +157,20 @@ id is `Proxeno.Kiln`; the assembly and namespace stay `Kiln`, so code uses `usin
 dotnet add package Proxeno.Kiln
 ```
 
+## Try it
+
+[`samples/Kiln.Capture`](samples/Kiln.Capture) records your camera to a playable `.m4v` — capture,
+colour conversion, H.264 encode and MP4 muxing, all managed, no native binaries anywhere in the
+pipeline:
+
+```
+dotnet run --project samples/Kiln.Capture -- list
+dotnet run --project samples/Kiln.Capture -- record --seconds 10 --output capture.m4v
+```
+
 ## Documentation
 
+- [samples/Kiln.Capture](samples/Kiln.Capture) — camera → `.m4v` sample, and how the MP4 muxing works
 - [docs/architecture.md](docs/architecture.md) — pipeline stages, SIMD kernel structure, subsystems
 - [docs/perf-gate.md](docs/perf-gate.md) — benchmark baseline + regression gate workflow
 - [CONTRIBUTING.md](CONTRIBUTING.md) — build, test, and contribution rules

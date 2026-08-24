@@ -35,6 +35,10 @@ dotnet test -c Release
 - [`tests/Kiln.Tests`](tests/Kiln.Tests) — xunit test project.
 - [`bench/Kiln.Benchmarks`](bench/Kiln.Benchmarks) — BenchmarkDotNet
   benchmarks used by the perf gate (below) and for ad hoc profiling.
+- [`samples/Kiln.Capture`](samples/Kiln.Capture) — console sample that records
+  a camera to `.m4v`. It is the only project with a third-party runtime
+  dependency (FlashCap, for camera access); the library itself must stay
+  dependency-free. Its MP4 muxer is sample code, not public API.
 - [`docs/architecture.md`](docs/architecture.md) — pipeline stages, SIMD
   kernel structure, and which subsystems are production vs. experimental.
   Read this before making non-trivial changes to the encoder.

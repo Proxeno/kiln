@@ -49,9 +49,8 @@ internal static class Program
         if (!DeviceCatalog.IsEncodable(options.Width, options.Height))
         {
             Console.Error.WriteLine(
-                $"error: {options.Width}x{options.Height} is not encodable. Kiln requires both " +
-                "dimensions to be multiples of 16.");
-            Console.Error.WriteLine("       Try 1280x720, 640x480, 320x240 or 1920x1440.");
+                $"error: {options.Width}x{options.Height} is not encodable. 4:2:0 chroma requires " +
+                "both dimensions to be even.");
             return 1;
         }
 
@@ -93,6 +92,7 @@ internal static class Program
                 "--fps" => options with { Fps = ParseInt(name, value) },
                 "--seconds" => options with { Seconds = ParseInt(name, value) },
                 "--qp" => options with { Qp = ParseInt(name, value) },
+                "--slices" => options with { Slices = ParseInt(name, value) },
                 "--output" => options with { OutputPath = value },
                 _ => throw new ArgumentException($"Unknown option \"{name}\"."),
             };
@@ -101,6 +101,11 @@ internal static class Program
         if (options.Qp is < 0 or > 51)
         {
             throw new ArgumentException($"--qp must be between 0 and 51; got {options.Qp}.");
+        }
+
+        if (options.Slices is < 1 or > 8)
+        {
+            throw new ArgumentException($"--slices must be between 1 and 8; got {options.Slices}.");
         }
 
         if (options.Seconds <= 0)
@@ -126,11 +131,12 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine("Options for record:");
         Console.WriteLine("  --device  <index>   capture device from \"list\"      (default 0)");
-        Console.WriteLine("  --width   <px>      frame width, multiple of 16     (default 1280)");
-        Console.WriteLine("  --height  <px>      frame height, multiple of 16    (default 720)");
+        Console.WriteLine("  --width   <px>      requested frame width           (default 1280)");
+        Console.WriteLine("  --height  <px>      requested frame height          (default 720)");
         Console.WriteLine("  --fps     <n>       requested frame rate            (default 30)");
         Console.WriteLine("  --seconds <n>       recording length                (default 10)");
         Console.WriteLine("  --qp      <0-51>    quantization parameter          (default 26)");
+        Console.WriteLine("  --slices  <1-8>     slices per frame, encoded in parallel (default 4)");
         Console.WriteLine("  --output  <path>    output file                     (default capture.m4v)");
         Console.WriteLine();
         Console.WriteLine("Press Ctrl+C to stop early; the file is finalized either way.");

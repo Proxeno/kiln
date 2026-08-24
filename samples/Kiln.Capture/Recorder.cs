@@ -24,6 +24,14 @@ internal sealed class Recorder
     private bool _hasPending;
     private bool _stopped;
 
+    private readonly Stopwatch _captureClock = new();
+    /// <summary>
+    /// Frames discarded before recording starts. A camera's first frames arrive erratically —
+    /// on this hardware the gap between the first few can exceed two seconds while exposure and
+    /// the capture graph settle — which would otherwise open the file with a long freeze.
+    /// </summary>
+    private const int WarmupFrames = 5;
+
     private int _dropped;
     private int _captured;
 
@@ -51,23 +59,9 @@ internal sealed class Recorder
         Console.WriteLine($"Device : {device.Name} ({device.DeviceType})");
         Console.WriteLine($"Format : {DeviceCatalog.Describe(characteristics)}");
         Console.WriteLine($"Output : {options.OutputPath}");
-        Console.WriteLine($"Encode : H.264 baseline, QP {options.Qp}, IDR every {options.Fps * 2} frames");
-        Console.WriteLine();
-
-        var converter = new FrameConverter(characteristics.PixelFormat, options.Width, options.Height);
-
-        using var encoder = new H264BaselineEncoder(options.Width, options.Height, new H264BaselineEncoderOptions
-        {
-            QuantizationParameter = options.Qp,
-            KeyframeIntervalFrames = options.Fps * 2,
-            SliceCount = 1,
-        });
-
-        var annexB = new byte[(options.Width * options.Height * 2) + 512_000];
-        using var mp4 = new Mp4Writer(options.OutputPath, options.Width, options.Height);
 
         // TranscodeFormats.DoNotTranscode keeps FlashCap out of the pixel path so we receive the
-        // device's native bytes and convert them ourselves.
+        // device's own bytes and convert them ourselves.
         using var captureDevice = await device.OpenAsync(
             characteristics,
             TranscodeFormats.DoNotTranscode,
@@ -79,6 +73,14 @@ internal sealed class Recorder
         var stopwatch = Stopwatch.StartNew();
         var deadline = TimeSpan.FromSeconds(options.Seconds);
 
+        var firstTimestamp = TimeSpan.MinValue;
+        FrameConverter? converter = null;
+        H264BaselineEncoder? encoder = null;
+        Mp4Writer? mp4 = null;
+        byte[] annexB = [];
+        var frames = 0;
+
+        _captureClock.Restart();
         await captureDevice.StartAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -89,10 +91,55 @@ internal sealed class Recorder
                     continue;
                 }
 
+                if (firstTimestamp == TimeSpan.MinValue)
+                {
+                    firstTimestamp = timestamp;
+                }
+
+                timestamp -= firstTimestamp;
+
+                if (converter is null)
+                {
+                    // The real frame layout is only knowable from a delivered frame, so the encoder
+                    // and the muxer are built once the first one arrives.
+                    var format = CapturedFrameFormat.Resolve(
+                        _work.AsSpan(0, length),
+                        characteristics.PixelFormat,
+                        characteristics.Width,
+                        characteristics.Height,
+                        DeviceCatalog.AdvertisedSizes(device));
+
+                    if (format.Anomaly is not null)
+                    {
+                        Console.WriteLine($"note   : {format.Anomaly}");
+                    }
+
+                    converter = new FrameConverter(format);
+                    Console.WriteLine($"Frames : {format.Describe()}");
+                    Console.WriteLine($"Encode : {converter.Width}x{converter.Height} " +
+                        $"level {H264Levels.ForFrameSize(converter.Width, converter.Height) / 10.0:0.0}, " +
+                        $"QP {options.Qp}, IDR every {options.Fps * 2} frames");
+                    Console.WriteLine();
+
+                    encoder = new H264BaselineEncoder(
+                        converter.Width,
+                        converter.Height,
+                        new H264BaselineEncoderOptions
+                        {
+                            QuantizationParameter = options.Qp,
+                            KeyframeIntervalFrames = options.Fps * 2,
+                            LevelIdc = H264Levels.ForFrameSize(converter.Width, converter.Height),
+                            SliceCount = options.Slices,
+                        });
+
+                    annexB = new byte[(converter.Width * converter.Height * 2) + 512_000];
+                    mp4 = new Mp4Writer(options.OutputPath, converter.Width, converter.Height);
+                }
+
                 converter.Convert(_work.AsSpan(0, length));
 
                 var encodeStart = Stopwatch.GetTimestamp();
-                var written = encoder.EncodeFrame(
+                var written = encoder!.EncodeFrame(
                     converter.Y,
                     converter.U,
                     converter.V,
@@ -102,13 +149,13 @@ internal sealed class Recorder
                 totalEncodeMs += Stopwatch.GetElapsedTime(encodeStart).TotalMilliseconds;
                 encodedBytes += written;
 
-                mp4.WriteSample(annexB.AsSpan(0, written), encoder.LastFrameWasIdr, timestamp);
+                mp4!.WriteSample(annexB.AsSpan(0, written), encoder.LastFrameWasIdr, timestamp);
 
                 if (mp4.SampleCount % 15 == 0)
                 {
                     Console.Write(
                         $"\r  {mp4.SampleCount,5} frames  {stopwatch.Elapsed.TotalSeconds,5:0.0}s  " +
-                        $"{encodedBytes / 1024.0,7:0.0} KiB");
+                        $"{encodedBytes / 1024.0,8:0.0} KiB");
                 }
             }
         }
@@ -123,8 +170,9 @@ internal sealed class Recorder
             await captureDevice.StopAsync(CancellationToken.None).ConfigureAwait(false);
         }
 
-        var frames = mp4.SampleCount;
-        mp4.Dispose();
+        frames = mp4?.SampleCount ?? 0;
+        mp4?.Dispose();
+        encoder?.Dispose();
 
         Console.WriteLine();
         Console.WriteLine();
@@ -157,11 +205,19 @@ internal sealed class Recorder
     private void OnFrameArrived(PixelBufferScope scope)
     {
         var image = scope.Buffer.ReferImage();
-        var timestamp = scope.Buffer.Timestamp;
+
+        // Stamp arrival from our own clock: PixelBuffer.Timestamp is not filled in consistently
+        // across FlashCap backends, and a wrong value here corrupts the container's stts table.
+        var timestamp = _captureClock.Elapsed;
 
         lock (_gate)
         {
             if (_stopped)
+            {
+                return;
+            }
+
+            if (++_captured <= WarmupFrames)
             {
                 return;
             }
@@ -182,7 +238,6 @@ internal sealed class Recorder
             _pendingLength = image.Count;
             _pendingTimestamp = timestamp;
             _hasPending = true;
-            _captured++;
             Monitor.Pulse(_gate);
         }
     }
@@ -232,4 +287,7 @@ internal sealed record RecordOptions
     internal int Qp { get; init; } = 26;
 
     internal string OutputPath { get; init; } = "capture.m4v";
+
+    /// <summary>Defaults to 4: encoding slices in parallel is what keeps HD frame rates viable.</summary>
+    internal int Slices { get; init; } = 4;
 }
