@@ -30,6 +30,15 @@ public class H264ResolutionSliceSweepBenchmarks
     [Params(1, 2, 4, 8)]
     public int SliceCount { get; set; }
 
+    /// <summary>
+    /// True runs the issue #3 fixes (temporal-seed probe + rate-aware ref1 competition); false
+    /// restores the pre-fix behaviour via the diagnostics kill switches, giving an interleaved
+    /// before/after within one BenchmarkDotNet session. The switches only alter P-slice encoder
+    /// search policy, so IDR cells measure equal across arms by construction.
+    /// </summary>
+    [Params(true, false)]
+    public bool Issue3Fix { get; set; }
+
     private int _w;
     private int _h;
     private int _ys;
@@ -59,6 +68,8 @@ public class H264ResolutionSliceSweepBenchmarks
             SliceCount = SliceCount,
         };
 
+        H264PInterDiagnostics.DisableTemporalSeedProbe = !Issue3Fix;
+        H264PInterDiagnostics.DisableRef1TieMargin = !Issue3Fix;
         _pEncoder = new H264BaselineEncoder(_w, _h, Opts());
         _idrEncoder = new H264BaselineEncoder(_w, _h, Opts());
         _annex = new byte[_ys * 2 + 1_048_576];
