@@ -255,11 +255,43 @@ public sealed class LowLatencyRateController
         EncoderPipelineStats stats)
     {
         var hasPacketLoss = feedback.PacketLossRatio > _config.CongestionPacketLossThreshold;
-        var hasRttSpike = feedback.RoundTripTime.TotalMilliseconds > 50;
+        var hasRttSpike = IsRttSpike(feedback.RoundTripTime);
         var hasSendQueueBacklog = feedback.PendingRtpBytes > _config.MaxPendingRtpBytes;
         var hasNackBurst = feedback.NackCount > 5;
 
         return hasPacketLoss || hasRttSpike || hasSendQueueBacklog || hasNackBurst;
+    }
+
+    /// <summary>
+    /// RTT-spike congestion test against a tracked baseline: spike when RTT exceeds both
+    /// (baseline * <see cref="RateControlConfig.CongestionRttMultiplier"/>) and
+    /// <see cref="RateControlConfig.CongestionRttFloor"/>. The baseline (see
+    /// <see cref="RateControlState.BaselineRttMs"/>) snaps down to the fastest sample seen and
+    /// drifts up by 1/256 of the gap per decision — a route change becomes the new baseline over a
+    /// few seconds while a transient bufferbloat spike barely moves it. Non-positive RTTs (callers
+    /// without an RTT measurement) update nothing and never spike, and until the first positive
+    /// sample there is no baseline to exceed — the other three congestion signals still apply. All
+    /// inputs are caller-supplied feedback, so the test stays deterministic.
+    /// </summary>
+    private bool IsRttSpike(TimeSpan roundTripTime)
+    {
+        var rttMs = roundTripTime.TotalMilliseconds;
+        if (rttMs <= 0)
+        {
+            return false;
+        }
+
+        if (_state.BaselineRttMs <= 0 || rttMs < _state.BaselineRttMs)
+        {
+            _state.BaselineRttMs = rttMs;
+        }
+        else
+        {
+            _state.BaselineRttMs += (rttMs - _state.BaselineRttMs) / 256.0;
+        }
+
+        return rttMs > _state.BaselineRttMs * _config.CongestionRttMultiplier
+            && rttMs > _config.CongestionRttFloor.TotalMilliseconds;
     }
 
     /// <summary>
