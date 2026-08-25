@@ -278,9 +278,10 @@ decisions are surfaced as recommendations until you can supply rescaled frames a
 `ChangeResolution` (Kiln has no scaler; the session recreates the encoder and the next frame is an
 IDR with the new SPS), `TargetFps` is a pacing contract for your capture loop (the SPS carries no
 timing info), and intra refresh remains **unimplemented** — a recovery request that lands in the
-IDR cooldown is reported on the result, not silently faked. The full taxonomy of what may change
-mid-stream at which boundary is in [docs/architecture.md](docs/architecture.md). The `Queue`
-namespace (latest-frame dropping) still ships unwired — **experimental**, APIs may change.
+IDR cooldown is reported on the result, not silently faked. Frame pacing and input dropping stay
+in your capture loop by design (the capture sample shows a latest-frame-wins hand-off; report your
+drops via `EncoderPipelineTimings` and the controller sees them). The full taxonomy of what may
+change mid-stream at which boundary is in [docs/architecture.md](docs/architecture.md).
 
 ## Installing
 

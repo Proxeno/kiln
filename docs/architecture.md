@@ -194,7 +194,14 @@ and apply decisions with the same primitives the session uses
 
 - `LowLatencyRateController` ([`RateControl/LowLatencyRateController.cs`](../src/Kiln/RateControl/LowLatencyRateController.cs))
   is the per-frame decision core (bitrate up/downshift, QP tracking ~+6 per
-  halving of the target bitrate, max-frame-bytes budget). **Ownership
+  halving of the target bitrate, max-frame-bytes budget). Congestion is
+  declared on packet loss, NACK bursts, send-queue backlog, or an RTT spike —
+  the RTT test is relative to a tracked baseline (fastest sample seen, with
+  a slow deterministic upward drift so a route change becomes the new
+  baseline): spike when RTT exceeds both
+  `baseline × CongestionRttMultiplier` and the absolute
+  `CongestionRttFloor` (default 50 ms), so a high-propagation-RTT link is
+  not treated as permanently congested. **Ownership
   contract:** it owns exactly one `H264RecoveryPolicy` instance and invokes
   `DecideRecovery` exactly once per `Decide()` call, folding the result in.
   Composing code must not call the recovery policy a second time or
@@ -210,7 +217,12 @@ and apply decisions with the same primitives the session uses
 - `Kiln.Recovery.H264RecoveryPolicy` ([`Recovery/H264RecoveryPolicy.cs`](../src/Kiln/Recovery/H264RecoveryPolicy.cs))
   turns client PLI/FIR feedback into `ForceIdr`/`EnableIntraRefresh`
   decisions, with an IDR cooldown to prevent keyframe storms (FIR takes
-  priority over PLI).
+  priority over PLI). Lowest priority: when the encoder reports the previous
+  frame was a scene cut (`EncoderPipelineStats.SceneChangeDetected`, a P
+  frame that coded a majority of MBs intra) and the cooldown is clear, the
+  next frame is forced to an IDR — a clean random-access point at the scene
+  boundary. In cooldown a scene change does nothing (nothing was lost, so
+  there is no intra-refresh fallback).
 - `IdrBudget` ([`Recovery/IdrBudget.cs`](../src/Kiln/Recovery/IdrBudget.cs))
   computes the larger byte budget IDR frames are allowed (2× the normal
   per-frame budget by default).
@@ -274,10 +286,14 @@ fps and the caller is expected to pace capture accordingly (pin
 Determinism holds through all three tiers: adaptation inputs are ordinary
 inputs, applied between frames, so identical frames plus identical feedback
 produce identical bitstreams. The session derives `EncoderPipelineStats`
-from the bitstream itself (bytes/QP/IDR of the previous frame) and reports
-wall-clock fields as zero unless the caller passes `EncoderPipelineTimings`
-explicitly — timings are then inputs too, and replaying them replays the
-stream.
+from the encoder itself — bytes/QP/IDR of the previous frame plus its
+measured content signals (`MotionComplexity` from the mean inter MV
+magnitude, `TextureComplexity` from mean log₂ MB variance,
+`SceneChangeDetected` from the intra ratio of P frames; all pure functions
+of the supplied frames, also surfaced on `H264StreamingEncodeResult`) — and
+reports wall-clock fields as zero unless the caller passes
+`EncoderPipelineTimings` explicitly — timings are then inputs too, and
+replaying them replays the stream.
 
 Tests: `tests/Kiln.Tests/H264StreamingSessionTests.cs` (adaptation taking
 effect + ffmpeg oracle across every tier transition),
@@ -298,14 +314,17 @@ byte-exact reconstruction parity), and
   into one `EncoderAdaptationDecision` per frame. **This layer is now
   consumed in production by `H264StreamingSession`** (it is the session's
   controller); the types themselves remain internal and may change shape.
-- **`Internal/H264/Queue/`** — still unwired, preview only:
-  `LatestFrameQueue<T>`, a thread-safe depth-≤1 "newest frame wins" queue
-  (older pending frame is dropped when a newer one arrives), and
-  `FrameDropPolicy`, which decides whether the frame currently being
-  encoded is stale enough (default 50 ms / ~3 frame periods at 60fps) and
-  has newer frames pending to justify dropping it. Nothing in the encoder
-  or the session references them; a server wanting latest-frame semantics
-  composes them around its own capture loop.
+
+Frame pacing and input dropping are deliberately **not** a library
+subsystem (an earlier `Internal/H264/Queue/` preview shipped unwired and
+has been removed): latest-frame-wins hand-off is a property of the caller's
+capture loop and buffer ownership — the capture sample's `Recorder`
+([`samples/Kiln.Capture/Recorder.cs`](../samples/Kiln.Capture/Recorder.cs))
+is the reference implementation (pooled buffer swap, blocking wait, dropped
+counter, no per-frame allocation), which a `T : class` queue type could not
+match. The library-side contract is the accounting: report your loop's
+`PendingInputFrames`/`DroppedInputFrames` via `EncoderPipelineTimings` and
+the rate controller sees your drops.
 
 ## Diagnostics (`KILN_*` environment variables)
 
