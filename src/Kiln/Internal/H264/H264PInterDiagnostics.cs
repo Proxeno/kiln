@@ -61,6 +61,8 @@ internal static class H264PInterDiagnostics
     private static long s_phase1Skip;
     private static long s_phase2Entered;
     private static long s_phase2bIntraWin;
+    private static long s_meHexSearches;
+    private static long s_meExhaustiveFallbacks;
 
     private static long s_phase2bEvalCount;
     private static long s_phase2bChooseInterCount;
@@ -173,6 +175,8 @@ internal static class H264PInterDiagnostics
         Interlocked.Exchange(ref s_phase1Skip, 0);
         Interlocked.Exchange(ref s_phase2Entered, 0);
         Interlocked.Exchange(ref s_phase2bIntraWin, 0);
+        Interlocked.Exchange(ref s_meHexSearches, 0);
+        Interlocked.Exchange(ref s_meExhaustiveFallbacks, 0);
     }
 
     public static void ResetPhase2bRdAccounting()
@@ -204,6 +208,16 @@ internal static class H264PInterDiagnostics
             Volatile.Read(ref s_phase1Skip),
             Volatile.Read(ref s_phase2Entered),
             Volatile.Read(ref s_phase2bIntraWin));
+
+    /// <summary>
+    /// Integer-pel ME invocation counters (gated by <see cref="CollectPhaseCounts"/>): hex seed
+    /// searches started, and how many escalated to the exhaustive-window fallback. These are the
+    /// direct measure of how much motion-search work slicing creates (see issue #3).
+    /// </summary>
+    public static (long HexSearches, long ExhaustiveFallbacks) ReadMeSearchCounts() =>
+        (
+            Volatile.Read(ref s_meHexSearches),
+            Volatile.Read(ref s_meExhaustiveFallbacks));
 
     public readonly record struct Phase2bRdSnapshot(
         long EvaluatedMacroblocks,
@@ -316,6 +330,22 @@ internal static class H264PInterDiagnostics
         if (CollectPhaseCounts)
         {
             Interlocked.Increment(ref s_phase2bIntraWin);
+        }
+    }
+
+    internal static void NotifyMeHexSearch()
+    {
+        if (CollectPhaseCounts)
+        {
+            Interlocked.Increment(ref s_meHexSearches);
+        }
+    }
+
+    internal static void NotifyMeExhaustiveFallback()
+    {
+        if (CollectPhaseCounts)
+        {
+            Interlocked.Increment(ref s_meExhaustiveFallbacks);
         }
     }
 
