@@ -119,6 +119,45 @@ internal sealed class H264FrameSharedState
     /// <summary>Per-MB winning reference index (0 or 1) for inter-coded MBs. Used by deblocking and MVP computation.</summary>
     public readonly byte[] MbRefIdx;
 
+    /// <summary>
+    /// Gradual intra refresh: sentinel for "the whole picture is join-guaranteed" (equivalently,
+    /// "no motion-vector restriction against this picture"). Kept as a plain
+    /// <see cref="int.MaxValue"/> so comparisons against pixel x positions need no special-casing.
+    /// </summary>
+    public const int GuaranteedFullPicture = int.MaxValue;
+    /// <summary>
+    /// Gradual intra refresh: per-DPB-slot exclusive luma-x bound of the join-guarantee region —
+    /// pixels with x &lt; this bound in that reference picture reconstruct byte-identically for a
+    /// decoder that started at the current refresh wave's first frame. Already excludes the ≤3-px
+    /// strip the §8.7 deblocking filter mixes with unrefreshed content at the wave's leading edge.
+    /// Rotated with the DPB (slot 0 = most recent). <see cref="GuaranteedFullPicture"/> means the
+    /// whole picture (IDR, or a completed wave) — the state of every slot outside refresh use, which
+    /// keeps every restriction check a no-op on non-refresh streams.
+    /// Written only between frames (single-threaded fence), read by all slice encoders.
+    /// </summary>
+    public readonly int[] DpbGuaranteedUptoX;
+    /// <summary>
+    /// Gradual intra refresh: the join-guarantee bound the frame currently being encoded must
+    /// establish. Inter MBs whose right luma edge lies left of this bound restrict their motion
+    /// vectors to the <see cref="DpbGuaranteedUptoX"/> region of whichever reference they use
+    /// (falling back to intra coding when no acceptable restricted vector exists); MBs at or right
+    /// of it are unrestricted. Set once per frame by the orchestrator before any slice encodes.
+    /// </summary>
+    public int CurrentFrameGuaranteedUptoX = GuaranteedFullPicture;
+    /// <summary>
+    /// Gradual intra refresh: first MB column (inclusive) of this frame's forced-intra band, or -1
+    /// when no band is active. Set once per frame by the orchestrator.
+    /// </summary>
+    public int RefreshBandStartMbX = -1;
+    /// <summary>Gradual intra refresh: end MB column (exclusive) of this frame's forced-intra band.</summary>
+    public int RefreshBandEndMbX = -1;
+    /// <summary>
+    /// True when any gradual-intra-refresh coding constraint can bind this frame: a forced-intra
+    /// band is active, or some DPB slot carries a partial join guarantee. False on every frame of a
+    /// non-refresh stream, which is what keeps the refresh checks off the hot path there.
+    /// </summary>
+    public bool RefreshConstraintsActive;
+
     /// <param name="maxReferenceFrames">
     /// Effective reference cap from options, clamped to [1, <see cref="MaxDpbSize"/>]. The padded
     /// reference planes are always allocated for every slot regardless of this cap.
@@ -169,5 +208,7 @@ internal sealed class H264FrameSharedState
         MbSubPartMvs = new H264MotionEstimator.Mv[mbCount * 4];
         MbPartitions = new H264MotionEstimator.McPartition[mbCount];
         MbRefIdx = new byte[mbCount];
+        DpbGuaranteedUptoX = new int[MaxDpbSize];
+        Array.Fill(DpbGuaranteedUptoX, GuaranteedFullPicture);
     }
 }

@@ -153,7 +153,15 @@ internal static class H264ParameterSets
         return bs.ToArray();
     }
 
-    public static byte[] WritePpsRbsp(int picInitQpMinus26)
+    /// <param name="picInitQpMinus26"><c>pic_init_qp_minus26</c> (§7.3.2.2).</param>
+    /// <param name="constrainedIntraPred">
+    /// <c>constrained_intra_pred_flag</c> (§7.4.2.2): when 1, intra prediction in P slices treats
+    /// inter-coded neighbouring macroblocks as unavailable (§8.3.1.1, §8.3.1.2, §8.3.2, §8.3.4) so
+    /// intra macroblocks never inherit inter-predicted content — the property gradual intra refresh
+    /// relies on. The encoder's own intra paths must mirror the flag (see
+    /// <c>H264BaselineSliceEncoder</c>); emitting it without doing so desynchronises every decoder.
+    /// </param>
+    public static byte[] WritePpsRbsp(int picInitQpMinus26, bool constrainedIntraPred = false)
     {
         var bs = new H264RbspBitBuffer();
         bs.WriteUe(0); // pic_parameter_set_id
@@ -169,8 +177,45 @@ internal static class H264ParameterSets
         bs.WriteSe(0); // pic_init_qs_minus26
         bs.WriteSe(0); // chroma_qp_index_offset
         bs.WriteBit(true); // deblocking_filter_control_present_flag
-        bs.WriteBit(false); // constrained_intra_pred_flag
+        bs.WriteBit(constrainedIntraPred); // constrained_intra_pred_flag
         bs.WriteBit(false); // redundant_pic_cnt_present_flag
+        bs.WriteRbspTrailingBits();
+        return bs.ToArray();
+    }
+
+    /// <summary>
+    /// Recovery point SEI message RBSP (§D.1.8 syntax, §D.2.8 semantics): tells a decoder that
+    /// starts decoding at this access unit that its output is correct in content once
+    /// <paramref name="recoveryFrameCnt"/> further frames (in <c>frame_num</c> counting order) have
+    /// been decoded. Emitted at the first frame of a gradual intra refresh wave so a mid-stream
+    /// joiner knows when the sweep completes. <c>exact_match_flag</c> is 1 — the wave's motion
+    /// vector restrictions and <c>constrained_intra_pred_flag</c> make post-recovery reconstruction
+    /// bit-exact, not approximate. <c>broken_link_flag</c> 0 and <c>changing_slice_group_idc</c> 0
+    /// (no slice groups in this encoder).
+    /// </summary>
+    public static byte[] WriteRecoveryPointSeiRbsp(int recoveryFrameCnt)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(recoveryFrameCnt);
+
+        // sei_payload( 6, size ) body, built first because sei_message needs its byte size.
+        var payload = new H264RbspBitBuffer();
+        payload.WriteUe((uint)recoveryFrameCnt); // recovery_frame_cnt
+        payload.WriteBit(true);  // exact_match_flag
+        payload.WriteBit(false); // broken_link_flag
+        payload.WriteBits(2, 0u); // changing_slice_group_idc
+        // §D.1: a payload that is not byte-aligned ends with bit_equal_to_one plus alignment
+        // zero bits — the same pattern as rbsp_trailing_bits, so reuse that writer.
+        payload.WriteRbspTrailingBits();
+        var payloadBytes = payload.ToArray();
+
+        var bs = new H264RbspBitBuffer();
+        bs.WriteBits(8, 6u); // last_payload_type_byte = 6 (recovery_point); < 255 so single byte
+        bs.WriteBits(8, (uint)payloadBytes.Length); // last_payload_size_byte; < 255 for any frame count
+        foreach (var b in payloadBytes)
+        {
+            bs.WriteBits(8, b);
+        }
+
         bs.WriteRbspTrailingBits();
         return bs.ToArray();
     }
