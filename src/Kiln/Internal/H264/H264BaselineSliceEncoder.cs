@@ -832,6 +832,12 @@ internal sealed class H264BaselineSliceEncoder
             Array.Copy(_shared.DpbPaddedV[0], _shared.DpbPaddedV[1], _shared.DpbPaddedV[0].Length);
             _shared.DpbGuaranteedUptoX[1] = _shared.DpbGuaranteedUptoX[0];
         }
+        else
+        {
+            // Slot 1 is never read in single-reference mode; keep its guarantee at the sentinel so
+            // RefreshConstraintsActive can clear after a wave instead of latching on a stale bound.
+            _shared.DpbGuaranteedUptoX[1] = H264FrameSharedState.GuaranteedFullPicture;
+        }
         if (_shared.DpbCount < effectiveMaxRefs)
             _shared.DpbCount++;
         H264ReferencePicturePadder.Pad(recY, width, width, _height, HaloLuma, _shared.DpbPaddedY[0], _paddedStrideY);
