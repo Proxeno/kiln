@@ -220,6 +220,9 @@ public sealed class H264IntraRefreshTests
         }, config);
         var annex = new byte[session.RecommendedOutputBufferSize];
 
+        var stream = new MemoryStream();
+        var sessionRecon = new List<(byte[] Y, byte[] U, byte[] V)>();
+
         H264StreamingEncodeResult Encode(int i, bool pli)
         {
             var f = frames[i % frames.Length];
@@ -233,7 +236,11 @@ public sealed class H264IntraRefreshTests
                 PictureLossIndication: pli,
                 FullIntraRequest: false,
                 ClientDecodeDelay: null);
-            return session.EncodeFrame(f.AsSpan(0, ys), f.AsSpan(ys, uv), f.AsSpan(ys + uv, uv), W, W / 2, annex, feedback);
+            var r = session.EncodeFrame(f.AsSpan(0, ys), f.AsSpan(ys, uv), f.AsSpan(ys + uv, uv), W, W / 2, annex, feedback);
+            stream.Write(annex, 0, r.BytesWritten);
+            var e = session.EncoderForTests;
+            sessionRecon.Add((e.LastReconstructedY.ToArray(), e.LastReconstructedU.ToArray(), e.LastReconstructedV.ToArray()));
+            return r;
         }
 
         Encode(0, pli: false);
@@ -256,6 +263,110 @@ public sealed class H264IntraRefreshTests
         }
 
         session.EncoderForTests.IntraRefreshActive.Should().BeFalse("the wave completes after one period");
+
+        // The session drives per-MB rate control (mb_qp_delta chains) through the wave — decode the
+        // whole stream and require byte-exact reconstruction, so the refresh band and the restricted
+        // vectors are proven conformant under rate control too, not only at constant QP.
+        if (FfmpegOnPath())
+        {
+            var decoded = FfmpegDecodeAllFrames(stream.ToArray());
+            var frameBytes = ys + 2 * uv;
+            (decoded.Length / frameBytes).Should().Be(sessionRecon.Count, "every session frame must decode");
+            for (var i = 0; i < sessionRecon.Count; i++)
+            {
+                AssertPlanesEqual(decoded, i, frameBytes,
+                    sessionRecon[i].Y, sessionRecon[i].U, sessionRecon[i].V, $"session frame {i}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Unaligned display size: the wave, the guarantee bounds and the MV restriction all operate on
+    /// the coded (macroblock-aligned) grid while the decoder outputs the cropped display size; the
+    /// joiner must still converge byte-exactly on the cropped planes.
+    /// </summary>
+    [Fact]
+    public void Joining_decoder_converges_at_unaligned_display_size()
+    {
+        if (!FfmpegOnPath())
+        {
+            return;
+        }
+
+        const int Dw = 308;
+        const int Dh = 230;
+        var frames = GenerateMotionContent();
+        var ys = Dw * Dh;
+        var uv = Dw / 2 * (Dh / 2);
+        var srcFrames = new byte[TotalFrames][];
+        for (var i = 0; i < TotalFrames; i++)
+        {
+            // Crop the 320×240 generator content to the display size, planar I420.
+            var srcFull = frames[i % frames.Length];
+            var dst = new byte[ys + 2 * uv];
+            for (var row = 0; row < Dh; row++)
+            {
+                Array.Copy(srcFull, row * W, dst, row * Dw, Dw);
+            }
+
+            for (var plane = 0; plane < 2; plane++)
+            {
+                var srcOff = W * H + plane * (W * H / 4);
+                var dstOff = ys + plane * uv;
+                for (var row = 0; row < Dh / 2; row++)
+                {
+                    Array.Copy(srcFull, srcOff + row * (W / 2), dst, dstOff + row * (Dw / 2), Dw / 2);
+                }
+            }
+
+            srcFrames[i] = dst;
+        }
+
+        var annex = new byte[2 * 320 * 240 + 1_048_576];
+        var accessUnits = new byte[TotalFrames][];
+        var recon = new (byte[] Y, byte[] U, byte[] V)[TotalFrames];
+        using (var enc = new H264BaselineEncoder(Dw, Dh, new H264BaselineEncoderOptions
+               {
+                   QuantizationParameter = 29,
+                   KeyframeIntervalFrames = int.MaxValue,
+                   IntraRefreshPeriodFrames = RefreshPeriod,
+               }))
+        {
+            for (var i = 0; i < TotalFrames; i++)
+            {
+                if (i == WaveRequestFrame)
+                {
+                    enc.RequestIntraRefresh();
+                }
+
+                var f = srcFrames[i];
+                var n = enc.EncodeFrame(
+                    f.AsSpan(0, ys), f.AsSpan(ys, uv), f.AsSpan(ys + uv, uv), Dw, Dw / 2, annex, forceKeyframe: i == 0);
+                accessUnits[i] = annex.AsSpan(0, n).ToArray();
+                var yPlane = new byte[ys];
+                var uPlane = new byte[uv];
+                var vPlane = new byte[uv];
+                enc.CopyLastReconstructedTo(yPlane, uPlane, vPlane, Dw, Dw / 2);
+                recon[i] = (yPlane, uPlane, vPlane);
+            }
+        }
+
+        var joinStream = Concat(accessUnits, WaveRequestFrame, TotalFrames - WaveRequestFrame);
+        var joinDecoded = FfmpegDecodeAllFrames(joinStream);
+        var frameBytes = ys + 2 * uv;
+        var joinFrames = joinDecoded.Length / frameBytes;
+        joinFrames.Should().Be(TotalFrames - RecoveryFrame, "output starts at the recovery point");
+        for (var k = 0; k < joinFrames; k++)
+        {
+            var encodedIndex = TotalFrames - joinFrames + k;
+            var baseOff = k * frameBytes;
+            CountMismatches(joinDecoded.AsSpan(baseOff, ys), recon[encodedIndex].Y)
+                .Should().Be(0, $"cropped joiner luma, frame {encodedIndex}");
+            CountMismatches(joinDecoded.AsSpan(baseOff + ys, uv), recon[encodedIndex].U)
+                .Should().Be(0, $"cropped joiner U, frame {encodedIndex}");
+            CountMismatches(joinDecoded.AsSpan(baseOff + ys + uv, uv), recon[encodedIndex].V)
+                .Should().Be(0, $"cropped joiner V, frame {encodedIndex}");
+        }
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────
