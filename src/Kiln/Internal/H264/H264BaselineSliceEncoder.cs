@@ -424,7 +424,7 @@ internal sealed class H264BaselineSliceEncoder
             var mbx = mb % _mbW;
             var mby = mb / _mbW;
             var rowOff = mby * 16 * strideY + mbx * 16;
-            var variance = H264VarianceFastPath.VarianceMb16x16(srcY.Slice(rowOff), strideY);
+            var variance = _kernels.VarianceMb16x16(srcY.Slice(rowOff), strideY);
             var act = Math.Max(variance, 1);
             var la = Math.Log2(act);
             logActs[mb] = la;
@@ -1939,7 +1939,7 @@ internal sealed class H264BaselineSliceEncoder
 
         var srcMbOff = mbY * strideY + mbX;
         var current = srcY.Slice(srcMbOff);
-        var variance = H264VarianceFastPath.VarianceMb16x16(current, strideY);
+        var variance = _kernels.VarianceMb16x16(current, strideY);
         var adaptiveRange = variance < 64 ? 8 : variance < 512 ? 16 : 32;
         H264MotionEstimator.Mv? temporalMv = _shared.PaddedRefValid ? _shared.PrevMbMvs[mbIndex] : null;
         if (sadSkip > 2048)

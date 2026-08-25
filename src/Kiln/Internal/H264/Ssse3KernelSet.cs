@@ -28,4 +28,7 @@ internal class Ssse3KernelSet : SimdKernelSetBase
 
     public override int Ssd8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
         H264MotionSsd.Ssd8x8Ssse3(a, strideA, b, strideB);
+
+    public override int VarianceMb16x16(ReadOnlySpan<byte> mbTopLeft, int stride) =>
+        H264VarianceFastPath.VarianceMb16x16Ssse3(mbTopLeft, stride);
 }

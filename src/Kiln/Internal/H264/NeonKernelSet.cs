@@ -28,4 +28,7 @@ internal class NeonKernelSet : SimdKernelSetBase
 
     public override int Ssd8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
         H264MotionSsd.Ssd8x8AdvSimd(a, strideA, b, strideB);
+
+    public override int VarianceMb16x16(ReadOnlySpan<byte> mbTopLeft, int stride) =>
+        H264VarianceFastPath.VarianceMb16x16AdvSimd(mbTopLeft, stride);
 }

@@ -20,6 +20,9 @@ internal sealed class ScalarKernelSet : IH264KernelSet
     public int Ssd8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
         H264MotionSsd.Ssd8x8Scalar(a, strideA, b, strideB);
 
+    public int VarianceMb16x16(ReadOnlySpan<byte> mbTopLeft, int stride) =>
+        H264VarianceFastPath.VarianceMb16x16Scalar(mbTopLeft, stride);
+
     public void SadMany4x4(ReadOnlySpan<byte> src, ReadOnlySpan<byte> predConcat, Span<int> sads, int count)
     {
         for (var i = 0; i < count; i++)
