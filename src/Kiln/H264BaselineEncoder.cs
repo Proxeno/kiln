@@ -49,9 +49,10 @@ public sealed class H264BaselineEncoderOptions
     public bool PreferHardwareIntrinsics { get; set; } = true;
 
     /// <summary>
-    /// When true, biases P-frame inter ME toward integer-pel refinement (fewer fractional-pel passes)
-    /// and skips chroma-DC rate–distortion refinement for inter-coded chroma. IDR/I paths keep full fidelity.
-    /// Default false for parity with golden / existing tests.
+    /// When true, skips chroma-DC rate–distortion refinement for inter-coded chroma. IDR/I paths
+    /// keep full fidelity. Default false for parity with golden / existing tests. This flag does
+    /// not bound motion-estimation cost; for a deterministic worst-case frame-time bound see
+    /// <see cref="MotionSearchEffortCapPerMb"/>.
     /// </summary>
     public bool PreferRealtimeLatencyTuning { get; set; }
 
