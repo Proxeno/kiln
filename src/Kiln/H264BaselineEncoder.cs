@@ -489,9 +489,14 @@ public sealed class H264BaselineEncoder : IDisposable
         var mbRowsPerSlice = _mbH / sliceCount;
         var remainder = _mbH - mbRowsPerSlice * sliceCount;
 
+        var collectFramePhases = H264PInterDiagnostics.CollectFramePhases;
+        var tFrameStart = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         // Single-threaded fence: clear shared per-MB caches and (if IDR) invalidate the reference.
         // Done once before the parallel loop so disjoint per-slice writes don't race with the reset.
         _sliceEncoders[0].BeginFrame(isIdr);
+
+        var tAfterBegin = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Pin the caller's source planes so the parallel workers can reconstitute ReadOnlySpans
         // from raw pointers. The pin scope encloses Parallel.For (which is synchronous), so the
@@ -544,6 +549,8 @@ public sealed class H264BaselineEncoder : IDisposable
             });
         }
 
+        var tAfterParallel = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         // Gather NALs in raster (slice-index) order. WriteNal must run sequentially because each
         // call advances `pos` and writes into the shared output buffer.
         for (var k = 0; k < sliceCount; k++)
@@ -551,7 +558,32 @@ public sealed class H264BaselineEncoder : IDisposable
             pos += WriteNal(annexB[pos..], 3, nalType, sliceEncoders[k].LastSliceRbsp);
         }
 
+        var tAfterGather = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         _sliceEncoders[0].PadReconstructedReference();
+
+        if (collectFramePhases)
+        {
+            var tEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+            long sliceSum = 0;
+            long sliceMax = 0;
+            for (var k = 0; k < sliceCount; k++)
+            {
+                var t = sliceEncoders[k].LastSliceElapsedTicks;
+                sliceSum += t;
+                sliceMax = Math.Max(sliceMax, t);
+                H264PInterDiagnostics.NotifySliceIndexTicks(k, t);
+            }
+
+            H264PInterDiagnostics.NotifyFramePhases(
+                beginFrameTicks: tAfterBegin - tFrameStart,
+                parallelWallTicks: tAfterParallel - tAfterBegin,
+                nalGatherTicks: tAfterGather - tAfterParallel,
+                padRotateTicks: tEnd - tAfterGather,
+                sliceSumTicks: sliceSum,
+                sliceMaxTicks: sliceMax);
+        }
+
         return pos;
     }
 

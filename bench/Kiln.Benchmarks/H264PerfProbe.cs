@@ -17,7 +17,17 @@ internal static class H264PerfProbe
     private const int W = 1920;
     private const int H = 1080;
 
-    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false);
+    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false, bool AtlasOff = false);
+
+    private static Arm ResolveArm(string name, int slices) => name switch
+    {
+        "default" => new Arm($"default-s{slices}", Satd: true, MaxRef: 2, Slices: slices),
+        "satdOff" => new Arm($"satdOff-s{slices}", Satd: false, MaxRef: 2, Slices: slices),
+        "ref1" => new Arm($"ref1-s{slices}", Satd: true, MaxRef: 1, Slices: slices),
+        "fast" => new Arm($"fast-s{slices}", Satd: false, MaxRef: 1, Slices: slices),
+        "atlasOff" => new Arm($"atlasOff-s{slices}", Satd: true, MaxRef: 2, Slices: slices, AtlasOff: true),
+        _ => throw new ArgumentException(name),
+    };
 
     public static void Run(string[] args)
     {
@@ -49,20 +59,30 @@ internal static class H264PerfProbe
                     new Arm("fast-s8", Satd: false, MaxRef: 1, Slices: 8),
                 ]);
                 break;
+            case "atlas":
+                Measure([
+                    ResolveArm("default", 4),
+                    ResolveArm("atlasOff", 4),
+                    ResolveArm("default", 1),
+                    ResolveArm("atlasOff", 1),
+                ]);
+                break;
             case "spin":
             {
                 var armName = args.Length > 1 ? args[1] : "default";
                 var seconds = args.Length > 2 ? int.Parse(args[2]) : 30;
-                var arm = armName switch
-                {
-                    "default" => new Arm("default", Satd: true, MaxRef: 2, Slices: 4),
-                    "satdOff" => new Arm("satdOff", Satd: false, MaxRef: 2, Slices: 4),
-                    "ref1" => new Arm("ref1", Satd: true, MaxRef: 1, Slices: 4),
-                    "fast" => new Arm("fast", Satd: false, MaxRef: 1, Slices: 4),
-                    "default-s1" => new Arm("default-s1", Satd: true, MaxRef: 2, Slices: 1),
-                    _ => throw new ArgumentException(armName),
-                };
-                Spin(arm, seconds);
+                Spin(ResolveArm(armName, slices: 4), seconds);
+                break;
+            }
+
+            case "phases":
+            case "mb":
+            case "satd":
+            {
+                var armName = args.Length > 1 ? args[1] : "default";
+                var slices = args.Length > 2 ? int.Parse(args[2]) : 4;
+                var frames = args.Length > 3 ? int.Parse(args[3]) : 200;
+                Diagnose(mode, ResolveArm(armName, slices), frames);
                 break;
             }
 
@@ -110,6 +130,7 @@ internal static class H264PerfProbe
             encs[a] = Setup(arms[a]);
             ms[a] = new double[Rounds];
             H264PInterDiagnostics.DisableRef1TieMargin = arms[a].DisableRef1Margin;
+            H264PInterDiagnostics.DisableRefTransformAtlas = arms[a].AtlasOff;
             Encode(encs[a].Enc, encs[a].Frames, encs[a].Annex, frameIdx[a]++, idr: true);
             for (var i = 0; i < 3; i++)
                 Encode(encs[a].Enc, encs[a].Frames, encs[a].Annex, frameIdx[a]++, idr: false);
@@ -122,6 +143,7 @@ internal static class H264PerfProbe
             for (var a = 0; a < arms.Length; a++)
             {
                 H264PInterDiagnostics.DisableRef1TieMargin = arms[a].DisableRef1Margin;
+                H264PInterDiagnostics.DisableRefTransformAtlas = arms[a].AtlasOff;
                 H264PInterDiagnostics.ResetPhaseCounts();
                 sw.Restart();
                 for (var i = 0; i < ChunkFrames; i++)
@@ -137,6 +159,7 @@ internal static class H264PerfProbe
 
         H264PInterDiagnostics.CollectPhaseCounts = false;
         H264PInterDiagnostics.DisableRef1TieMargin = false;
+        H264PInterDiagnostics.DisableRefTransformAtlas = false;
         for (var a = 0; a < arms.Length; a++)
         {
             Array.Sort(ms[a]);
@@ -146,6 +169,72 @@ internal static class H264PerfProbe
                 $"hex/frame={(double)hex[a] / mbs[a],8:F1} exhaustive/frame={(double)fb[a] / mbs[a],6:F1}");
             encs[a].Enc.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Single-arm diagnostic run: <c>phases</c> prints the frame-phase wall breakdown plus managed
+    /// allocation per frame, <c>mb</c> the per-macroblock Phase2 timing split, <c>satd</c> the SATD
+    /// atom-DAG cache report. Timed frames run after a warm-up so the DPB and caches are hot.
+    /// </summary>
+    private static void Diagnose(string mode, Arm arm, int frames)
+    {
+        var (enc, srcFrames, annex) = Setup(arm);
+        H264PInterDiagnostics.DisableRefTransformAtlas = arm.AtlasOff;
+        var idx = 0;
+        Encode(enc, srcFrames, annex, idx++, idr: true);
+        for (var i = 0; i < 8; i++)
+            Encode(enc, srcFrames, annex, idx++, idr: false);
+
+        switch (mode)
+        {
+            case "phases":
+                H264PInterDiagnostics.ResetFramePhases();
+                H264PInterDiagnostics.CollectFramePhases = true;
+                break;
+            case "mb":
+                H264PInterDiagnostics.ResetPhase2Timing();
+                H264PInterDiagnostics.CollectPhase2Timing = true;
+                break;
+            case "satd":
+                H264MotionSatdDagDiagnostics.Reset();
+                H264MotionSatdDagDiagnostics.Enabled = true;
+                break;
+            default:
+                throw new ArgumentException(mode);
+        }
+
+        var allocBefore = GC.GetTotalAllocatedBytes(precise: true);
+        var gen0Before = GC.CollectionCount(0);
+        var gen1Before = GC.CollectionCount(1);
+        var gen2Before = GC.CollectionCount(2);
+        var sw = Stopwatch.StartNew();
+        for (var i = 0; i < frames; i++)
+            Encode(enc, srcFrames, annex, idx++, idr: false);
+        sw.Stop();
+        var allocAfter = GC.GetTotalAllocatedBytes(precise: true);
+
+        Console.WriteLine($"// {mode} arm={arm.Name} frames={frames} wall={sw.Elapsed.TotalMilliseconds / frames:F2} ms/frame");
+        Console.WriteLine(
+            $"// alloc/frame={(allocAfter - allocBefore) / (double)frames / 1024.0:F1} KiB  " +
+            $"gc0={GC.CollectionCount(0) - gen0Before} gc1={GC.CollectionCount(1) - gen1Before} gc2={GC.CollectionCount(2) - gen2Before}");
+        switch (mode)
+        {
+            case "phases":
+                H264PInterDiagnostics.CollectFramePhases = false;
+                Console.WriteLine(H264PInterDiagnostics.BuildFramePhaseReport(reset: true));
+                break;
+            case "mb":
+                H264PInterDiagnostics.CollectPhase2Timing = false;
+                Console.WriteLine(H264PInterDiagnostics.BuildPhase2TimingReport(reset: true));
+                break;
+            case "satd":
+                H264MotionSatdDagDiagnostics.Enabled = false;
+                Console.WriteLine(H264MotionSatdDagDiagnostics.BuildReport(reset: true));
+                break;
+        }
+
+        H264PInterDiagnostics.DisableRefTransformAtlas = false;
+        enc.Dispose();
     }
 
     private static void Spin(Arm arm, int seconds)

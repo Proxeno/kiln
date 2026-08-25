@@ -146,6 +146,126 @@ internal static class H264PInterDiagnostics
 
     public static bool CollectPhase2Timing { get; set; }
 
+    /// <summary>
+    /// Measurement-only frame-phase wall-clock accounting for the multi-slice orchestrator:
+    /// serial prologue/epilogue versus the parallel slice region, and slice load imbalance.
+    /// Keep false in normal operation; the perf probe enables it around bounded runs.
+    /// </summary>
+    public static bool CollectFramePhases { get; set; }
+
+    /// <summary>
+    /// Measurement-only A/B kill switch for the reference transform atlas
+    /// (<see cref="H264ReferenceTransformAtlas"/>): when true the slice encoder passes a null atlas
+    /// to motion estimation so every SATD ref transform is recomputed in place of the cache lookup.
+    /// Keep false in normal operation.
+    /// </summary>
+    public static bool DisableRefTransformAtlas { get; set; }
+
+    private static long s_fpFrames;
+    private static long s_fpBeginFrameTicks;
+    private static long s_fpParallelWallTicks;
+    private static long s_fpNalGatherTicks;
+    private static long s_fpPadRotateTicks;
+    private static long s_fpSliceSumTicks;
+    private static long s_fpSliceMaxTicks;
+    private static long s_fpSliceCopyTicks;
+    private static long s_fpSliceDeblockTicks;
+    private static readonly long[] s_fpSliceTicksByIndex = new long[16];
+
+    /// <summary>Clears the frame-phase accumulators recorded via <see cref="NotifyFramePhases"/>.</summary>
+    public static void ResetFramePhases()
+    {
+        Interlocked.Exchange(ref s_fpFrames, 0);
+        Interlocked.Exchange(ref s_fpBeginFrameTicks, 0);
+        Interlocked.Exchange(ref s_fpParallelWallTicks, 0);
+        Interlocked.Exchange(ref s_fpNalGatherTicks, 0);
+        Interlocked.Exchange(ref s_fpPadRotateTicks, 0);
+        Interlocked.Exchange(ref s_fpSliceSumTicks, 0);
+        Interlocked.Exchange(ref s_fpSliceMaxTicks, 0);
+        Interlocked.Exchange(ref s_fpSliceCopyTicks, 0);
+        Interlocked.Exchange(ref s_fpSliceDeblockTicks, 0);
+        Array.Clear(s_fpSliceTicksByIndex);
+    }
+
+    /// <summary>Records one multi-slice frame's phase ticks (orchestrator thread, once per frame).</summary>
+    internal static void NotifyFramePhases(
+        long beginFrameTicks,
+        long parallelWallTicks,
+        long nalGatherTicks,
+        long padRotateTicks,
+        long sliceSumTicks,
+        long sliceMaxTicks)
+    {
+        if (!CollectFramePhases)
+            return;
+        Interlocked.Increment(ref s_fpFrames);
+        Interlocked.Add(ref s_fpBeginFrameTicks, beginFrameTicks);
+        Interlocked.Add(ref s_fpParallelWallTicks, parallelWallTicks);
+        Interlocked.Add(ref s_fpNalGatherTicks, nalGatherTicks);
+        Interlocked.Add(ref s_fpPadRotateTicks, padRotateTicks);
+        Interlocked.Add(ref s_fpSliceSumTicks, sliceSumTicks);
+        Interlocked.Add(ref s_fpSliceMaxTicks, sliceMaxTicks);
+    }
+
+    /// <summary>Records one slice's total ticks under its slice index (orchestrator thread).</summary>
+    internal static void NotifySliceIndexTicks(int sliceIndex, long ticks)
+    {
+        if (!CollectFramePhases || (uint)sliceIndex >= (uint)s_fpSliceTicksByIndex.Length)
+            return;
+        Interlocked.Add(ref s_fpSliceTicksByIndex[sliceIndex], ticks);
+    }
+
+    /// <summary>Records one slice's source-copy and deblock ticks (slice worker, once per slice).</summary>
+    internal static void NotifySlicePhases(long copyTicks, long deblockTicks)
+    {
+        if (!CollectFramePhases)
+            return;
+        Interlocked.Add(ref s_fpSliceCopyTicks, copyTicks);
+        Interlocked.Add(ref s_fpSliceDeblockTicks, deblockTicks);
+    }
+
+    /// <summary>Per-frame averages of the phase ticks recorded since the last reset.</summary>
+    public static string BuildFramePhaseReport(bool reset = false)
+    {
+        var frames = Volatile.Read(ref s_fpFrames);
+        if (frames <= 0)
+            return "Frame-phase timing: no frames recorded.";
+
+        static double Ms(long ticks, long frames) =>
+            ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency / frames;
+        var begin = Ms(Volatile.Read(ref s_fpBeginFrameTicks), frames);
+        var par = Ms(Volatile.Read(ref s_fpParallelWallTicks), frames);
+        var gather = Ms(Volatile.Read(ref s_fpNalGatherTicks), frames);
+        var pad = Ms(Volatile.Read(ref s_fpPadRotateTicks), frames);
+        var sliceSum = Ms(Volatile.Read(ref s_fpSliceSumTicks), frames);
+        var sliceMax = Ms(Volatile.Read(ref s_fpSliceMaxTicks), frames);
+        var copy = Ms(Volatile.Read(ref s_fpSliceCopyTicks), frames);
+        var deblock = Ms(Volatile.Read(ref s_fpSliceDeblockTicks), frames);
+        var sb = new StringBuilder(320);
+        sb.Append("Frame phases (ms/frame, n=").Append(frames).AppendLine("):");
+        sb.Append("  beginFrame=").Append(begin.ToString("F3"))
+            .Append(" parallelWall=").Append(par.ToString("F3"))
+            .Append(" nalGather=").Append(gather.ToString("F3"))
+            .Append(" padRotate=").Append(pad.ToString("F3")).AppendLine();
+        sb.Append("  sliceSum=").Append(sliceSum.ToString("F3"))
+            .Append(" sliceMax=").Append(sliceMax.ToString("F3"))
+            .Append(" forkJoin=").Append((par - sliceMax).ToString("F3"))
+            .Append(" sliceCopySum=").Append(copy.ToString("F3"))
+            .Append(" sliceDeblockSum=").Append(deblock.ToString("F3"));
+        sb.AppendLine().Append("  perSlice:");
+        for (var i = 0; i < s_fpSliceTicksByIndex.Length; i++)
+        {
+            var t = Volatile.Read(ref s_fpSliceTicksByIndex[i]);
+            if (t == 0)
+                continue;
+            sb.Append(" [").Append(i).Append("]=").Append(Ms(t, frames).ToString("F2"));
+        }
+
+        if (reset)
+            ResetFramePhases();
+        return sb.ToString();
+    }
+
     public static bool IsPhase2TimingEnabled =>
         CollectPhase2Timing || EnvCollectPhase2Timing || H264MotionSatdDagDiagnostics.IsEnabled;
 
