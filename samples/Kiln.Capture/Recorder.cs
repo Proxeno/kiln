@@ -115,11 +115,6 @@ internal sealed class Recorder
                     }
 
                     converter = new FrameConverter(format);
-                    Console.WriteLine($"Frames : {format.Describe()}");
-                    Console.WriteLine($"Encode : {converter.Width}x{converter.Height} " +
-                        $"level {H264Levels.ForFrameSize(converter.Width, converter.Height) / 10.0:0.0}, " +
-                        $"QP {options.Qp}, IDR every {options.Fps * 2} frames");
-                    Console.WriteLine();
 
                     encoder = new H264BaselineEncoder(
                         converter.Width,
@@ -128,11 +123,17 @@ internal sealed class Recorder
                         {
                             QuantizationParameter = options.Qp,
                             KeyframeIntervalFrames = options.Fps * 2,
-                            LevelIdc = H264Levels.ForFrameSize(converter.Width, converter.Height),
+                            // LevelIdc left at 0: the encoder picks the lowest sufficient level.
                             SliceCount = options.Slices,
                         });
 
-                    annexB = new byte[(converter.Width * converter.Height * 2) + 512_000];
+                    Console.WriteLine($"Frames : {format.Describe()}");
+                    Console.WriteLine($"Encode : {converter.Width}x{converter.Height} " +
+                        $"level {encoder.LevelIdc / 10.0:0.0}, " +
+                        $"QP {options.Qp}, IDR every {options.Fps * 2} frames");
+                    Console.WriteLine();
+
+                    annexB = new byte[encoder.RecommendedOutputBufferSize];
                     mp4 = new Mp4Writer(options.OutputPath, converter.Width, converter.Height);
                 }
 

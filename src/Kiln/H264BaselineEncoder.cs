@@ -16,8 +16,16 @@ public sealed class H264BaselineEncoderOptions
 
     public byte ProfileIdc { get; set; } = 66;
 
-    /// <summary>H.264 level_idc (e.g. 31 = Level 3.1).</summary>
-    public byte LevelIdc { get; set; } = 0x1F;
+    /// <summary>
+    /// H.264 <c>level_idc</c> to signal in the SPS (e.g. 31 = Level 3.1), or 0 (default) to pick
+    /// automatically: the lowest Annex A Table A-1 level whose frame-size limit (MaxFS) admits the
+    /// coded picture, floored at Level 3.1 so small pictures keep signalling the historical Kiln
+    /// default. 0 is unambiguous as an "auto" sentinel — Table A-1 has no level 0. Set explicitly
+    /// when a decoder contract requires a specific level; the constructor throws (naming the lowest
+    /// sufficient level) if the frame size exceeds the explicit level's MaxFS.
+    /// Read the signalled value back from <see cref="H264BaselineEncoder.LevelIdc"/>.
+    /// </summary>
+    public byte LevelIdc { get; set; }
 
     /// <summary>
     /// Number of reference frames the encoder may use/signal, clamped to [1, <see cref="Internal.H264.H264FrameSharedState.MaxDpbSize"/>].
@@ -238,12 +246,22 @@ public sealed class H264BaselineEncoder : IDisposable
                 _options.ExperimentalZeroMvSkipSadThreshold,
                 _options.SubPartitionRangeCap);
         }
+        // LevelIdc = 0 means auto: lowest Table A-1 level whose MaxFS admits the coded picture,
+        // floored at Level 3.1 (see H264BaselineEncoderOptions.LevelIdc). An explicit level is
+        // validated against MaxFS inside WriteSpsRbsp and throws naming the lowest sufficient level.
+        LevelIdc = _options.LevelIdc != 0
+            ? _options.LevelIdc
+            : H264LevelLimits.AutoLevelForFrameSize(_mbW, _mbH);
         _spsRbsp = H264ParameterSets.WriteSpsRbsp(
-            _codedWidth, _codedHeight, _options.ProfileIdc, _options.LevelIdc,
+            _codedWidth, _codedHeight, _options.ProfileIdc, LevelIdc,
             Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize),
             displayWidth: width, displayHeight: height);
         _ppsRbsp = H264ParameterSets.WritePpsRbsp(_picInitQpMinus26);
         _ebspScratch = new byte[H264RbspEmulation.GetEmulationPreventionBufferSize(checked(_codedWidth * _codedHeight * 2 + 65_536))];
+        // Same worst-case bound the encoder assumes internally (2 bytes per coded pixel of RBSP,
+        // plus emulation-prevention headroom), plus start-code + NAL-header framing for SPS, PPS
+        // and up to MaxSliceEncoders slice NALs.
+        RecommendedOutputBufferSize = _ebspScratch.Length + (2 + MaxSliceEncoders) * 5;
     }
 
     /// <summary>Display width as passed to the constructor — what the decoder outputs after SPS cropping.</summary>
@@ -251,6 +269,25 @@ public sealed class H264BaselineEncoder : IDisposable
 
     /// <summary>Display height as passed to the constructor — what the decoder outputs after SPS cropping.</summary>
     public int Height => _height;
+
+    /// <summary>
+    /// The <c>level_idc</c> signalled in the SPS: <see cref="H264BaselineEncoderOptions.LevelIdc"/>
+    /// when non-zero, otherwise the automatically selected level (the lowest Annex A Table A-1
+    /// level whose MaxFS admits the coded picture, floored at Level 3.1 — see
+    /// <see cref="H264BaselineEncoderOptions.LevelIdc"/>).
+    /// </summary>
+    public byte LevelIdc { get; }
+
+    /// <summary>
+    /// Recommended minimum length for the <c>annexB</c> destination span of <see cref="EncodeFrame"/>:
+    /// the same worst-case per-frame bound the encoder sizes its internal emulation-prevention
+    /// scratch from (2 bytes per coded pixel plus emulation-prevention and NAL-framing headroom).
+    /// Real CAVLC frames stay far below it — uncompressed I420 is 1.5 bytes per pixel — so a span
+    /// of this size does not run out; a smaller span works whenever every frame it receives fits,
+    /// and <see cref="EncodeFrame"/> throws an <see cref="ArgumentException"/> naming this property
+    /// when one does not.
+    /// </summary>
+    public int RecommendedOutputBufferSize { get; }
 
     /// <summary>
     /// Coded picture width: <see cref="Width"/> rounded up to a multiple of 16 (the macroblock grid).
@@ -329,6 +366,11 @@ public sealed class H264BaselineEncoder : IDisposable
     /// When display ≠ coded dimensions the encoder extends the planes to the macroblock grid
     /// internally (edge replication); callers never supply padded planes.
     /// </summary>
+    /// <param name="annexB">
+    /// Destination for the complete Annex B access unit. Allocate at least
+    /// <see cref="RecommendedOutputBufferSize"/> bytes to be safe for any frame; a smaller span
+    /// throws <see cref="ArgumentException"/> mid-frame if a NAL unit does not fit.
+    /// </param>
     /// <param name="sliceLumaQp">
     /// When set, coded slice luma QP for this picture (via slice <c>slice_qp_delta</c>). When null,
     /// uses constructor <see cref="H264BaselineEncoderOptions.QuantizationParameter"/>.
