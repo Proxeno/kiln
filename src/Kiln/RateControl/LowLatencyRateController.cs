@@ -154,16 +154,29 @@ public sealed class LowLatencyRateController
             _state.StableFrameCounter++;
         }
 
-        // 3. Adjust QP based on bitrate relative to initial
+        // 3. Adjust QP based on bitrate relative to initial: ~+6 QP per halving of the target (the
+        // H.264 rule of thumb that +6 QP costs roughly half the bitrate), plus graded steps for the
+        // remaining partial ratio. Integer arithmetic throughout so decisions are deterministic on
+        // every platform. The historical fixed +1/+3 offsets stopped tracking after one halving, so
+        // a target collapsed to the configured floor still asked the encoder for near-initial
+        // quality and the per-frame bit budget was unachievable. No offset is applied above the
+        // initial rate: BaseQp is the quality ceiling.
         int adaptedQp = _config.BaseQp;
-
-        if (_state.TargetBitrateBps < _config.InitialTargetBitrateBps * 0.5)
+        var initialBps = (long)_config.InitialTargetBitrateBps;
+        var targetBps = Math.Max(1L, _state.TargetBitrateBps);
+        while (initialBps >= 2 * targetBps && adaptedQp - _config.BaseQp < 48)
         {
-            adaptedQp += 3;
+            adaptedQp += 6;
+            targetBps *= 2;
         }
-        else if (_state.TargetBitrateBps < _config.InitialTargetBitrateBps * 0.7)
+
+        if (2 * initialBps >= 3 * targetBps)
         {
-            adaptedQp += 1;
+            adaptedQp += 3; // remaining ratio ≥ 1.5×
+        }
+        else if (5 * initialBps >= 6 * targetBps)
+        {
+            adaptedQp += 1; // remaining ratio ≥ 1.2×
         }
 
         // If network is very bad, additional increase

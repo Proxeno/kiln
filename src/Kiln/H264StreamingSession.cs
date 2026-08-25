@@ -193,6 +193,10 @@ public sealed class H264StreamingSession : IDisposable
     /// <summary>The most recent controller decision, or null before the first frame.</summary>
     public EncoderAdaptationDecision? LastDecision { get; private set; }
 
+    /// <summary>Test support: the encoder currently owned by the session (replaced by
+    /// <see cref="ChangeResolution"/>).</summary>
+    internal H264BaselineEncoder EncoderForTests => _encoder;
+
     /// <summary>Reason string of the last resolution/fps/speed adaptation, for observability.</summary>
     public string LastAdaptationReason => _controller.LastAdaptationReason;
 
