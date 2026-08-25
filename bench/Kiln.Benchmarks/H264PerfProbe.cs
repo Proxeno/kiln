@@ -17,7 +17,7 @@ internal static class H264PerfProbe
     private const int W = 1920;
     private const int H = 1080;
 
-    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false, bool AtlasOff = false, bool BalanceOff = false, int RangeCap = 16, int Qp = 28, bool Divergent = false, int? SubPartDivisor = null, int EffortCap = 0);
+    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false, bool AtlasOff = false, bool BalanceOff = false, bool QgateOff = false, int RangeCap = 16, int Qp = 28, bool Divergent = false, int? SubPartDivisor = null, int EffortCap = 0);
 
     private static Arm ResolveArm(string name, int slices) => name switch
     {
@@ -26,6 +26,8 @@ internal static class H264PerfProbe
         "ref1" => new Arm($"ref1-s{slices}", Satd: true, MaxRef: 1, Slices: slices),
         "fast" => new Arm($"fast-s{slices}", Satd: false, MaxRef: 1, Slices: slices),
         "atlasOff" => new Arm($"atlasOff-s{slices}", Satd: true, MaxRef: 2, Slices: slices, AtlasOff: true),
+        "qgateOff" => new Arm($"qgateOff-s{slices}", Satd: true, MaxRef: 2, Slices: slices, QgateOff: true),
+        "qgateOff+atlasOff" => new Arm($"qgateOff+atlasOff-s{slices}", Satd: true, MaxRef: 2, Slices: slices, AtlasOff: true, QgateOff: true),
         "rc8" => new Arm($"rc8-s{slices}", Satd: true, MaxRef: 2, Slices: slices, RangeCap: 8),
         "rc4" => new Arm($"rc4-s{slices}", Satd: true, MaxRef: 2, Slices: slices, RangeCap: 4),
         "div" => new Arm($"div-s{slices}", Satd: true, MaxRef: 2, Slices: slices, Divergent: true),
@@ -87,6 +89,14 @@ internal static class H264PerfProbe
                     ResolveArm("atlasOff", 4),
                     ResolveArm("default", 1),
                     ResolveArm("atlasOff", 1),
+                ]);
+                break;
+            case "qgate":
+                Measure([
+                    ResolveArm("default", 4),
+                    ResolveArm("qgateOff", 4),
+                    ResolveArm("atlasOff", 4),
+                    ResolveArm("qgateOff+atlasOff", 4),
                 ]);
                 break;
             case "rangecap":
@@ -212,6 +222,7 @@ internal static class H264PerfProbe
             H264PInterDiagnostics.DisableRef1TieMargin = arms[a].DisableRef1Margin;
             H264PInterDiagnostics.DisableRefTransformAtlas = arms[a].AtlasOff;
             H264PInterDiagnostics.DisableSlicePartitionBalance = arms[a].BalanceOff;
+            H264PInterDiagnostics.DisableUnifiedQuadrantGate = arms[a].QgateOff;
             H264PInterDiagnostics.SubPartBudgetDivisorOverride = arms[a].SubPartDivisor;
             Encode(encs[a].Enc, encs[a].Frames, encs[a].Annex, frameIdx[a]++, idr: true);
             for (var i = 0; i < 3; i++)
@@ -227,6 +238,7 @@ internal static class H264PerfProbe
                 H264PInterDiagnostics.DisableRef1TieMargin = arms[a].DisableRef1Margin;
                 H264PInterDiagnostics.DisableRefTransformAtlas = arms[a].AtlasOff;
                 H264PInterDiagnostics.DisableSlicePartitionBalance = arms[a].BalanceOff;
+                H264PInterDiagnostics.DisableUnifiedQuadrantGate = arms[a].QgateOff;
                 H264PInterDiagnostics.SubPartBudgetDivisorOverride = arms[a].SubPartDivisor;
                 H264PInterDiagnostics.ResetPhaseCounts();
                 sw.Restart();
@@ -249,6 +261,7 @@ internal static class H264PerfProbe
         H264PInterDiagnostics.DisableRef1TieMargin = false;
         H264PInterDiagnostics.DisableRefTransformAtlas = false;
         H264PInterDiagnostics.DisableSlicePartitionBalance = false;
+        H264PInterDiagnostics.DisableUnifiedQuadrantGate = false;
         H264PInterDiagnostics.SubPartBudgetDivisorOverride = null;
         for (var a = 0; a < arms.Length; a++)
         {
@@ -271,6 +284,7 @@ internal static class H264PerfProbe
     {
         var (enc, srcFrames, annex) = Setup(arm);
         H264PInterDiagnostics.DisableRefTransformAtlas = arm.AtlasOff;
+        H264PInterDiagnostics.DisableUnifiedQuadrantGate = arm.QgateOff;
         var idx = 0;
         Encode(enc, srcFrames, annex, idx++, idr: true);
         for (var i = 0; i < 8; i++)
@@ -327,6 +341,7 @@ internal static class H264PerfProbe
         }
 
         H264PInterDiagnostics.DisableRefTransformAtlas = false;
+        H264PInterDiagnostics.DisableUnifiedQuadrantGate = false;
         enc.Dispose();
     }
 
@@ -338,6 +353,7 @@ internal static class H264PerfProbe
     {
         var (enc, srcFrames, annex) = Setup(arm);
         H264PInterDiagnostics.DisableRefTransformAtlas = arm.AtlasOff;
+        H264PInterDiagnostics.DisableUnifiedQuadrantGate = arm.QgateOff;
         var srcPath = System.IO.Path.Combine(outDir, arm.Divergent ? "source-div.yuv" : "source.yuv");
         using var src = System.IO.File.Exists(srcPath) ? null : System.IO.File.Create(srcPath);
         using var bs = System.IO.File.Create(System.IO.Path.Combine(outDir, $"{arm.Name.Trim()}.h264"));
@@ -352,6 +368,7 @@ internal static class H264PerfProbe
 
         Console.WriteLine($"// dump arm={arm.Name} frames={frames} bytes={bytes} kbitPerFrame={bytes * 8.0 / frames / 1000.0:F1}");
         H264PInterDiagnostics.DisableRefTransformAtlas = false;
+        H264PInterDiagnostics.DisableUnifiedQuadrantGate = false;
         enc.Dispose();
     }
 

@@ -28,3 +28,15 @@ Implication: the atlas 8%-hit story was a conflation. Real targets, in order of 
   1) unified loop 377K atoms: add quadrant-level SAD-lower-bound gating (exact)
   2) RefineFrac 412K atoms: tighten/skip refinement (mostly approximate)
   3) atlas: integer-only, perf-neutral at s=4 (18.69 vs 18.66) -> candidate for removal
+
+# Optimisation 1 (landed): quadrant-level SAD-lower-bound gate in unified sub-partition loop
+# Skip a quadrant's 4 SATD atoms when every shape using it has lb=((sad+1)>>1)+mvCost STRICTLY
+# above that shape's best score (strict '>' cannot affect tie-breaks -> bitstream-identical).
+# Kill switch: H264PInterDiagnostics.DisableUnifiedQuadrantGate; probe mode `qgate`.
+  byte-identity: 64-frame 1080p dump default vs qgateOff -> cmp identical (382831 bytes both)
+  atoms: unified 377.0K -> 258.7K/frame (-31%); total integer 495.9K -> 377.7K (-24%)
+  wall (interleaved, median, two runs):
+    default-s4(gate on)  15.08 / 14.75   qgateOff-s4  17.02 / 16.32   -> ~10-11% frame-time win
+    atlasOff-s4          14.86 / 14.72   qgateOff+atlasOff 16.30 / 16.29
+  NOTE: with the gate on, atlasOff is now measurably EQUAL-or-FASTER than atlas at s=4.
+  tests: 2207 green.

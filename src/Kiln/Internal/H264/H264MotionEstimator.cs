@@ -796,8 +796,11 @@ internal static class H264MotionEstimator
                     // for the right half would have high sadTL+sadBL yet a valid 8x16-right candidate.
                     // So we compute each quadrant's SAD atom once and derive per-shape lower bounds,
                     // skipping SATD only when NO shape can possibly improve on its current best.
+                    var sTl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 0, rx, ry);
+                    var sTr = -1;
+                    var sBl = -1;
+                    var sBr = -1;
                     {
-                        var sTl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 0, rx, ry);
                         var lb00 = ((sTl + 1) >> 1) + mvCost;
                         if (lb00 >= q00BestScore)
                         {
@@ -805,13 +808,13 @@ internal static class H264MotionEstimator
                             var canImprove = false;
                             if (trFits)
                             {
-                                var sTr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 1, rx, ry);
+                                sTr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 1, rx, ry);
                                 canImprove = ((sTr + 1) >> 1) + mvCost < q10BestScore ||
                                              ((sTl + sTr + 1) >> 1) + mvCost < topBestScore;
                                 if (!canImprove && blFits) // brFits ⊆ trFits && blFits
                                 {
-                                    var sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
-                                    var sBr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 3, rx, ry);
+                                    sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
+                                    sBr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 3, rx, ry);
                                     canImprove =
                                         ((sBl + 1) >> 1) + mvCost < q01BestScore ||
                                         ((sBr + 1) >> 1) + mvCost < q11BestScore ||
@@ -822,7 +825,7 @@ internal static class H264MotionEstimator
                             }
                             else if (blFits)
                             {
-                                var sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
+                                sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
                                 canImprove = ((sBl + 1) >> 1) + mvCost < q01BestScore ||
                                              ((sTl + sBl + 1) >> 1) + mvCost < leftBestScore;
                             }
@@ -831,15 +834,63 @@ internal static class H264MotionEstimator
                         }
                     }
 
-                    // Compute SATD 4x4 atoms; skip columns/rows that fall outside the picture
+                    // Quadrant-level gate: skip a quadrant's four SATD atoms when every shape using
+                    // that quadrant has a SAD lower bound STRICTLY above its current best score.
+                    // Strict '>' pruning is bitstream-identical by construction: SAD/2 never exceeds
+                    // SATD, so lb > best implies candScore > bestScore, which IsBetterScoreCandidate
+                    // rejects regardless of its SAD / MV-magnitude tie-breaks. (The candidate-level
+                    // pre-filter above keeps its historical '>=' semantics untouched.)
+                    var needTl = true;
+                    var needTr = trFits;
+                    var needBl = blFits;
+                    var needBr = brFits;
+                    if (!H264PInterDiagnostics.DisableUnifiedQuadrantGate)
+                    {
+                        if (trFits && sTr < 0)
+                            sTr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 1, rx, ry);
+                        if (blFits && sBl < 0)
+                            sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
+                        if (brFits && sBr < 0)
+                            sBr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 3, rx, ry);
+
+                        var possQ00 = !q00Done && chromaTL && ((sTl + 1) >> 1) + mvCost <= q00BestScore;
+                        var possQ10 = !q10Done && trFits && chromaTR && ((sTr + 1) >> 1) + mvCost <= q10BestScore;
+                        var possQ01 = !q01Done && blFits && chromaBL && ((sBl + 1) >> 1) + mvCost <= q01BestScore;
+                        var possQ11 = !q11Done && brFits && chromaBR && ((sBr + 1) >> 1) + mvCost <= q11BestScore;
+                        var possTop = !topDone && trFits && chromaTL && chromaTR &&
+                            ((sTl + sTr + 1) >> 1) + mvCost <= topBestScore;
+                        var possBot = !botDone && brFits && chromaBL && chromaBR &&
+                            ((sBl + sBr + 1) >> 1) + mvCost <= botBestScore;
+                        var possLeft = !leftDone && blFits && chromaTL && chromaBL &&
+                            ((sTl + sBl + 1) >> 1) + mvCost <= leftBestScore;
+                        var possRight = !rightDone && brFits && chromaTR && chromaBR &&
+                            ((sTr + sBr + 1) >> 1) + mvCost <= rightBestScore;
+
+                        needTl = possQ00 || possTop || possLeft;
+                        needTr = possQ10 || possTop || possRight;
+                        needBl = possQ01 || possBot || possLeft;
+                        needBr = possQ11 || possBot || possRight;
+                        if (!needTl && !needTr && !needBl && !needBr)
+                            continue;
+                    }
+
+                    // Compute SATD 4x4 atoms; skip columns/rows that fall outside the picture and
+                    // quadrants the gate proved irrelevant.
                     var bxLim = xFit16 ? 4 : 2;
                     var byLim = yFit16 ? 4 : 2;
+                    var atomCount = 0;
                     for (var by = 0; by < byLim; by++)
                     {
                         var sy = by * 4;
                         var ry4 = ry + sy;
+                        var topHalf = by < 2;
                         for (var bx = 0; bx < bxLim; bx++)
                         {
+                            var need = bx < 2
+                                ? (topHalf ? needTl : needBl)
+                                : (topHalf ? needTr : needBr);
+                            if (!need)
+                                continue;
                             var sx = bx * 4;
                             atoms[by * 4 + bx] = Satd4x4Direct(
                                 currentMb, currentMbStride, sx, sy,
@@ -847,40 +898,41 @@ internal static class H264MotionEstimator
                                 sourceTransformCoefficients,
                                 refTransformCache, referenceTransformAtlas,
                                 collectDiag, 0 /* B16x16 atom shape */);
+                            atomCount++;
                         }
                     }
 
                     t_searchEffort += byLim * bxLim;
                     if (collectDiag)
-                        H264MotionSatdDagDiagnostics.NotifyUnifiedIntegerAtomComputes(bxLim * byLim);
+                        H264MotionSatdDagDiagnostics.NotifyUnifiedIntegerAtomComputes(atomCount);
 
-                    // Quadrant sums → shape scores
-                    var sumTl = atoms[0] + atoms[1] + atoms[4] + atoms[5];
-                    var sumTr = trFits ? atoms[2] + atoms[3] + atoms[6] + atoms[7] : int.MaxValue;
-                    var sumBl = blFits ? atoms[8] + atoms[9] + atoms[12] + atoms[13] : int.MaxValue;
-                    var sumBr = brFits ? atoms[10] + atoms[11] + atoms[14] + atoms[15] : int.MaxValue;
+                    // Quadrant sums → shape scores (valid only for quadrants the gate computed)
+                    var sumTl = needTl ? atoms[0] + atoms[1] + atoms[4] + atoms[5] : int.MaxValue;
+                    var sumTr = needTr ? atoms[2] + atoms[3] + atoms[6] + atoms[7] : int.MaxValue;
+                    var sumBl = needBl ? atoms[8] + atoms[9] + atoms[12] + atoms[13] : int.MaxValue;
+                    var sumBr = needBr ? atoms[10] + atoms[11] + atoms[14] + atoms[15] : int.MaxValue;
 
                     // 8x8 quadrants
-                    if (!q00Done && chromaTL && IsBetterScoreCandidate(sumTl + mvCost, sumTl, mv, q00BestScore, q00BestSad, q00BestMv))
+                    if (!q00Done && needTl && chromaTL && IsBetterScoreCandidate(sumTl + mvCost, sumTl, mv, q00BestScore, q00BestSad, q00BestMv))
                     { q00BestSad = sumTl; q00BestScore = sumTl + mvCost; q00BestMv = mv; }
 
-                    if (!q10Done && trFits && chromaTR && IsBetterScoreCandidate(sumTr + mvCost, sumTr, mv, q10BestScore, q10BestSad, q10BestMv))
+                    if (!q10Done && needTr && chromaTR && IsBetterScoreCandidate(sumTr + mvCost, sumTr, mv, q10BestScore, q10BestSad, q10BestMv))
                     { q10BestSad = sumTr; q10BestScore = sumTr + mvCost; q10BestMv = mv; }
 
-                    if (!q01Done && blFits && chromaBL && IsBetterScoreCandidate(sumBl + mvCost, sumBl, mv, q01BestScore, q01BestSad, q01BestMv))
+                    if (!q01Done && needBl && chromaBL && IsBetterScoreCandidate(sumBl + mvCost, sumBl, mv, q01BestScore, q01BestSad, q01BestMv))
                     { q01BestSad = sumBl; q01BestScore = sumBl + mvCost; q01BestMv = mv; }
 
-                    if (!q11Done && brFits && chromaBR && IsBetterScoreCandidate(sumBr + mvCost, sumBr, mv, q11BestScore, q11BestSad, q11BestMv))
+                    if (!q11Done && needBr && chromaBR && IsBetterScoreCandidate(sumBr + mvCost, sumBr, mv, q11BestScore, q11BestSad, q11BestMv))
                     { q11BestSad = sumBr; q11BestScore = sumBr + mvCost; q11BestMv = mv; }
 
                     // 16x8 shapes
-                    if (!topDone && trFits && chromaTL && chromaTR)
+                    if (!topDone && needTl && needTr && chromaTL && chromaTR)
                     {
                         var sadTop = sumTl + sumTr;
                         if (IsBetterScoreCandidate(sadTop + mvCost, sadTop, mv, topBestScore, topBestSad, topBestMv))
                         { topBestSad = sadTop; topBestScore = sadTop + mvCost; topBestMv = mv; }
                     }
-                    if (!botDone && brFits && chromaBL && chromaBR)
+                    if (!botDone && needBl && needBr && chromaBL && chromaBR)
                     {
                         var sadBot = sumBl + sumBr;
                         if (IsBetterScoreCandidate(sadBot + mvCost, sadBot, mv, botBestScore, botBestSad, botBestMv))
@@ -888,13 +940,13 @@ internal static class H264MotionEstimator
                     }
 
                     // 8x16 shapes
-                    if (!leftDone && blFits && chromaTL && chromaBL)
+                    if (!leftDone && needTl && needBl && chromaTL && chromaBL)
                     {
                         var sadLeft = sumTl + sumBl;
                         if (IsBetterScoreCandidate(sadLeft + mvCost, sadLeft, mv, leftBestScore, leftBestSad, leftBestMv))
                         { leftBestSad = sadLeft; leftBestScore = sadLeft + mvCost; leftBestMv = mv; }
                     }
-                    if (!rightDone && brFits && chromaTR && chromaBR)
+                    if (!rightDone && needTr && needBr && chromaTR && chromaBR)
                     {
                         var sadRight = sumTr + sumBr;
                         if (IsBetterScoreCandidate(sadRight + mvCost, sadRight, mv, rightBestScore, rightBestSad, rightBestMv))

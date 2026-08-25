@@ -171,6 +171,13 @@ internal static class H264PInterDiagnostics
     /// </summary>
     public static bool DisableSlicePartitionBalance { get; set; }
 
+    /// <summary>
+    /// Measurement-only A/B kill switch for the unified sub-partition search's quadrant-level
+    /// SAD-lower-bound gate (skipping a quadrant's SATD atoms when no partition shape using that
+    /// quadrant can strictly improve). Bitstream-identical either way; keep false in normal operation.
+    /// </summary>
+    public static bool DisableUnifiedQuadrantGate { get; set; }
+
     private static long s_fpFrames;
     private static long s_fpBeginFrameTicks;
     private static long s_fpParallelWallTicks;
