@@ -86,6 +86,16 @@ internal static class H264PerfProbe
                 break;
             }
 
+            case "dump":
+            {
+                var armName = args.Length > 1 ? args[1] : "default";
+                var slices = args.Length > 2 ? int.Parse(args[2]) : 4;
+                var frames = args.Length > 3 ? int.Parse(args[3]) : 64;
+                var outDir = args.Length > 4 ? args[4] : ".";
+                Dump(ResolveArm(armName, slices), frames, outDir);
+                break;
+            }
+
             default:
                 throw new ArgumentException(mode);
         }
@@ -233,6 +243,31 @@ internal static class H264PerfProbe
                 break;
         }
 
+        H264PInterDiagnostics.DisableRefTransformAtlas = false;
+        enc.Dispose();
+    }
+
+    /// <summary>
+    /// Writes an Annex-B stream for one arm (IDR then P-frames over the synthetic cycle) plus, once,
+    /// the raw source YUV, so PSNR/bitrate can be computed externally with ffmpeg.
+    /// </summary>
+    private static void Dump(Arm arm, int frames, string outDir)
+    {
+        var (enc, srcFrames, annex) = Setup(arm);
+        H264PInterDiagnostics.DisableRefTransformAtlas = arm.AtlasOff;
+        var srcPath = System.IO.Path.Combine(outDir, "source.yuv");
+        using var src = System.IO.File.Exists(srcPath) ? null : System.IO.File.Create(srcPath);
+        using var bs = System.IO.File.Create(System.IO.Path.Combine(outDir, $"{arm.Name.Trim()}.h264"));
+        long bytes = 0;
+        for (var i = 0; i < frames; i++)
+        {
+            var n = Encode(enc, srcFrames, annex, i, idr: i == 0);
+            bs.Write(annex, 0, n);
+            bytes += n;
+            src?.Write(srcFrames[i % H264ResolutionSliceSweepBenchmarks.FrameCycle]);
+        }
+
+        Console.WriteLine($"// dump arm={arm.Name} frames={frames} bytes={bytes} kbitPerFrame={bytes * 8.0 / frames / 1000.0:F1}");
         H264PInterDiagnostics.DisableRefTransformAtlas = false;
         enc.Dispose();
     }

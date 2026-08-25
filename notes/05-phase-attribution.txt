@@ -42,3 +42,14 @@ atlas A/B (interleaved, noisier ambient):
 3. Slicing multiplies work: s1 total work 30.3 ms vs s4 sliceSum 44.6 ms (+47%), s8 (fast) +37% vs s4.
 4. Managed allocation is a non-issue now: 7-9 KiB/frame, zero collections in 300 frames.
 5. Atlas: not a structural cost or win at s=4.
+
+# Quality/bitrate at fixed QP28, 64 frames, synthetic scroll+square (ffmpeg PSNR vs source):
+#   arm          kbit/frame  Y-PSNR
+#   default-s1     33.5      39.34
+#   default-s4     47.9      38.69   (baseline for knobs)
+#   default-s8     64.7      38.61
+#   ref1-s4        49.1      38.69   <- MaxRef=1: +2.5% bits, +-0.00 dB on this content
+#   satdOff-s4     58.6      37.74   <- SATD off: +22% bits, -0.95 dB
+#   fast-s4        59.5      37.68
+#   fast-s8        80.7      37.77
+# Slicing bit cost: s1->s4 +43%, s1->s8 +93% bits at equal QP (skip-chain breaks at slice tops).
