@@ -20,9 +20,10 @@ public enum EncoderSpeedMode
     HighQuality = 0,
 
     /// <summary>
-    /// Near-free speed wins: single reference frame plus a worst-case motion-search effort ceiling
-    /// that typical content never touches. Quality within measurement noise of
-    /// <see cref="HighQuality"/> on typical content; recommended for most real-time scenarios.
+    /// Near-free speed wins: single reference frame plus a worst-case motion-search effort
+    /// ceiling. Within ~0.1 dB of <see cref="HighQuality"/> on coherent content at typical QPs;
+    /// the ceiling binds on sustained high-motion or scene-cut content, where it trades PSNR for
+    /// a bounded frame time. Recommended for most real-time scenarios.
     /// </summary>
     Balanced = 1,
 

@@ -178,6 +178,24 @@ public class H264SingleFrameBenchmarks
             return;
         }
 
+        if (args.Length > 1 && args[0] == "--speed-modes")
+        {
+            H264SpeedModeHarness.RunQuality(args[1]);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--speed-modes-tiers")
+        {
+            H264SpeedModeHarness.RunTierDiag();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--speed-modes-timing")
+        {
+            H264SpeedModeHarness.RunTiming();
+            return;
+        }
+
         if (args.Length > 1 && args[0] == "--budget-sweep")
         {
             H264SliceSweepQuickHarness.RunBudgetSweep(args[1]);

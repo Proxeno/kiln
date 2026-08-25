@@ -240,8 +240,10 @@ public sealed class H264BaselineEncoderOptions
     {
         // Historical defaults: everything on, no caps.
         EncoderSpeedMode.HighQuality => (2, true, 16, 0),
-        // Near-free wins only: single reference + a worst-case effort ceiling that typical
-        // content (~150 units/MB) never touches.
+        // Single reference (the bulk of the wall-clock win on coherent content) plus a worst-case
+        // effort ceiling. Coherent motion puts only a few percent of MBs into the ceiling's first
+        // degradation tiers; sustained high-motion / scene-cut content does bind it, trading PSNR
+        // there for the latency bound.
         EncoderSpeedMode.Balanced => (1, true, 16, 512),
         // Adds the sub-partition radius cap and a tighter effort ceiling.
         EncoderSpeedMode.Fast => (1, true, 8, 256),

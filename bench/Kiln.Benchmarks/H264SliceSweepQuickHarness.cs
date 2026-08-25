@@ -387,7 +387,7 @@ internal static class H264SliceSweepQuickHarness
     }
 
     /// <summary>One generator frame repeated exactly — the skip-dominated best case.</summary>
-    private static byte[][] GenerateStatic(int w, int h) =>
+    internal static byte[][] GenerateStatic(int w, int h) =>
         [H264ResolutionSliceSweepBenchmarks.GenerateFrames(w, h)[0]];
 
     /// <summary>
@@ -396,7 +396,7 @@ internal static class H264SliceSweepQuickHarness
     /// </summary>
     internal static byte[][] HighMotionFrames(int w, int h) => GenerateHighMotion(w, h);
 
-    private static byte[][] GenerateHighMotion(int w, int h)
+    internal static byte[][] GenerateHighMotion(int w, int h)
     {
         const int Cycle = 8;
         var ys = w * h;
@@ -447,7 +447,7 @@ internal static class H264SliceSweepQuickHarness
     }
 
     /// <summary>Two unrelated textures alternated every 6 frames — the "genuinely lost" case the wide search exists for.</summary>
-    private static byte[][] GenerateSceneCut(int w, int h)
+    internal static byte[][] GenerateSceneCut(int w, int h)
     {
         var a = H264ResolutionSliceSweepBenchmarks.GenerateFrames(w, h);
         var b = GenerateHighMotion(w, h);
