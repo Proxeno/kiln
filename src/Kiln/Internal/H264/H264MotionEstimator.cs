@@ -9,6 +9,20 @@ namespace Kiln.Internal.H264;
 /// </summary>
 internal static class H264MotionEstimator
 {
+    /// <summary>
+    /// Thread-local running count of motion-search candidate evaluations, in rough relative cost
+    /// units (an integer-pel 16x16 score = 1, a unified sub-partition candidate = 8, a fractional
+    /// qpel candidate = 2). Deterministic for a given input — it counts algorithmic work, not time —
+    /// so the slice-partition balancer can feed the previous frame's per-row effort back into the
+    /// row split without making bitstreams depend on wall-clock measurements. Monotonic; callers
+    /// read deltas.
+    /// </summary>
+    [ThreadStatic]
+    private static long t_searchEffort;
+
+    /// <summary>Current thread's accumulated search effort (see <see cref="t_searchEffort"/>).</summary>
+    internal static long ThreadSearchEffort => t_searchEffort;
+
     /// <summary>One signed motion vector in quarter-pel units.</summary>
     public readonly record struct Mv(short X, short Y);
 
@@ -835,6 +849,8 @@ internal static class H264MotionEstimator
                         }
                     }
 
+                    t_searchEffort += byLim * bxLim;
+
                     // Quadrant sums → shape scores
                     var sumTl = atoms[0] + atoms[1] + atoms[4] + atoms[5];
                     var sumTr = trFits ? atoms[2] + atoms[3] + atoms[6] + atoms[7] : int.MaxValue;
@@ -1537,10 +1553,20 @@ internal static class H264MotionEstimator
         ReadOnlySpan<byte> current,
         int currentStride,
         ReadOnlySpan<byte> reference,
-        int referenceStride) =>
-        useMotionSatd
+        int referenceStride)
+    {
+        // Effort in 4x4-SATD-atom equivalents: a WxH SATD is ~area/16 atoms, SAD ~half that.
+        var area = blockShape switch
+        {
+            MeBlockShape.B16x16 => 256,
+            MeBlockShape.B16x8 or MeBlockShape.B8x16 => 128,
+            _ => 64,
+        };
+        t_searchEffort += useMotionSatd ? area >> 4 : area >> 5;
+        return useMotionSatd
             ? SatdBlock(kernels, blockShape, current, currentStride, reference, referenceStride)
             : SadBlock(kernels, blockShape, current, currentStride, reference, referenceStride);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int SadBlock(
@@ -1573,6 +1599,7 @@ internal static class H264MotionEstimator
         int referenceBlockX,
         int referenceBlockY)
     {
+        t_searchEffort++;
         var sourceX = (atomIndex & 1) << 3;
         var sourceY = (atomIndex >> 1) << 3;
         return kernels.Sad8x8(
@@ -1967,6 +1994,8 @@ internal static class H264MotionEstimator
                             mv.X, mv.Y))
                         continue;
 
+                    // Fractional candidate: qpel interpolation plus SAD/SATD over the block.
+                    t_searchEffort += (bw * bh) >> 4;
                     if (useMotionSatd)
                     {
                         var mvCost = lambda == 0 ? 0 : qpelMvCosts[(fy << 2) + fx];

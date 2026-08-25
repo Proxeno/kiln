@@ -461,6 +461,8 @@ internal sealed class H264BaselineSliceEncoder
         bool isFirstSliceInFrame = true,
         int codedFrameIndex = -1)
     {
+        var collectFramePhases = H264PInterDiagnostics.CollectFramePhases;
+        var sliceStartTicks = collectFramePhases ? Stopwatch.GetTimestamp() : 0;
         var effectiveMbCount = mbCountInSlice < 0 ? _mbCount : mbCountInSlice;
         if (firstMbInSlice % _mbW != 0)
         {
@@ -494,10 +496,12 @@ internal sealed class H264BaselineSliceEncoder
 
         // Copy this slice's source luma into the reconstruction buffer so intra prediction
         // can read correct top/left neighbors across the slice boundary before encoding overwrites them.
+        var copyStartTicks = collectFramePhases ? Stopwatch.GetTimestamp() : 0;
         CopyPlane2d(
             y.Slice(_firstMbRowInSlice * 16 * strideY), strideY,
             _recY.AsSpan(_firstMbRowInSlice * 16 * _width), _width,
             _width, effectiveMbCount / _mbW * 16);
+        var copyTicks = collectFramePhases ? Stopwatch.GetTimestamp() - copyStartTicks : 0;
 
         // Reference-picture lifecycle: an IDR resets the reference cache (decoder will too via
         // memory_management_control_operation 5 implied by IDR). For a P-slice the cache is
@@ -549,6 +553,9 @@ internal sealed class H264BaselineSliceEncoder
         // (H.264 7.3.4) — flushing inside the MB loop and then once more after the loop if the
         // slice ends in a skip tail (an all-skip slice ends here with a single ue(_mbCount)).
         var pendingSkipRun = 0;
+        var rowStartTicks = collectFramePhases ? Stopwatch.GetTimestamp() : 0;
+        var rowStartEffort = H264MotionEstimator.ThreadSearchEffort;
+        var rowFlushMb = firstMbInSlice + _mbW - 1;
         for (var mb = firstMbInSlice; mb < firstMbInSlice + effectiveMbCount; mb++)
         {
             var mbLocal = mb - firstMbInSlice;
@@ -582,6 +589,22 @@ internal sealed class H264BaselineSliceEncoder
             // decoder QPY,PREV. Skips and zero-CBP inter MBs do NOT advance _lastMbQp.
             _qpY[mb] = _lastMbQp;
             _qpUv[mb] = H264ChromaDcScale.ChromaQpFromLuma(_lastMbQp, 0);
+            if (mb == rowFlushMb)
+            {
+                // Row boundary: publish this row's deterministic motion-search effort for the
+                // orchestrator's slice-partition balancer. Rows are owned by exactly one slice, so
+                // this is a plain single-writer store.
+                var rowEndEffort = H264MotionEstimator.ThreadSearchEffort;
+                _shared.RowMeEffort[mb / _mbW] = rowEndEffort - rowStartEffort;
+                rowStartEffort = rowEndEffort;
+                rowFlushMb += _mbW;
+                if (collectFramePhases)
+                {
+                    var rowEndTicks = Stopwatch.GetTimestamp();
+                    NotifyRowStats(mb / _mbW, rowEndTicks - rowStartTicks);
+                    rowStartTicks = rowEndTicks;
+                }
+            }
         }
 
         // Flush a trailing skip run for an all-skip or skip-tail slice (H.264 7.3.4 mb_skip_run
@@ -598,6 +621,7 @@ internal sealed class H264BaselineSliceEncoder
                 "Slice macroblock loop wrote no bits after the slice header; RBSP would decode as an empty slice_data.");
         }
 
+        var deblockStartTicks = collectFramePhases ? Stopwatch.GetTimestamp() : 0;
         if (firstMbInSlice == 0 && mbCountInSlice < 0)
         {
             // Single-slice legacy path: deblock full picture then rotate DPB and pad reference.
@@ -614,6 +638,12 @@ internal sealed class H264BaselineSliceEncoder
         }
 
         _rbspBuffer.WriteRbspTrailingBits();
+        if (collectFramePhases)
+        {
+            var endTicks = Stopwatch.GetTimestamp();
+            LastSliceElapsedTicks = endTicks - sliceStartTicks;
+            H264PInterDiagnostics.NotifySlicePhases(copyTicks, endTicks - deblockStartTicks);
+        }
         return _rbspBuffer.WrittenSpan();
     }
 
@@ -623,6 +653,33 @@ internal sealed class H264BaselineSliceEncoder
     /// caches so within-frame neighbours remain visible. Slice-boundary neighbours are still hidden
     /// via the <c>_firstMbRowInSlice</c> guards in the prediction/CAVLC helpers (H.264 6.4.4).
     /// </summary>
+    /// <summary>
+    /// Per-MB-row diagnostics flush for <see cref="H264PInterDiagnostics.CollectFramePhases"/> runs:
+    /// row wall ticks plus the row's MB outcome mix (P_Skip / plain 16x16 inter / sub-partitioned
+    /// inter / intra) so the partition cost model can be calibrated against measured row times.
+    /// </summary>
+    private void NotifyRowStats(int mbRow, long ticks)
+    {
+        var effort = _shared.RowMeEffort[mbRow];
+        var skip = 0;
+        var inter16 = 0;
+        var interSub = 0;
+        var intra = 0;
+        for (var mb = mbRow * _mbW; mb < (mbRow + 1) * _mbW; mb++)
+        {
+            if (_mbIsSkip[mb])
+                skip++;
+            else if (!_mbIsInter[mb])
+                intra++;
+            else if (_mbPartitions[mb] == H264MotionEstimator.McPartition.Mb16x16)
+                inter16++;
+            else
+                interSub++;
+        }
+
+        H264PInterDiagnostics.NotifyRowStats(mbRow, ticks, effort, skip, inter16, interSub, intra);
+    }
+
     private void ResetForFrame()
     {
         Array.Clear(_nonZeros);
@@ -664,10 +721,25 @@ internal sealed class H264BaselineSliceEncoder
     internal ReadOnlySpan<byte> LastSliceRbsp => _rbspBuffer.WrittenSpan();
 
     /// <summary>
+    /// Wall-clock ticks of the most recent <see cref="EncodeSliceRbsp"/> call on this instance.
+    /// Only recorded while <see cref="H264PInterDiagnostics.CollectFramePhases"/> is set; the
+    /// multi-slice orchestrator reads it after the parallel region to measure slice imbalance.
+    /// </summary>
+    internal long LastSliceElapsedTicks { get; private set; }
+
+    /// <summary>
     /// Pad the fully-reconstructed frame into the internal padded reference buffer so inter
     /// prediction is available for the next P-frame. Called by the orchestrator after all slices
     /// of a multi-slice frame have been encoded and deblocked.
     /// </summary>
+    /// <summary>
+    /// Reference transform atlas for the given DPB slot, honouring the measurement-only
+    /// <see cref="H264PInterDiagnostics.DisableRefTransformAtlas"/> A/B kill switch (null atlas
+    /// makes SATD recompute every reference 4x4 transform instead of consulting the cache).
+    /// </summary>
+    private H264ReferenceTransformAtlas? RefAtlasForMotionSearch(int dpbSlot) =>
+        H264PInterDiagnostics.DisableRefTransformAtlas ? null : _shared.DpbLumaAtlas[dpbSlot];
+
     internal void PadReconstructedReference()
     {
         var uvW = _width / 2;
@@ -1840,7 +1912,7 @@ internal sealed class H264BaselineSliceEncoder
             pictureWidth: _width,
             pictureHeight: _height,
             allowSubPartitionSearch: allowSubPartitionSearch,
-            referenceTransformAtlas: _shared.DpbLumaAtlas[0],
+            referenceTransformAtlas: RefAtlasForMotionSearch(0),
             subPartitionRangeCap: rangeCapThisMb);
         var winRefIdx = 0;
         // Ref1 must beat ref0 by a rate-aware margin (below); when ref0 already sits at the
@@ -1893,7 +1965,7 @@ internal sealed class H264BaselineSliceEncoder
                 pictureWidth: _width,
                 pictureHeight: _height,
                 allowSubPartitionSearch: allowSubPartitionSearch,
-                referenceTransformAtlas: _shared.DpbLumaAtlas[1],
+                referenceTransformAtlas: RefAtlasForMotionSearch(1),
                 subPartitionRangeCap: rangeCapThisMb);
 
             // Ref1 must beat ref0 by a rate-aware margin, not a raw SAD tie-break. ref_idx_l0 is
@@ -1939,7 +2011,7 @@ internal sealed class H264BaselineSliceEncoder
                 pictureHeight: _height,
                 fractionalPelRefinementRounds: 2,
                 lambda: lambdaThisMb,
-                referenceTransformAtlas: _shared.DpbLumaAtlas[0]);
+                referenceTransformAtlas: RefAtlasForMotionSearch(0));
             partResult = new H264MotionEstimator.PartitionResult(
                 H264MotionEstimator.McPartition.Mb16x16,
                 safe.BestMv,

@@ -1,0 +1,55 @@
+# Frame-phase attribution (1080p, procCount=18, Neon64, H264PerfProbe modes phases/mb/satd/atlas)
+# All "sum" figures are thread-time summed across slices; wall = per-frame wall clock.
+
+phases default s=4 (n=300, wall 16.85):
+  beginFrame=0.011 parallelWall=16.633 nalGather=0.005 padRotate=0.135 forkJoin=0.049
+  sliceSum=44.562 sliceMax=16.584 sliceCopySum=0.047 sliceDeblockSum=1.098
+  perSlice: [0]=6.67 [1]=14.98 [2]=15.67 [3]=7.24        <-- 2.3x imbalance
+  alloc/frame=7.3 KiB, zero GCs
+
+phases fast s=4 (n=300, wall 6.01):
+  parallelWall=5.844 padRotate=0.081 sliceSum=18.672 sliceMax=5.801 deblockSum=2.342
+  perSlice: [0]=3.65 [1]=5.57 [2]=5.61 [3]=3.85
+phases fast s=8 (n=300, wall 5.38):
+  parallelWall=5.178 padRotate=0.096 sliceSum=25.698 sliceMax=5.105 deblockSum=2.675
+  perSlice: 2.35 2.58 2.50 3.49 4.84 2.76 3.17 4.00
+phases satdOff s=4 (n=300, wall 7.50):
+  parallelWall=7.279 sliceSum=21.896 sliceMax=7.236 deblockSum=2.191
+  perSlice: [0]=3.93 [1]=6.78 [2]=6.88 [3]=4.31
+
+mb default s=4 (Phase2 per-MB timing, n=200, wall 16.68):
+  761 MB/frame enter Phase2; avg 50.9us/MB; Phase2 thread-time 38.8 ms/frame of 44.6 sliceSum
+  ME=92.4% of Phase2, luma recon 2.2%, chroma 3.3%, write 0.4%
+mb fast s=4 (n=200, wall 6.72):
+  863 MB/frame Phase2; avg 14.5us/MB; Phase2 12.5 ms/frame of 18.7 sliceSum
+  ME=65.3%, luma 13.0%, chroma 12.6%, write 2.0%
+
+satd default s=4 (n=100; instrumentation inflates wall to 34ms — counts valid, times not):
+  SATD 4x4 atom computes: 501K/frame (!); candidateCacheHitRate 7.9%
+  refTransformAtlas: 388K hits + 114K misses/frame, hit rate 77.3%
+  satd-vs-sad lower-bound skip rate 42.4%
+
+atlas A/B (interleaved, noisier ambient):
+  default-s4 18.69 vs atlasOff-s4 18.66  -> atlas is perf-NEUTRAL at s=4 (169 MB footprint buys ~0)
+  default-s1 31.22 vs atlasOff-s1 32.40  -> ~4% win at s=1
+
+# Conclusions so far
+1. The Amdahl "serial ~3.9ms" is NOT serial code: outside-parallel work is ~0.2 ms/frame
+   (beginFrame+nalGather+padRotate+forkJoin). It is slice load imbalance: wall == max slice.
+   Balanced bound at default s=4 = sliceSum/4 + 0.2 = ~11.3 ms (vs 16.6 measured).
+2. ME dominates all work: default s=4 Phase2 ME = ~35.8 ms/frame thread-time = ~80% of sliceSum.
+   Non-vectorised residual/recon/CAVLC is small (<10% of work). Deblock ~1-2.7 ms sum.
+3. Slicing multiplies work: s1 total work 30.3 ms vs s4 sliceSum 44.6 ms (+47%), s8 (fast) +37% vs s4.
+4. Managed allocation is a non-issue now: 7-9 KiB/frame, zero collections in 300 frames.
+5. Atlas: not a structural cost or win at s=4.
+
+# Quality/bitrate at fixed QP28, 64 frames, synthetic scroll+square (ffmpeg PSNR vs source):
+#   arm          kbit/frame  Y-PSNR
+#   default-s1     33.5      39.34
+#   default-s4     47.9      38.69   (baseline for knobs)
+#   default-s8     64.7      38.61
+#   ref1-s4        49.1      38.69   <- MaxRef=1: +2.5% bits, +-0.00 dB on this content
+#   satdOff-s4     58.6      37.74   <- SATD off: +22% bits, -0.95 dB
+#   fast-s4        59.5      37.68
+#   fast-s8        80.7      37.77
+# Slicing bit cost: s1->s4 +43%, s1->s8 +93% bits at equal QP (skip-chain breaks at slice tops).

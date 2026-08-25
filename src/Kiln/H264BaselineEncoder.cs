@@ -177,6 +177,10 @@ public sealed class H264BaselineEncoder : IDisposable
     private readonly byte[] _spsRbsp;
     private readonly byte[] _ppsRbsp;
     private readonly byte[] _ebspScratch;
+    private readonly int[] _slicePartitionRows;
+    private readonly long[] _rowEffortWindow;
+    private int _partitionSliceCount;
+    private int _partitionWindowFrames;
     private int _codedFrameIndex;
     private int _h264FrameNum;
     private int _idrPicId;
@@ -227,6 +231,8 @@ public sealed class H264BaselineEncoder : IDisposable
         var kernels = _options.PreferHardwareIntrinsics ? H264KernelSet.CreateBest() : new ScalarKernelSet();
         var encoderCount = Math.Max(1, Math.Min(MaxSliceEncoders, _mbH));
         _sliceEncoders = new H264BaselineSliceEncoder[encoderCount];
+        _slicePartitionRows = new int[encoderCount + 1];
+        _rowEffortWindow = new long[_mbH];
         for (var i = 0; i < encoderCount; i++)
         {
             _sliceEncoders[i] = new H264BaselineSliceEncoder(
@@ -486,12 +492,25 @@ public sealed class H264BaselineEncoder : IDisposable
         Span<byte> annexB, int pos)
     {
         sliceCount = Math.Min(sliceCount, _sliceEncoders.Length);
-        var mbRowsPerSlice = _mbH / sliceCount;
-        var remainder = _mbH - mbRowsPerSlice * sliceCount;
+
+        var collectFramePhases = H264PInterDiagnostics.CollectFramePhases;
+        var tFrameStart = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+        // Cost-balanced slice partition: the frame wall clock is the *slowest* slice, and with
+        // equal-height slices the band containing the moving content runs 2x+ longer than the rest
+        // (measured 6.7/15.0/15.7/7.2 ms at 1080p s=4 — see notes/05-phase-attribution.txt). Weight
+        // each MB row by the previous frame's skip map (read before BeginFrame clears it) so row
+        // bands equalise predicted work instead of height. Deterministic for a given input sequence;
+        // slice partitioning is an encoder-side choice with no normative constraint on where
+        // first_mb_in_slice boundaries fall (§7.4.3 only requires slices to tile the picture).
+        ComputeSlicePartition(sliceCount);
+        var partitionRows = _slicePartitionRows;
 
         // Single-threaded fence: clear shared per-MB caches and (if IDR) invalidate the reference.
         // Done once before the parallel loop so disjoint per-slice writes don't race with the reset.
         _sliceEncoders[0].BeginFrame(isIdr);
+
+        var tAfterBegin = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Pin the caller's source planes so the parallel workers can reconstitute ReadOnlySpans
         // from raw pointers. The pin scope encloses Parallel.For (which is synchronous), so the
@@ -517,8 +536,8 @@ public sealed class H264BaselineEncoder : IDisposable
                 new ParallelOptions { TaskScheduler = SliceScheduler, MaxDegreeOfParallelism = sliceCount },
                 k =>
             {
-                var firstMbRow = k * mbRowsPerSlice;
-                var rowCount = mbRowsPerSlice + (k == sliceCount - 1 ? remainder : 0);
+                var firstMbRow = partitionRows[k];
+                var rowCount = partitionRows[k + 1] - firstMbRow;
                 var firstMbInSlice = firstMbRow * mbW;
                 var mbCountInSlice = rowCount * mbW;
                 ReadOnlySpan<byte> ySpan;
@@ -544,6 +563,8 @@ public sealed class H264BaselineEncoder : IDisposable
             });
         }
 
+        var tAfterParallel = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         // Gather NALs in raster (slice-index) order. WriteNal must run sequentially because each
         // call advances `pos` and writes into the shared output buffer.
         for (var k = 0; k < sliceCount; k++)
@@ -551,8 +572,144 @@ public sealed class H264BaselineEncoder : IDisposable
             pos += WriteNal(annexB[pos..], 3, nalType, sliceEncoders[k].LastSliceRbsp);
         }
 
+        var tAfterGather = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         _sliceEncoders[0].PadReconstructedReference();
+
+        if (collectFramePhases)
+        {
+            var tEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+            long sliceSum = 0;
+            long sliceMax = 0;
+            for (var k = 0; k < sliceCount; k++)
+            {
+                var t = sliceEncoders[k].LastSliceElapsedTicks;
+                sliceSum += t;
+                sliceMax = Math.Max(sliceMax, t);
+                H264PInterDiagnostics.NotifySliceIndexTicks(k, t);
+            }
+
+            H264PInterDiagnostics.NotifyFramePhases(
+                beginFrameTicks: tAfterBegin - tFrameStart,
+                parallelWallTicks: tAfterParallel - tAfterBegin,
+                nalGatherTicks: tAfterGather - tAfterParallel,
+                padRotateTicks: tEnd - tAfterGather,
+                sliceSumTicks: sliceSum,
+                sliceMaxTicks: sliceMax);
+        }
+
         return pos;
+    }
+
+    /// <summary>
+    /// Baseline cost per macroblock, in the candidate-evaluation units of
+    /// <see cref="H264MotionEstimator.ThreadSearchEffort"/>, covering the work motion search does
+    /// not account for (P_Skip validation, reconstruction, CAVLC, deblocking). Calibrated against
+    /// per-row wall times at 1080p (notes/05-phase-attribution.txt).
+    /// </summary>
+    private const int RowBaseEffortPerMb = 8;
+
+    /// <summary>
+    /// Predicted extra effort per MB for a freshly placed slice-top row: the boundary breaks the
+    /// P_Skip prediction chain, so the row runs near-full motion search (~100 of 120 MBs at 1080p,
+    /// measured ~70 effort units per MB on the probe content). Charged to every slice but the first
+    /// when evaluating a candidate partition, so the optimiser prices the boundary it creates.
+    /// </summary>
+    private const int TopRowEffortPerMb = 64;
+
+    /// <summary>Frames of per-row effort averaged per partition decision (one probe content cycle).</summary>
+    private const int PartitionDecisionWindowFrames = 8;
+
+    /// <summary>
+    /// Update <see cref="_slicePartitionRows"/> (slice k covers MB rows [rows[k], rows[k+1])) so
+    /// slice costs equalise. The frame wall clock is the *slowest* slice, and with fixed
+    /// equal-height slices the band containing the moving content runs 2x+ longer than the rest
+    /// (measured 6.7/15.0/15.7/7.2 ms at 1080p s=4 — notes/05-phase-attribution.txt).
+    ///
+    /// The cost signal is the previous frames' per-row motion-search effort
+    /// (<see cref="H264FrameSharedState.RowMeEffort"/>) — a deterministic count of candidate
+    /// evaluations, not a wall-clock measure, so identical inputs produce identical bitstreams.
+    /// Outcome-based signals (skip maps, MB counts) were tried first and mispredict by an order of
+    /// magnitude: rows with identical skip/inter mixes differ 4x in measured time because
+    /// deep-but-unsuccessful searches leave no trace in the outcome.
+    ///
+    /// Repartitioning is deliberately infrequent (every <see cref="PartitionDecisionWindowFrames"/>
+    /// frames, from window-averaged effort): every boundary move breaks the P_Skip chain along a
+    /// fresh row the following frame, so per-frame moves were measured to cost more than the
+    /// balance they bought on cheap configurations. Each decision solves a greedy prefix
+    /// partition in which (a) rows that are currently slice tops have their observed effort
+    /// replaced by the neighbouring rows' average — that effort is the boundary's own artifact and
+    /// would otherwise make the partition chase itself — and (b) every slice after the first is
+    /// charged <see cref="TopRowEffortPerMb"/> per MB for the top row its boundary will disturb.
+    /// Slice partitioning is an encoder-side choice; §7.4.3 only requires slices to tile the
+    /// picture in raster order.
+    /// </summary>
+    private void ComputeSlicePartition(int sliceCount)
+    {
+        var rows = _slicePartitionRows;
+        // The effort units are calibrated against the SATD search path; in SAD mode
+        // (UseMotionSatd=false) they over-weight high-motion rows ~4x (measured on the probe
+        // content) and the resulting partition is a small net loss, so SAD-mode encodes keep the
+        // historical equal-height split.
+        var balanceDisabled = !_options.UseMotionSatd || H264PInterDiagnostics.DisableSlicePartitionBalance;
+        if (_partitionSliceCount != sliceCount || balanceDisabled)
+        {
+            // First frame at this slice count: equal-height start, matching the historical layout.
+            var mbRowsPerSlice = _mbH / sliceCount;
+            var remainder = _mbH - mbRowsPerSlice * sliceCount;
+            rows[0] = 0;
+            for (var k = 1; k <= sliceCount; k++)
+                rows[k] = rows[k - 1] + mbRowsPerSlice + (k == sliceCount ? remainder : 0);
+            _partitionSliceCount = balanceDisabled ? 0 : sliceCount;
+            Array.Clear(_rowEffortWindow);
+            _partitionWindowFrames = 0;
+            return;
+        }
+
+        var rowEffort = _frameShared.RowMeEffort;
+        for (var r = 0; r < _mbH; r++)
+            _rowEffortWindow[r] += rowEffort[r];
+        if (++_partitionWindowFrames < PartitionDecisionWindowFrames)
+            return;
+
+        // Per-row cost over the window, with current slice-top rows replaced by their neighbours'
+        // average so the boundary's own skip-chain damage does not steer the next partition.
+        Span<long> rowCost = stackalloc long[_mbH];
+        for (var r = 0; r < _mbH; r++)
+            rowCost[r] = _rowEffortWindow[r] / _partitionWindowFrames + (long)RowBaseEffortPerMb * _mbW;
+        for (var k = 1; k < sliceCount; k++)
+        {
+            var top = rows[k];
+            var lo = top > 0 ? rowCost[top - 1] : rowCost[top + 1];
+            var hi = top + 1 < _mbH ? rowCost[top + 1] : rowCost[top - 1];
+            rowCost[top] = (lo + hi) / 2;
+        }
+
+        long remainingCost = (long)(sliceCount - 1) * TopRowEffortPerMb * _mbW;
+        for (var r = 0; r < _mbH; r++)
+            remainingCost += rowCost[r];
+
+        // Greedy sequential fill: give each slice its share of the remaining cost, keeping at
+        // least one row per slice (and enough rows for every slice still to come).
+        var row = 0;
+        for (var k = 0; k < sliceCount - 1; k++)
+        {
+            var budget = remainingCost / (sliceCount - k);
+            long acc = k > 0 ? (long)TopRowEffortPerMb * _mbW : 0;
+            var maxRow = _mbH - (sliceCount - 1 - k);
+            var first = row;
+            while (row < maxRow && (row == first || acc + rowCost[row] / 2 < budget))
+            {
+                acc += rowCost[row];
+                row++;
+            }
+
+            rows[k + 1] = row;
+            remainingCost -= acc;
+        }
+
+        Array.Clear(_rowEffortWindow);
+        _partitionWindowFrames = 0;
     }
 
     private int WriteNal(Span<byte> dest, byte nri, byte nalType, ReadOnlySpan<byte> rbsp) =>
