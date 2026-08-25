@@ -17,7 +17,7 @@ internal static class H264PerfProbe
     private const int W = 1920;
     private const int H = 1080;
 
-    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false, bool AtlasOff = false, bool BalanceOff = false, int RangeCap = 16, int Qp = 28, bool Divergent = false);
+    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false, bool AtlasOff = false, bool BalanceOff = false, int RangeCap = 16, int Qp = 28, bool Divergent = false, int? SubPartDivisor = null);
 
     private static Arm ResolveArm(string name, int slices) => name switch
     {
@@ -31,6 +31,9 @@ internal static class H264PerfProbe
         "div" => new Arm($"div-s{slices}", Satd: true, MaxRef: 2, Slices: slices, Divergent: true),
         "rc8div" => new Arm($"rc8div-s{slices}", Satd: true, MaxRef: 2, Slices: slices, RangeCap: 8, Divergent: true),
         "rc4div" => new Arm($"rc4div-s{slices}", Satd: true, MaxRef: 2, Slices: slices, RangeCap: 4, Divergent: true),
+        "ref1div" => new Arm($"ref1div-s{slices}", Satd: true, MaxRef: 1, Slices: slices, Divergent: true),
+        "satdOffDiv" => new Arm($"satdOffDiv-s{slices}", Satd: false, MaxRef: 2, Slices: slices, Divergent: true),
+        "bud64div" => new Arm($"bud64div-s{slices}", Satd: true, MaxRef: 2, Slices: slices, Divergent: true, SubPartDivisor: 64),
         _ => throw new ArgumentException(name),
     };
 
@@ -92,6 +95,14 @@ internal static class H264PerfProbe
                     ResolveArm("div", 4),
                     ResolveArm("rc8div", 4),
                     ResolveArm("rc4div", 4),
+                ]);
+                break;
+            case "div-parts":
+                Measure([
+                    ResolveArm("div", 4),
+                    ResolveArm("ref1div", 4),
+                    ResolveArm("satdOffDiv", 4),
+                    ResolveArm("bud64div", 4),
                 ]);
                 break;
             case "spin":
@@ -176,6 +187,7 @@ internal static class H264PerfProbe
             H264PInterDiagnostics.DisableRef1TieMargin = arms[a].DisableRef1Margin;
             H264PInterDiagnostics.DisableRefTransformAtlas = arms[a].AtlasOff;
             H264PInterDiagnostics.DisableSlicePartitionBalance = arms[a].BalanceOff;
+            H264PInterDiagnostics.SubPartBudgetDivisorOverride = arms[a].SubPartDivisor;
             Encode(encs[a].Enc, encs[a].Frames, encs[a].Annex, frameIdx[a]++, idr: true);
             for (var i = 0; i < 3; i++)
                 Encode(encs[a].Enc, encs[a].Frames, encs[a].Annex, frameIdx[a]++, idr: false);
@@ -190,6 +202,7 @@ internal static class H264PerfProbe
                 H264PInterDiagnostics.DisableRef1TieMargin = arms[a].DisableRef1Margin;
                 H264PInterDiagnostics.DisableRefTransformAtlas = arms[a].AtlasOff;
                 H264PInterDiagnostics.DisableSlicePartitionBalance = arms[a].BalanceOff;
+                H264PInterDiagnostics.SubPartBudgetDivisorOverride = arms[a].SubPartDivisor;
                 H264PInterDiagnostics.ResetPhaseCounts();
                 sw.Restart();
                 for (var i = 0; i < ChunkFrames; i++)
@@ -207,6 +220,7 @@ internal static class H264PerfProbe
         H264PInterDiagnostics.DisableRef1TieMargin = false;
         H264PInterDiagnostics.DisableRefTransformAtlas = false;
         H264PInterDiagnostics.DisableSlicePartitionBalance = false;
+        H264PInterDiagnostics.SubPartBudgetDivisorOverride = null;
         for (var a = 0; a < arms.Length; a++)
         {
             Array.Sort(ms[a]);
