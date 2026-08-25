@@ -108,7 +108,7 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
 | `LightweightDeblocking` | false | Disables in-loop deblocking (bitstream-signalled) to cut CPU. |
 | `PreferHardwareIntrinsics` | true | Runtime SIMD kernel selection; false forces scalar. |
 | `SubPartitionRangeCap` | 16 | Sub-partition ME radius cap (per-frame complexity budget applies). |
-| `ProfileIdc` / `LevelIdc` | 66 / 0x1F | Signalled profile (baseline) and level. |
+| `ProfileIdc` / `LevelIdc` | 66 / 0 (auto) | Signalled profile (baseline) and level. `LevelIdc = 0` auto-selects the lowest level whose MaxFS admits the frame, floored at 3.1; set explicitly to pin a level. |
 | `ChromaDcRdLambda`, `Intra4x4SadLambda` | derived | Expert RD-lambda overrides; leave null. |
 
 ## Performance
@@ -140,9 +140,18 @@ clean-licensed, dependency-free, low-latency H.264 inside a .NET process, you ar
 Frame dimensions need not be multiples of 16: sizes like 1920×1080 or 1366×768 are supported via
 SPS frame cropping — the encoder pads to the 16×16 macroblock grid internally and signals the true
 display size, which is what decoders output. Dimensions must be **even** (4:2:0 chroma is
-subsampled 2×2, so odd extents are unrepresentable). Note that level limits are checked against the
-*padded* size: 1920×1080 codes as 1920×1088 (8160 macroblocks), which needs
-`H264BaselineEncoderOptions.LevelIdc = 40` — the default Level 3.1 tops out at 1280×720.
+subsampled 2×2, so odd extents are unrepresentable). By default the encoder signals the lowest
+H.264 level whose frame-size limit (MaxFS, Annex A Table A-1) admits the *padded* picture, floored
+at Level 3.1 — 1920×1080 codes as 1920×1088 (8160 macroblocks) and signals Level 4.0 automatically.
+Set `H264BaselineEncoderOptions.LevelIdc` explicitly to pin a level; an explicit level that is too
+small for the frame throws, naming the lowest sufficient level. The chosen level is readable from
+`H264BaselineEncoder.LevelIdc`.
+
+> **0.x behavioural change:** `LevelIdc` previously defaulted to 31 (Level 3.1) and the constructor
+> threw for frames above 1280×720. The default is now 0 = auto-select. Streams ≤720p with default
+> options are byte-identical to before (the auto floor is still 3.1); larger frames now construct
+> and encode instead of throwing. `EncodeFrame`'s output span now has a documented recommended size,
+> `H264BaselineEncoder.RecommendedOutputBufferSize`.
 
 The `Adaptation` (resolution/fps ladders) and `Queue` (latest-frame dropping) namespaces ship inside
 the library, fully tested but not yet wired into the encoder — **experimental**, and their APIs may

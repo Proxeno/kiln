@@ -107,17 +107,65 @@ public sealed class H264FrameCroppingTests
     }
 
     [Fact]
-    public void Encoder_1080p_with_default_level_throws_naming_required_level()
+    public void Encoder_1080p_with_explicit_insufficient_level_throws_naming_required_level()
     {
-        // Padded 1920×1088 = 8160 MBs > MaxFS 3600 of the default level_idc 31 (Annex A Table A-1).
-        // The exception must name the minimum sufficient level (40) and explain that the MB count is
-        // of the padded picture, since 8160 won't match arithmetic done on 1920×1080.
-        Action act = () => new H264BaselineEncoder(1920, 1080);
+        // Padded 1920×1088 = 8160 MBs > MaxFS 3600 of level_idc 31 (Annex A Table A-1). With an
+        // explicit level the encoder must not silently upgrade it: the exception must name the
+        // minimum sufficient level (40) and explain that the MB count is of the padded picture,
+        // since 8160 won't match arithmetic done on 1920×1080.
+        Action act = () => new H264BaselineEncoder(
+            1920, 1080, new H264BaselineEncoderOptions { LevelIdc = 31 });
         act.Should().Throw<ArgumentException>()
             .WithMessage("*MaxFS*")
             .WithMessage("*8160*")
             .WithMessage("*padded*")
             .WithMessage("*level_idc 40*");
+    }
+
+    [Theory]
+    [InlineData(320, 240, 31)]    // 300 MBs — min level 1.1, floored at the 3.1 default
+    [InlineData(1280, 720, 31)]   // 3600 MBs — exactly Level 3.1's MaxFS (the historical default)
+    [InlineData(1366, 768, 32)]   // padded 1376×768 = 4128 MBs — first above 3.1
+    [InlineData(1920, 1080, 40)]  // padded 1920×1088 = 8160 MBs
+    [InlineData(3840, 2160, 51)]  // 32400 MBs — 4K needs Level 5.1
+    public void Encoder_default_level_auto_selects_lowest_sufficient_floored_at_31(
+        int w, int h, byte expectedLevelIdc)
+    {
+        using var enc = new H264BaselineEncoder(w, h);
+        enc.LevelIdc.Should().Be(expectedLevelIdc);
+    }
+
+    [Fact]
+    public void Encoder_auto_level_is_signalled_in_sps()
+    {
+        var (y, u, v) = MakeCheckerboard(1920, 1080);
+        using var enc = new H264BaselineEncoder(1920, 1080);
+        var annexB = new byte[enc.RecommendedOutputBufferSize];
+        var written = enc.EncodeFrame(y, u, v, 1920, 960, annexB);
+        written.Should().BeGreaterThan(0);
+
+        // SPS NAL: start code (4) + header (1), then profile_idc, constraint flags, level_idc.
+        annexB[4].Should().Be(0x67, "first NAL of an IDR access unit is the SPS");
+        annexB[7].Should().Be(40, "auto-selected level_idc 40 must be written to the SPS");
+    }
+
+    [Fact]
+    public void Encoder_explicit_level_is_exposed_unchanged()
+    {
+        using var enc = new H264BaselineEncoder(
+            1280, 720, new H264BaselineEncoderOptions { LevelIdc = 42 });
+        enc.LevelIdc.Should().Be(42);
+    }
+
+    [Fact]
+    public void EncodeFrame_with_undersized_output_span_names_recommended_size()
+    {
+        var (y, u, v) = MakeCheckerboard(64, 64);
+        using var enc = new H264BaselineEncoder(64, 64);
+        var annexB = new byte[16];
+        Action act = () => enc.EncodeFrame(y, u, v, 64, 32, annexB);
+        act.Should().Throw<ArgumentException>()
+            .WithMessage("*RecommendedOutputBufferSize*");
     }
 
     [Fact]

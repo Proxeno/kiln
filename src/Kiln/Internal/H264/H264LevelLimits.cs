@@ -93,4 +93,36 @@ internal static class H264LevelLimits
 
         return 0;
     }
+
+    /// <summary>
+    /// Floor for automatically selected levels: Level 3.1, the historical Kiln default. Auto
+    /// selection never signals below this — a higher-than-necessary <c>level_idc</c> is always
+    /// conformant (Annex A level limits are monotone), and only frame size (MaxFS) is validated
+    /// here; MaxMBPS/MaxBR are not enforced (no VUI HRD), so under-signalling a tiny level for a
+    /// small picture could still overstate what the stream honours. Keeping the 3.1 floor also
+    /// leaves every existing ≤720p default-options stream byte-identical.
+    /// </summary>
+    public const byte AutoLevelFloorIdc = 31;
+
+    /// <summary>
+    /// Level to signal when the caller left <c>LevelIdc = 0</c> (auto): the lowest Annex A
+    /// Table A-1 level whose <c>MaxFS</c> admits the coded picture, floored at
+    /// <see cref="AutoLevelFloorIdc"/>.
+    /// </summary>
+    /// <param name="mbW">Coded (padded) picture width in macroblocks.</param>
+    /// <param name="mbH">Coded (padded) picture height in macroblocks.</param>
+    /// <exception cref="ArgumentException">No level in Table A-1 admits this frame size.</exception>
+    public static byte AutoLevelForFrameSize(int mbW, int mbH)
+    {
+        var minimumLevel = MinimumLevelForFrameSize(mbW, mbH);
+        if (minimumLevel == 0)
+        {
+            throw new ArgumentException(
+                $"Frame size {mbW}×{mbH} = {mbW * mbH} macroblocks — counted on the padded coded picture, " +
+                "whose dimensions are the display dimensions rounded up to multiples of 16 — exceeds " +
+                "MaxFS for every level in H.264 Annex A Table A-1 (Level 5.2, MaxFS=36864). Reduce resolution.");
+        }
+
+        return Math.Max(AutoLevelFloorIdc, minimumLevel);
+    }
 }

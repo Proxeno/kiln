@@ -18,7 +18,10 @@ internal static class H264AnnexB
         var total = StartCode.Length + 1 + ebspLen;
         if (dest.Length < total)
         {
-            throw new ArgumentException("destination span too small for NAL unit", nameof(dest));
+            throw new ArgumentException(
+                $"Annex B destination too small for a {total}-byte NAL unit ({dest.Length} bytes remaining). " +
+                "Size the EncodeFrame output span to at least H264BaselineEncoder.RecommendedOutputBufferSize.",
+                nameof(dest));
         }
 
         StartCode.CopyTo(dest);
