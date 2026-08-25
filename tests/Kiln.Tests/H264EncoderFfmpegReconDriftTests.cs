@@ -21,9 +21,13 @@ public sealed class H264EncoderFfmpegReconDriftTests
     private const int Frames = 6;
 
     [Theory]
-    [InlineData(1)]
-    [InlineData(4)]
-    public void Encoder_recon_matches_ffmpeg_decode_on_high_motion_two_ref_content(int slices)
+    [InlineData(1, 0)]
+    [InlineData(4, 0)]
+    // 24 units/MB is far below what this content consumes, so every effort-budget degradation
+    // tier engages (asserted below) — the degraded search decisions must still produce a
+    // bitstream whose reconstruction a conformant decoder reproduces byte-exactly.
+    [InlineData(4, 24)]
+    public void Encoder_recon_matches_ffmpeg_decode_on_high_motion_two_ref_content(int slices, int effortCap)
     {
         if (!TryVerifyFfmpegOnPath())
         {
@@ -43,8 +47,11 @@ public sealed class H264EncoderFfmpegReconDriftTests
                    KeyframeIntervalFrames = int.MaxValue,
                    LevelIdc = 40,
                    SliceCount = slices,
+                   MotionSearchEffortCapPerMb = effortCap,
                }))
         {
+            Kiln.Internal.H264.H264PInterDiagnostics.CollectPhaseCounts = true;
+            Kiln.Internal.H264.H264PInterDiagnostics.ResetPhaseCounts();
             for (var i = 0; i < Frames; i++)
             {
                 var f = frames[i % frames.Length];
@@ -52,6 +59,19 @@ public sealed class H264EncoderFfmpegReconDriftTests
                     f.AsSpan(0, ys), f.AsSpan(ys, uv), f.AsSpan(ys + uv, uv), W, W / 2, annex, forceKeyframe: i == 0);
                 stream.Write(annex, 0, n);
                 reconPerFrame[i] = enc.LastReconstructedY[..ys].ToArray();
+            }
+
+            var (tier1, tier2, tier3) = Kiln.Internal.H264.H264PInterDiagnostics.ReadMeBudgetTierCounts();
+            Kiln.Internal.H264.H264PInterDiagnostics.CollectPhaseCounts = false;
+            if (effortCap > 0)
+            {
+                (tier1 + tier2 + tier3).Should().BeGreaterThan(0,
+                    "the effort cap must actually engage for this case to guard the degraded search paths");
+                tier3.Should().BeGreaterThan(0, "the 16x16-only tier must be exercised");
+            }
+            else
+            {
+                (tier1 + tier2 + tier3).Should().Be(0, "an unset cap must never degrade the search");
             }
         }
 

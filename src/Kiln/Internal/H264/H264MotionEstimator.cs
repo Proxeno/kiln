@@ -108,7 +108,8 @@ internal static class H264MotionEstimator
         int fastSeedSearchRange = 0,
         bool allowSubPartitionSearch = true,
         H264ReferenceTransformAtlas? referenceTransformAtlas = null,
-        int subPartitionRangeCap = 8)
+        int subPartitionRangeCap = 8,
+        bool allowExhaustiveFallback = true)
     {
         var best = new PartitionResult(McPartition.Mb16x16, default, default, default, default, int.MaxValue);
 
@@ -169,7 +170,7 @@ internal static class H264MotionEstimator
         // keep whichever is better. This only fires on macroblocks the fast search failed on, so the
         // well-predicted common case keeps its speed.
         var fallbackThreshold = useMotionSatd ? FastSearchFullFallbackSatd : FastSearchFullFallbackSad;
-        if (fastSearch && r0.BestSad > fallbackThreshold)
+        if (fastSearch && allowExhaustiveFallback && r0.BestSad > fallbackThreshold)
         {
             H264PInterDiagnostics.NotifyMeExhaustiveFallback();
             var full = SearchMb16x16(
@@ -1119,6 +1120,7 @@ internal static class H264MotionEstimator
                     if (useMotionSatd &&
                         CanUseTransformDomainSatd4x4(sourceTransformCoefficients, refTransformCache, referenceTransformAtlas))
                     {
+                        t_searchEffort += (bw * bh) >> 4;
                         s = SatdBlockTransformDomain(blockShape, currentMb, currentMbStride, reference, referenceStride,
                             currentBlockX, currentBlockY, candidate.ReferenceX, candidate.ReferenceY,
                             sourceTransformCoefficients, refTransformCache, referenceTransformAtlas,
@@ -1419,6 +1421,10 @@ internal static class H264MotionEstimator
                 }
             }
 
+            // Same effort unit as ScoreBlock: a WxH SATD is ~area/16 4x4 atoms. Without this the
+            // hex seed search (which always takes this branch in the default config) is invisible
+            // to ThreadSearchEffort, blinding the slice balancer and the ME effort budget to it.
+            t_searchEffort += (bw * bh) >> 4;
             s = SatdBlockFromReferenceAtlas(
                 blockShape,
                 sourceTransformCoefficients,
@@ -1450,6 +1456,7 @@ internal static class H264MotionEstimator
                     return;
                 }
 
+                t_searchEffort += (bw * bh) >> 4;
                 s = SatdBlockBounded(blockShape, current, currentStride, refWin, referenceStride, satdStopAfter);
             }
             else

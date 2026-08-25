@@ -285,6 +285,18 @@ internal sealed class H264BaselineSliceEncoder
     private const int SubPartBudgetMbDivisor = 4;
     private readonly int _subPartitionRangeCap;
 
+    // Deterministic per-slice motion-search effort budget (see
+    // H264BaselineEncoderOptions.MotionSearchEffortCapPerMb): an equal share of the frame budget,
+    // fixed at construction (capPerMb x frame MB count / slice count — equal, not proportional to
+    // the slice's MB count, because the effort-balanced partition deliberately gives high-motion
+    // bands fewer rows; a proportional budget would bind on exactly the slice the balancer already
+    // equalised). Consumption is read from the thread-local
+    // H264MotionEstimator.ThreadSearchEffort as a delta from the slice start — each slice encodes
+    // sequentially on a single worker thread, so the delta contains exactly this slice's work and
+    // the resulting decisions are independent of thread scheduling.
+    private readonly long _meEffortBudget;
+    private long _meEffortAtSliceStart;
+
     /// <summary>First MB row of the current slice — used to scope deblocking to the slice range.</summary>
     private int _firstMbRowInSlice;
     /// <summary>When true, emits <c>disable_deblocking_filter_idc=2</c> (within-slice only) in the slice header.</summary>
@@ -329,7 +341,8 @@ internal sealed class H264BaselineSliceEncoder
         bool useMotionSatd = true,
         bool enableIntraInPFallback = true,
         int? experimentalZeroMvSkipSadThreshold = null,
-        int subPartitionRangeCap = 16)
+        int subPartitionRangeCap = 16,
+        long motionSearchEffortSliceBudget = 0)
     {
         if (width <= 0 || height <= 0 || (width & 15) != 0 || (height & 15) != 0)
         {
@@ -398,6 +411,7 @@ internal sealed class H264BaselineSliceEncoder
         _mbAqQpOffset = adaptiveQuantStrength > 0 ? new int[_mbCount] : Array.Empty<int>();
         _kernels = kernels ?? H264KernelSet.CreateBest();
         _subPartitionRangeCap = Math.Max(1, subPartitionRangeCap);
+        _meEffortBudget = motionSearchEffortSliceBudget > 0 ? motionSearchEffortSliceBudget : long.MaxValue;
     }
 
     private void ComputeAqOffsets(ReadOnlySpan<byte> srcY, int strideY)
@@ -491,6 +505,9 @@ internal sealed class H264BaselineSliceEncoder
             < 0 => 32, // legacy fixed per-slice-encoder budget (measurement baseline)
             _ => Math.Max(8, effectiveMbCount / subPartDivisor),
         };
+        // ME effort budget: snapshot the thread counter before any macroblock encodes, so the
+        // ladder in TryEncodePInterMacroblock depends only on this slice's own prior work.
+        _meEffortAtSliceStart = H264MotionEstimator.ThreadSearchEffort;
         _currentFrameNum = frameNum;
         _currentCodedFrameIndex = codedFrameIndex;
 
@@ -1894,6 +1911,47 @@ internal sealed class H264BaselineSliceEncoder
         if (allowSubPartitionSearch)
             _subPartMbCount++;
         var rangeCapThisMb = _subPartMbCount > _subPartBudget ? Math.Min(4, _subPartitionRangeCap) : _subPartitionRangeCap;
+
+        // Deterministic effort-budget ladder (H264BaselineEncoderOptions.MotionSearchEffortCapPerMb):
+        // consumption is this slice's own accumulated search effort, so the tier for a given MB
+        // depends only on previously encoded MBs of the same slice — never on wall clock or thread
+        // scheduling. Each tier sheds the costliest remaining content-scaled term first (measured
+        // on divergent-motion 1080p, notes/07): the 65x65 exhaustive fallback, then the second
+        // reference and the wide seed window, then the sub-partition shapes entirely. Encoder
+        // search policy only; every output remains a normatively valid P-macroblock.
+        var seedSearchRangeThisMb = 32;
+        var allowExhaustiveFallback = true;
+        var allowRef1Search = true;
+        if (_meEffortBudget != long.MaxValue)
+        {
+            var consumed = H264MotionEstimator.ThreadSearchEffort - _meEffortAtSliceStart;
+            if (consumed >= _meEffortBudget)
+            {
+                allowSubPartitionSearch = false;
+                allowExhaustiveFallback = false;
+                allowRef1Search = false;
+                seedSearchRangeThisMb = 8;
+                adaptiveRange = Math.Min(adaptiveRange, 8);
+                rangeCapThisMb = Math.Min(4, rangeCapThisMb);
+                H264PInterDiagnostics.NotifyMeBudgetTier(3);
+            }
+            else if (consumed >= _meEffortBudget - (_meEffortBudget >> 2))
+            {
+                allowExhaustiveFallback = false;
+                allowRef1Search = false;
+                seedSearchRangeThisMb = 16;
+                adaptiveRange = Math.Min(adaptiveRange, 16);
+                rangeCapThisMb = Math.Min(4, rangeCapThisMb);
+                H264PInterDiagnostics.NotifyMeBudgetTier(2);
+            }
+            else if (consumed >= _meEffortBudget >> 1)
+            {
+                allowExhaustiveFallback = false;
+                rangeCapThisMb = Math.Min(8, rangeCapThisMb);
+                H264PInterDiagnostics.NotifyMeBudgetTier(1);
+            }
+        }
+
         var lambdaThisMb = LambdaSatdForQp(qpThisMb);
 
         // ME against DPB slot 0 (most recent reference, refIdx=0).
@@ -1907,13 +1965,14 @@ internal sealed class H264BaselineSliceEncoder
             _kernels,
             temporalMv: temporalMv,
             fastSearch: _fastSearch,
-            fastSeedSearchRange: 32,
+            fastSeedSearchRange: seedSearchRangeThisMb,
             lambda: lambdaThisMb,
             pictureWidth: _width,
             pictureHeight: _height,
             allowSubPartitionSearch: allowSubPartitionSearch,
             referenceTransformAtlas: RefAtlasForMotionSearch(0),
-            subPartitionRangeCap: rangeCapThisMb);
+            subPartitionRangeCap: rangeCapThisMb,
+            allowExhaustiveFallback: allowExhaustiveFallback);
         var winRefIdx = 0;
         // Ref1 must beat ref0 by a rate-aware margin (below); when ref0 already sits at the
         // "good enough" floor (4 per sample over a 16x16 luma MB, the same floor the sub-partition
@@ -1930,7 +1989,7 @@ internal sealed class H264BaselineSliceEncoder
         // significant coefficients (and a better reference still pays off), so the floor scales with
         // lambda and only saturates at the sub-partition early-out floor for mid/high QPs.
         var ref1SearchFloor = Math.Min(4 * 16 * 16, 32 * lambdaThisMb);
-        var searchRef1 = _shared.DpbCount >= 2;
+        var searchRef1 = _shared.DpbCount >= 2 && allowRef1Search;
         if (searchRef1 && !H264PInterDiagnostics.DisableRef1TieMargin &&
             partResult.TotalSad <= ref1SearchFloor + ref1TieMargin)
         {
@@ -1960,13 +2019,14 @@ internal sealed class H264BaselineSliceEncoder
                 _kernels,
                 temporalMv: partResult.Mv0,
                 fastSearch: _fastSearch,
-                fastSeedSearchRange: 32,
+                fastSeedSearchRange: seedSearchRangeThisMb,
                 lambda: lambdaThisMb,
                 pictureWidth: _width,
                 pictureHeight: _height,
                 allowSubPartitionSearch: allowSubPartitionSearch,
                 referenceTransformAtlas: RefAtlasForMotionSearch(1),
-                subPartitionRangeCap: rangeCapThisMb);
+                subPartitionRangeCap: rangeCapThisMb,
+                allowExhaustiveFallback: allowExhaustiveFallback);
 
             // Ref1 must beat ref0 by a rate-aware margin, not a raw SAD tie-break. ref_idx_l0 is
             // te(v)-coded at 1 bit either way (§9.1.1), but a two-frames-back MV roughly doubles the

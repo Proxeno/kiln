@@ -62,6 +62,9 @@ internal static class H264PInterDiagnostics
     private static long s_phase2Entered;
     private static long s_phase2bIntraWin;
     private static long s_meHexSearches;
+    private static long s_meBudgetTier1;
+    private static long s_meBudgetTier2;
+    private static long s_meBudgetTier3;
     private static long s_meExhaustiveFallbacks;
     private static long s_temporalProbeWideGate;
     private static long s_temporalProbeAttempts;
@@ -390,6 +393,9 @@ internal static class H264PInterDiagnostics
         Interlocked.Exchange(ref s_phase2bIntraWin, 0);
         Interlocked.Exchange(ref s_meHexSearches, 0);
         Interlocked.Exchange(ref s_meExhaustiveFallbacks, 0);
+        Interlocked.Exchange(ref s_meBudgetTier1, 0);
+        Interlocked.Exchange(ref s_meBudgetTier2, 0);
+        Interlocked.Exchange(ref s_meBudgetTier3, 0);
         Interlocked.Exchange(ref s_temporalProbeWideGate, 0);
         Interlocked.Exchange(ref s_temporalProbeAttempts, 0);
         Interlocked.Exchange(ref s_temporalProbePasses, 0);
@@ -430,6 +436,16 @@ internal static class H264PInterDiagnostics
     /// searches started, and how many escalated to the exhaustive-window fallback. These are the
     /// direct measure of how much motion-search work slicing creates.
     /// </summary>
+    /// <summary>
+    /// Macroblocks encoded at each ME effort-budget degradation tier (gated by
+    /// <see cref="CollectPhaseCounts"/>); all zero when the budget is off or never binds.
+    /// </summary>
+    public static (long Tier1, long Tier2, long Tier3) ReadMeBudgetTierCounts() =>
+        (
+            Volatile.Read(ref s_meBudgetTier1),
+            Volatile.Read(ref s_meBudgetTier2),
+            Volatile.Read(ref s_meBudgetTier3));
+
     public static (long HexSearches, long ExhaustiveFallbacks) ReadMeSearchCounts() =>
         (
             Volatile.Read(ref s_meHexSearches),
@@ -565,6 +581,24 @@ internal static class H264PInterDiagnostics
         if (CollectPhaseCounts)
         {
             Interlocked.Increment(ref s_meHexSearches);
+        }
+    }
+
+    /// <summary>
+    /// Records a P-inter macroblock encoded under ME effort-budget pressure (gated by
+    /// <see cref="CollectPhaseCounts"/>): tier 1 = fallback skipped + radius 8, tier 2 = single
+    /// reference + radius 4 + narrowed window, tier 3 = 16x16-only search.
+    /// </summary>
+    internal static void NotifyMeBudgetTier(int tier)
+    {
+        if (CollectPhaseCounts)
+        {
+            switch (tier)
+            {
+                case 1: Interlocked.Increment(ref s_meBudgetTier1); break;
+                case 2: Interlocked.Increment(ref s_meBudgetTier2); break;
+                default: Interlocked.Increment(ref s_meBudgetTier3); break;
+            }
         }
     }
 

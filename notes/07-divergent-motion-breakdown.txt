@@ -1,0 +1,98 @@
+# Divergent-motion worst case (1080p s=4 defaults, Neon64, procCount=18)
+# Content: probe arm "div" (half-frame opposing 6px scroll + 2 opposing 96x96 squares)
+# cherry-picked bench arm 6d371a6 from worktree-agent-a7b7facf773e2dea3
+
+## Reproduction (phases mode)
+default-s4: wall 12.38 ms/frame  sliceSum=39.57 sliceMax=12.11 perSlice 9.15/9.72/10.01/10.69
+div-s4:     wall 88.01 ms/frame  sliceSum=179.06 sliceMax=87.68 perSlice 42.15/59.29/38.16/39.45
+-> 7.1x. Total thread work 4.5x; the rest is load imbalance:
+   div sliceMax(mean per frame)=87.7 but per-slice-index means are 38-59 -> per frame ONE slice
+   runs ~88ms while others ~30ms, and WHICH slice is hot varies. Balanced bound would be
+   179/4+0.2 = ~45ms. Imbalance factor 1.95x (default content: 1.20x).
+
+## Phase2 per-MB (mb mode, n=100)
+default (notes/05): 761 MB/frame Phase2, 50.9 us/MB, ME=92.4% -> ~35.8 ms/frame thread-time
+div:                874 MB/frame Phase2, 194.2 us/MB, ME=97.7% -> ~165.8 ms/frame thread-time
+-> MB count nearly flat (+15%); per-MB ME cost is 3.8x.
+
+## SATD DAG counters (satd mode, n=60; counts valid, wall inflated)
+per frame              default      div      ratio
+atom computes           405.7K     3047.8K    7.5x
+candidate SATD evals     14.3K      24.6K     1.7x
+unified-search MBs        60.6       505.3    8.3x   <- SMOKING GUN
+  (of Phase2 MBs)        8.0%       57.8%
+lb tests 16x8+8x16+8x8   14.4K      120.4K    8.3x
+satd-vs-sad skip rate    43.6%      21.8%           <- SAD lower bound stops filtering
+refT hitRate             74.0%      89.9%
+depth histogram div: 5-8=14.1% 13-16=18.1% 17+=67.8% (default: 20.6/17.5/61.9 of a 8.3x smaller base)
+
+## Search counts (Measure mode, interleaved arms, 6 rounds x 10 frames, median)
+default-s4 14.19 ms (min 11.19 max 15.36) hex/frame= 791 exhaustive/frame=11.5
+rc8-s4     12.43   (-12%)                 hex 797 exh 11.8
+rc4-s4     10.92   (-23%)                 hex 802 exh 12.3
+div-s4     83.68 ms (min 71.94 max 108.66) hex/frame=1106 exhaustive/frame=12.3
+rc8div-s4  72.27   (-14%)                 hex 1187 exh 12.6
+rc4div-s4  51.60   (-38%)                 hex 1313 exh 12.5
+-> hexagon searches +40% on div, exhaustive fallbacks FLAT (~12/frame): full-pel search is NOT
+   the driver. rc4 still 3.6x baseline: range cap alone does not bound the worst case.
+
+## Interpretation so far
+Cost = (#MBs entering unified sub-partition search) x (per-search SATD cost).
+Divergent content pushes 58% of Phase2 MBs into unified search vs 8% on coherent content.
+SubPartBudget = SliceMbCount/4 = 510/slice = 2040/frame; unified MBs/frame = 505 (~126/slice)
+-> the budget NEVER BINDS on this content. It caps a pathological 100%-of-MBs case at 25%,
+   but 25% of MBs at ~300us each is already ~60ms/frame of thread work. (VERIFY semantics.)
+
+## Mechanism decomposition (div-parts, interleaved, median of 6x10)
+div-s4        85.38 ms (min 71.8 max 111.6)  hex 1106 exh 12.3
+ref1div-s4    60.18 ms (MaxRef=1)            -> ref1 competition ~25 ms (29%)
+satdOffDiv-s4 30.50 ms (UseMotionSatd=false) -> SATD unified sub-partition machinery ~55 ms (64%)
+bud64div-s4   47.58 ms (SubPartBudget divisor 64 -> binds at 32 MBs/slice)
+-> Even a hard-binding budget floors at ~48 ms: over-budget MBs only drop the sub-partition
+   range cap to 4; shapes, both refs, fractional refinement and the 16x16 search all still run.
+
+## SubPartBudget semantics (H264BaselineSliceEncoder.cs:1893-1896)
+_subPartMbCount++ for EVERY Phase2 MB with variance>=64 (whether or not unified search runs);
+over budget => rangeCapThisMb = min(4, cap). That is all it does. It bounds nothing else.
+On div content: ~505 unified MBs/frame ~= 126/slice vs budget 510/slice -> never binds.
+
+## Effort-counting fix (commit "count atlas/transform-domain/bounded SATD candidates")
+ThreadSearchEffort was blind to the default-config hex path (SatdBlockFromReferenceAtlas /
+SatdBlockBounded / SatdBlockTransformDomain). After fix: default 1.166M units/frame (143/MB),
+div 5.63M (690/MB), hot row 1.51M (12.5K/MB). Effort tracks thread-time at ~35 ns/unit on
+both contents. Frame time unchanged (13.0 / 83.5 ms).
+
+## MotionSearchEffortCapPerMb: deterministic per-slice budget + degradation ladder
+Budget/slice = cap x frameMbCount / sliceCount (EQUAL share, not slice-MB-proportional: the
+effort balancer gives hot bands fewer rows, so a proportional budget binds on exactly the slice
+the balancer already equalised — measured as spurious tier engagement on coherent content).
+Ladder at 50/75/100% consumed: (1) skip 65x65 exhaustive fallback, subpart radius<=8;
+(2) + drop ref1, window 16, radius<=4; (3) 16x16-only, window 8.
+Consumption = slice's own ThreadSearchEffort delta -> bitstream independent of scheduling/clock.
+
+## Timing (interleaved Measure, median of 6x10; phases wall for n=100 in parens)
+content   cap=0            cap512           cap256          cap128
+coherent  12.00            11.83 (t:13/f)   11.12 (63/f)    9.25 (179/f)
+divergent 83.03 (88.0)     40.04 (40.8)     29.70           21.38 (24.0)
+divergent max chunk 108.9  44.2             35.8            33.2
+cap512div phases: sliceSum=100.5 sliceMax=40.5 -> hot slice = full budget (1.04M units ~ 36ms)
+cap128div phases: sliceMax=23.7; tier-3 floor (uncounted recon/CAVLC/skip + degraded search)
+puts the asymptote near ~20ms at s=4 on this machine; ME capping alone cannot reach 16.7ms.
+
+## Quality (64 frames, ffmpeg Y-PSNR vs source, fixed QP)
+coherent q24: base 40.75/70.6k | cap512 40.74/71.5k | cap256 40.66/72.3k | cap128 40.54/71.8k
+coherent q28: base 38.59/47.7k | cap512 38.59/48.6k | cap256 38.64/48.5k | cap128 38.55/48.6k
+coherent q32: base 38.46/33.2k | cap512 38.48/33.1k | cap256 38.44/34.0k | cap128 38.50/34.3k
+div q24: base 40.76/125.4k | cap512 40.37/139.1k | cap256 40.15/166.5k | cap128 39.87/191.2k
+div q28: base 39.75/78.9k  | cap512 39.40/119.4k | cap256 39.24/157.0k | cap128 39.09/171.6k
+div q32: base 38.78/69.7k  | cap512 39.08/77.2k  | cap256 38.95/124.4k | cap128 38.89/155.5k
+-> Coherent: cap512 fully neutral (-0.01 dB, +1.9% bits). Divergent: cost lands mostly in
+   BITRATE at fixed QP (worse prediction -> bigger residual): cap512 -0.35 dB and +11..51%,
+   cap128 up to -0.7 dB @q24 and +117% bits @q28. This is the price of the bound, paid only
+   when the bound binds.
+
+## Guards
+- H264EncoderFfmpegReconDriftTests extended: cap=24 case engages all tiers, recon still
+  byte-exact vs ffmpeg. Default cap=0 asserted to never engage.
+- H264MotionEffortBudgetTests: cross-run bitstream determinism with the cap binding mid-slice.
+- Full suite 2211 passing; golden PSNR floors intact (cap defaults to 0 = byte-identical).

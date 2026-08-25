@@ -49,9 +49,10 @@ public sealed class H264BaselineEncoderOptions
     public bool PreferHardwareIntrinsics { get; set; } = true;
 
     /// <summary>
-    /// When true, biases P-frame inter ME toward integer-pel refinement (fewer fractional-pel passes)
-    /// and skips chroma-DC rate–distortion refinement for inter-coded chroma. IDR/I paths keep full fidelity.
-    /// Default false for parity with golden / existing tests.
+    /// When true, skips chroma-DC rate–distortion refinement for inter-coded chroma. IDR/I paths
+    /// keep full fidelity. Default false for parity with golden / existing tests. This flag does
+    /// not bound motion-estimation cost; for a deterministic worst-case frame-time bound see
+    /// <see cref="MotionSearchEffortCapPerMb"/>.
     /// </summary>
     public bool PreferRealtimeLatencyTuning { get; set; }
 
@@ -136,6 +137,24 @@ public sealed class H264BaselineEncoderOptions
     /// to the slice's MB count, so the per-frame total is independent of <see cref="SliceCount"/>.
     /// </summary>
     public int SubPartitionRangeCap { get; set; } = 16;
+
+    /// <summary>
+    /// Deterministic per-frame motion-search complexity ceiling, in candidate-evaluation units per
+    /// macroblock (the units of the internal search-effort counter: one 16×16 SATD candidate = 16).
+    /// <c>0</c> (default) = unbounded, byte-identical to previous behaviour. When set, every slice
+    /// receives an equal share of a frame budget of value × frame MB count (equal — not
+    /// proportional to slice size — because the effort-balanced partition gives high-motion bands
+    /// fewer rows on purpose); consumption is counted as motion search runs, and
+    /// as it crosses 50% / 75% / 100% of the budget the search degrades in steps: first the
+    /// exhaustive-window fallback is skipped and the sub-partition radius drops to 8; then the
+    /// second reference frame is dropped, the search window shrinks, and the radius drops to 4;
+    /// finally sub-partition shapes are skipped entirely (16×16-only ME). The count is algorithmic
+    /// work, not wall clock, so identical inputs still produce identical bitstreams. Typical 1080p
+    /// content measures ~150 units/MB and is unaffected by ceilings ≥ 512; divergent-motion stress
+    /// content measures ~700 unbounded. See the README options table for measured latency/quality
+    /// trade-offs.
+    /// </summary>
+    public int MotionSearchEffortCapPerMb { get; set; }
 }
 
 /// <summary>Baseline H.264 encoder (I and P slices, intra macroblocks only in P). Emits Annex B byte stream.</summary>
@@ -230,6 +249,14 @@ public sealed class H264BaselineEncoder : IDisposable
         _frameShared = sharedState;
         var kernels = _options.PreferHardwareIntrinsics ? H264KernelSet.CreateBest() : new ScalarKernelSet();
         var encoderCount = Math.Max(1, Math.Min(MaxSliceEncoders, _mbH));
+        // Equal per-slice share of the frame ME effort budget (see
+        // H264BaselineEncoderOptions.MotionSearchEffortCapPerMb). Equal — not proportional to a
+        // slice's MB count — because the effort-balanced partition gives high-motion bands fewer
+        // rows; the balancer aims at equal per-slice effort, so the budget shares match that aim.
+        var budgetSliceCount = Math.Min(Math.Max(1, GetEffectiveSliceCount()), encoderCount);
+        var effortSliceBudget = _options.MotionSearchEffortCapPerMb > 0
+            ? Math.Max(1L, (long)_options.MotionSearchEffortCapPerMb * (_mbW * _mbH) / budgetSliceCount)
+            : 0L;
         _sliceEncoders = new H264BaselineSliceEncoder[encoderCount];
         _slicePartitionRows = new int[encoderCount + 1];
         _rowEffortWindow = new long[_mbH];
@@ -252,7 +279,8 @@ public sealed class H264BaselineEncoder : IDisposable
                 _options.UseMotionSatd,
                 _options.EnableIntraInPFallback,
                 _options.ExperimentalZeroMvSkipSadThreshold,
-                _options.SubPartitionRangeCap);
+                _options.SubPartitionRangeCap,
+                effortSliceBudget);
         }
         // LevelIdc = 0 means auto: lowest Table A-1 level whose MaxFS admits the coded picture,
         // floored at Level 3.1 (see H264BaselineEncoderOptions.LevelIdc). An explicit level is

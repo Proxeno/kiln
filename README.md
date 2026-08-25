@@ -107,7 +107,8 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
 | `PreferRealtimeLatencyTuning` | false | Speed-biased P-frame ME / chroma-DC handling. |
 | `LightweightDeblocking` | false | Disables in-loop deblocking (bitstream-signalled) to cut CPU. |
 | `PreferHardwareIntrinsics` | true | Runtime SIMD kernel selection; false forces scalar. |
-| `SubPartitionRangeCap` | 16 | Sub-partition ME radius cap (per-frame complexity budget applies). |
+| `SubPartitionRangeCap` | 16 | Sub-partition ME radius cap (per-frame complexity budget applies). A speed knob: 8 is ~20% faster per frame and 4 ~30% faster. Quality-neutral (±0.01 dB) on coherent motion; on divergent motion 8 costs about −0.17 dB / +13.5% bits at QP 24. |
+| `MotionSearchEffortCapPerMb` | 0 (off) | Deterministic worst-case frame-time bound: caps motion-search work per frame (units/MB; each slice gets an equal share) and degrades search in steps as the budget depletes. Typical content uses ~150 units/MB and is untouched by 512; pathological divergent motion is bounded from ~7× to ~2× typical frame time at 512 (~2.4× fewer ms at 128), paying bitrate/PSNR only when the cap binds. Bitstreams stay reproducible — the count is algorithmic work, not wall clock. |
 | `ProfileIdc` / `LevelIdc` | 66 / 0 (auto) | Signalled profile (baseline) and level. `LevelIdc = 0` auto-selects the lowest level whose MaxFS admits the frame, floored at 3.1; set explicitly to pin a level. |
 | `ChromaDcRdLambda`, `Intra4x4SadLambda` | derived | Expert RD-lambda overrides; leave null. |
 
