@@ -21,7 +21,7 @@ namespace Kiln.Benchmarks;
 [MinColumn, MeanColumn, MedianColumn, MaxColumn, StdDevColumn]
 public class H264ResolutionSliceSweepBenchmarks
 {
-    private const int FrameCycle = 8;
+    internal const int FrameCycle = 8;
     private const int Qp = 28;
 
     [Params("640x480", "1280x720", "1920x1080")]
@@ -103,7 +103,7 @@ public class H264ResolutionSliceSweepBenchmarks
     /// 96×96 bright square moving 16 px per frame. Identical for every (resolution, slice) cell at
     /// a given resolution; scaled texture, same recipe, across resolutions.
     /// </summary>
-    private static byte[][] GenerateFrames(int w, int h)
+    internal static byte[][] GenerateFrames(int w, int h)
     {
         var ys = w * h;
         var uv = ys / 4;
