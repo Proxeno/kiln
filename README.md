@@ -110,6 +110,7 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
 | `FastSearch` | true | Hex/diamond integer ME + qpel refinement; false = exhaustive integer search. |
 | `UseMotionSatd` | true | SATD scoring for integer-pel ME candidates (SAD for fractional refinement). |
 | `EnableIntraInPFallback` | true | Allows I16x16/I4x4 macroblocks inside P-frames when inter prediction fails. |
+| `IntraRefreshPeriodFrames` | 0 (off) | Gradual intra refresh: N > 0 enables it (sets `constrained_intra_pred_flag` in the PPS) and spreads each `RequestIntraRefresh()` wave over up to N frames — an intra MB-column band sweeps the picture with motion vectors of refreshed MBs restricted to the refreshed reference region, so a decoder joining at the wave start converges byte-exactly without an IDR. Measured at 640×480 QP 30 on motion content: recovery costs a max of ~2.7× a typical P-frame per frame for N frames instead of one ~14× IDR spike; the standing cost of the flag with no wave running is ≈ +0.3–1.1% bits, ±0.1 dB. |
 | `TrellisLevel` | 0 | 1 = greedy per-coefficient trellis quantization (better RD, ~5% CPU). |
 | `AdaptiveQuantStrength` | 0.0 | Variance-based spatial AQ; 1.0 = standard, typical 0.5–1.5. |
 | `PreferRealtimeLatencyTuning` | false | Skips chroma-DC RD refinement for inter-coded chroma. Does not bound motion-search cost — that's `MotionSearchEffortCapPerMb`. |
@@ -276,10 +277,16 @@ The session is deterministic (identical frames + feedback → identical bytes; w
 figures participate only if you pass them in), and it is honest about its limits: resolution
 decisions are surfaced as recommendations until you can supply rescaled frames and call
 `ChangeResolution` (Kiln has no scaler; the session recreates the encoder and the next frame is an
-IDR with the new SPS), `TargetFps` is a pacing contract for your capture loop (the SPS carries no
-timing info), and intra refresh remains **unimplemented** — a recovery request that lands in the
-IDR cooldown is reported on the result, not silently faked. The full taxonomy of what may change
-mid-stream at which boundary is in [docs/architecture.md](docs/architecture.md). The `Queue`
+IDR with the new SPS), and `TargetFps` is a pacing contract for your capture loop (the SPS carries
+no timing info). Gradual intra refresh is implemented: construct with
+`IntraRefreshPeriodFrames = N` and a recovery request that lands in the IDR cooldown starts a
+refresh wave — a band of intra MB columns sweeping the picture over up to N frames, with
+`constrained_intra_pred_flag` and motion vectors restricted to the refreshed region, so a decoder
+joining at the wave start (SPS/PPS and a recovery-point SEI are repeated there) reconstructs
+byte-exactly once the wave completes, for a bounded per-frame premium instead of an IDR-sized
+spike. With the option at its default 0 the flag is off and streams are byte-identical to
+previous releases. The full taxonomy of what may change mid-stream at which boundary is in
+[docs/architecture.md](docs/architecture.md). The `Queue`
 namespace (latest-frame dropping) still ships unwired — **experimental**, APIs may change.
 
 ## Installing
