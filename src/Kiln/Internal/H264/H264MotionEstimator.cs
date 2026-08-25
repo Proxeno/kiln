@@ -2039,12 +2039,21 @@ internal static class H264MotionEstimator
 
         var bestMv = seedMv;
 
+        var prevRoundOriginX = int.MinValue;
+        var prevRoundOriginY = int.MinValue;
         for (var round = 0; round < refinementRounds; round++)
         {
             var ix = ((int)bestMv.X >> 2);
             var iy = ((int)bestMv.Y >> 2);
             var originX = mbX + ix;
             var originY = mbY + iy;
+            // Candidates are (fx, fy) in [0,3]^2 around the same integer pel, so a round whose
+            // origin matches the previous round's re-evaluates an identical candidate set; every
+            // pruning rule below is strict, so the repeat is deterministic dead work -- stop.
+            if (originX == prevRoundOriginX && originY == prevRoundOriginY)
+                break;
+            prevRoundOriginX = originX;
+            prevRoundOriginY = originY;
             if (!QpelFits(originX, originY, bw, bh, picW, picH))
                 continue;
 

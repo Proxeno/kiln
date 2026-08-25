@@ -40,3 +40,14 @@ Implication: the atlas 8%-hit story was a conflation. Real targets, in order of 
     atlasOff-s4          14.86 / 14.72   qgateOff+atlasOff 16.30 / 16.29
   NOTE: with the gate on, atlasOff is now measurably EQUAL-or-FASTER than atlas at s=4.
   tests: 2207 green.
+
+# Optimisation 2 (landed): dead second fractional-refinement round eliminated
+# RefineFrac candidates are (fx,fy) in [0,3]^2 around one integer pel; mv>>2 is invariant, so
+# round 2's origin always equals round 1's -> identical candidate set, deterministic, strict
+# pruning -> provably no-op. Break when a round's origin repeats.
+  byte-identity: 64-frame dump still cmp-identical to the pre-change stream
+  atoms: frac SATD 411.9K -> 205.9K/frame (-50%); frac SAD blocks 41.8K -> 21.6K
+  qpel interpolations ~unchanged (block cache already spanned rounds)
+  wall (qgate probe): default-s4 15.08/14.75 -> 13.73 ms/frame; cumulative vs pre-gate 17.0 -> 13.7 (-19%)
+  atlasOff-s4 13.73 == default-s4 13.73 (atlas now exactly neutral at s=4 with both changes)
+  tests: 2207 green.
