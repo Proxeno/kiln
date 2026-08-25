@@ -157,6 +157,7 @@ internal static class H264MotionEstimator
         var fallbackThreshold = useMotionSatd ? FastSearchFullFallbackSatd : FastSearchFullFallbackSad;
         if (fastSearch && r0.BestSad > fallbackThreshold)
         {
+            H264PInterDiagnostics.NotifyMeExhaustiveFallback();
             var full = SearchMb16x16(
                 current, currentStride, reference, referenceStride, mbX, mbY, mvPredictor, seedSearchRange,
                 useMotionSatd, kernels,
@@ -1170,6 +1171,7 @@ internal static class H264MotionEstimator
         int fractionalPelRefinementRounds = 2,
         H264ReferenceTransformAtlas? referenceTransformAtlas = null)
     {
+        H264PInterDiagnostics.NotifyMeHexSearch();
         var picW = referenceStride;
         var picH = reference.Length / referenceStride;
         var predIx = mvPredictor.X >> 2;

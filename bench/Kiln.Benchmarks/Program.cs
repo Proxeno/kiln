@@ -148,6 +148,24 @@ public class H264SingleFrameBenchmarks
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--slice-quick")
+        {
+            H264SliceSweepQuickHarness.RunPerf();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--slice-trace")
+        {
+            H264SliceSweepQuickHarness.RunTrace();
+            return;
+        }
+
+        if (args.Length > 1 && args[0] == "--slice-quality")
+        {
+            H264SliceSweepQuickHarness.RunQuality(args[1]);
+            return;
+        }
+
         foreach (var summary in BenchmarkSwitcher
                      .FromAssembly(typeof(H264SingleFrameBenchmarks).Assembly)
                      .Run(args, KilnBenchmarkHostConfig.Create()))

@@ -1740,13 +1740,41 @@ internal sealed class H264BaselineSliceEncoder
         var current = srcY.Slice(srcMbOff);
         var variance = H264VarianceFastPath.VarianceMb16x16(current, strideY);
         var adaptiveRange = variance < 64 ? 8 : variance < 512 ? 16 : 32;
-        // When skip prediction is clearly poor, widen ME even for low-variance MBs.
-        if (sadSkip > 4096)
-            adaptiveRange = Math.Max(adaptiveRange, 32);
-        else if (sadSkip > 2048)
-            adaptiveRange = Math.Max(adaptiveRange, 24);
         H264MotionEstimator.Mv? temporalMv = _shared.PaddedRefValid ? _shared.PrevMbMvs[mbIndex] : null;
-        if (temporalMv.HasValue && adaptiveRange < 16)
+        if (sadSkip > 2048)
+        {
+            // Poor skip prediction usually means real motion, so widen ME even for low-variance MBs —
+            // but a slice-top row has no B neighbour, so P_Skip is normatively (0,0) (§8.4.1.1) and
+            // sadSkip runs high on any moving content there. That signals a missing spatial predictor,
+            // not a scene change: probe the co-located previous-frame MV with one SAD first, and
+            // search tightly around that seed when it explains the motion (at most half the skip SAD;
+            // the probe is luma-only, so the margin also absorbs sadSkip's chroma term). Only when the
+            // temporal seed fails too does this conclude the search must widen. The probe requires a
+            // seed distinct from the skip MV that already failed: for an equal seed (e.g. the all-zero
+            // PrevMbMvs after an IDR) it would re-measure the failed prediction minus its chroma term
+            // and pass spuriously on chroma-heavy error, collapsing the range below real motion.
+            var sadTemporal = int.MaxValue;
+            var probeAttempted = false;
+            if (!H264PInterDiagnostics.DisableTemporalSeedProbe &&
+                temporalMv is { } tSeed && (tSeed.X != mvSkipPred.X || tSeed.Y != mvSkipPred.Y))
+            {
+                probeAttempted = true;
+                sadTemporal = TemporalSeedProbeSadLuma(current, strideY, mbX, mbY, tSeed);
+            }
+
+            H264PInterDiagnostics.NotifyTemporalProbe(probeAttempted, sadTemporal < sadSkip >> 1);
+            if (sadTemporal < sadSkip >> 1)
+            {
+                var tmv = temporalMv!.Value;
+                var temporalIntPelMag = Math.Max(Math.Abs(tmv.X), Math.Abs(tmv.Y)) >> 2;
+                adaptiveRange = Math.Clamp(temporalIntPelMag + 4, 8, 32);
+            }
+            else
+            {
+                adaptiveRange = Math.Max(adaptiveRange, sadSkip > 4096 ? 32 : 24);
+            }
+        }
+        else if (temporalMv.HasValue && adaptiveRange < 16)
         {
             var tmv = temporalMv.Value;
             var temporalIntPelMag = Math.Max(Math.Abs(tmv.X), Math.Abs(tmv.Y)) >> 2;
@@ -1782,7 +1810,37 @@ internal sealed class H264BaselineSliceEncoder
             referenceTransformAtlas: _shared.DpbLumaAtlas[0],
             subPartitionRangeCap: rangeCapThisMb);
         var winRefIdx = 0;
-        if (_shared.DpbCount >= 2)
+        // Ref1 must beat ref0 by a rate-aware margin (below); when ref0 already sits at the
+        // "good enough" floor (4 per sample over a 16x16 luma MB, the same floor the sub-partition
+        // search early-outs at), a full second search is usually wasted work. But "usually" is not
+        // "always" — tile-period scroll is a measured case where ref0 is acceptable while ref1 (the
+        // less-requantised IDR reconstruction) is meaningfully better — so instead of skipping
+        // outright, compare the references with symmetric cheap luma SAD probes: ref1 at the
+        // linear-motion extrapolation 2×Mv0 (two frames back) and at Mv0 itself (co-located /
+        // static), against ref0 at Mv0. Only when ref1 shows no margin-clearing advantage under the
+        // same metric is the full second search skipped. On well-predicted content this halves the
+        // inter ME work per MB.
+        var ref1TieMargin = H264PInterDiagnostics.DisableRef1TieMargin ? 0 : 2 * lambdaThisMb;
+        // "Good enough" must track the quantiser: at low QP a residual of 4 per sample still codes
+        // significant coefficients (and a better reference still pays off), so the floor scales with
+        // lambda and only saturates at the sub-partition early-out floor for mid/high QPs.
+        var ref1SearchFloor = Math.Min(4 * 16 * 16, 32 * lambdaThisMb);
+        var searchRef1 = _shared.DpbCount >= 2;
+        if (searchRef1 && !H264PInterDiagnostics.DisableRef1TieMargin &&
+            partResult.TotalSad <= ref1SearchFloor + ref1TieMargin)
+        {
+            var mv0 = partResult.Mv0;
+            var mvLinear = new H264MotionEstimator.Mv(
+                (short)Math.Clamp(2 * mv0.X, short.MinValue, short.MaxValue),
+                (short)Math.Clamp(2 * mv0.Y, short.MinValue, short.MaxValue));
+            var probeRef1 = Math.Min(
+                SeedProbeSadLuma(_shared.DpbPaddedY[1], current, strideY, mbX, mbY, mvLinear),
+                SeedProbeSadLuma(_shared.DpbPaddedY[1], current, strideY, mbX, mbY, mv0));
+            var probeRef0 = SeedProbeSadLuma(_paddedRefY, current, strideY, mbX, mbY, mv0);
+            searchRef1 = probeRef1 != int.MaxValue && probeRef1 + ref1TieMargin < probeRef0;
+        }
+
+        if (searchRef1)
         {
             // Search ref1 using ref0's winning MV as the temporal seed. Without this, ref1 always
             // starts its hex search from (0,0) — the refIdx-filtered spatial predictor collapses
@@ -1805,7 +1863,15 @@ internal sealed class H264BaselineSliceEncoder
                 referenceTransformAtlas: _shared.DpbLumaAtlas[1],
                 subPartitionRangeCap: rangeCapThisMb);
 
-            if (partResult1.TotalSad < partResult.TotalSad)
+            // Ref1 must beat ref0 by a rate-aware margin, not a raw SAD tie-break. ref_idx_l0 is
+            // te(v)-coded at 1 bit either way (§9.1.1), but a two-frames-back MV roughly doubles the
+            // MVD magnitude (extra ~2 bits), and — far costlier downstream — a refIdx≠0 winner
+            // disables P_Skip for every MB that predicts from it (§8.4.1.1 requires A/B refIdx 0)
+            // and feeds its double-length MV back into the temporal seed field. On noise-tied
+            // content the raw comparison made ref1 win ~half the time for no distortion gain,
+            // cascading skip failures rows deep below every slice-top row (issue #3). Encoder
+            // search policy only; either reference is normatively valid.
+            if (partResult1.TotalSad + ref1TieMargin < partResult.TotalSad)
             {
                 partResult = partResult1;
                 winRefIdx = 1;
@@ -2532,6 +2598,40 @@ internal sealed class H264BaselineSliceEncoder
         }
 
         return sse;
+    }
+
+    /// <summary>
+    /// One luma SAD of the current MB against the padded reference at the co-located previous-frame
+    /// MV, truncated to integer pel (arithmetic >> 2, matching the temporal seed candidate in
+    /// <see cref="H264MotionEstimator.SearchMbSubPartitions"/>). Encoder-search heuristic only — it
+    /// never affects normative prediction — used to decide whether a failed P_Skip means "widen the
+    /// search" or "the previous frame already explains this motion". Returns
+    /// <see cref="int.MaxValue"/> when the displaced window falls outside the padded reference.
+    /// </summary>
+    private int TemporalSeedProbeSadLuma(
+        ReadOnlySpan<byte> currentMb, int currentStride, int mbX, int mbY, H264MotionEstimator.Mv mv) =>
+        SeedProbeSadLuma(_paddedRefY, currentMb, currentStride, mbX, mbY, mv);
+
+    /// <summary>
+    /// One luma SAD of the current MB against an arbitrary padded reference plane at an integer-pel
+    /// truncated MV (see <see cref="TemporalSeedProbeSadLuma"/>); also drives the ref1 competition
+    /// gate. Returns <see cref="int.MaxValue"/> when the displaced window falls outside the plane.
+    /// </summary>
+    private int SeedProbeSadLuma(
+        ReadOnlySpan<byte> paddedRef,
+        ReadOnlySpan<byte> currentMb,
+        int currentStride,
+        int mbX,
+        int mbY,
+        H264MotionEstimator.Mv mv)
+    {
+        var rx = mbX + HaloLuma + (mv.X >> 2);
+        var ry = mbY + HaloLuma + (mv.Y >> 2);
+        var paddedH = paddedRef.Length / _paddedStrideY;
+        if (rx < 0 || ry < 0 || rx + 16 > _paddedStrideY || ry + 16 > paddedH)
+            return int.MaxValue;
+        return _kernels.Sad16x16(
+            currentMb, currentStride, paddedRef.Slice(ry * _paddedStrideY + rx), _paddedStrideY);
     }
 
     private static int ComputeInterPredictionSse(
