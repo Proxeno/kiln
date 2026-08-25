@@ -1740,13 +1740,34 @@ internal sealed class H264BaselineSliceEncoder
         var current = srcY.Slice(srcMbOff);
         var variance = H264VarianceFastPath.VarianceMb16x16(current, strideY);
         var adaptiveRange = variance < 64 ? 8 : variance < 512 ? 16 : 32;
-        // When skip prediction is clearly poor, widen ME even for low-variance MBs.
-        if (sadSkip > 4096)
-            adaptiveRange = Math.Max(adaptiveRange, 32);
-        else if (sadSkip > 2048)
-            adaptiveRange = Math.Max(adaptiveRange, 24);
         H264MotionEstimator.Mv? temporalMv = _shared.PaddedRefValid ? _shared.PrevMbMvs[mbIndex] : null;
-        if (temporalMv.HasValue && adaptiveRange < 16)
+        if (sadSkip > 2048)
+        {
+            // Poor skip prediction usually means real motion, so widen ME even for low-variance MBs —
+            // but a slice-top row has no B neighbour, so P_Skip is normatively (0,0) (§8.4.1.1) and
+            // sadSkip runs high on any moving content there. That signals a missing spatial predictor,
+            // not a scene change: probe the co-located previous-frame MV with one SAD first, and
+            // search tightly around that seed when it explains the motion (at most half the skip SAD;
+            // the probe is luma-only, so the margin also absorbs sadSkip's chroma term). Only when the
+            // temporal seed fails too does this conclude the search must widen. The probe requires a
+            // seed distinct from the skip MV that already failed: for an equal seed (e.g. the all-zero
+            // PrevMbMvs after an IDR) it would re-measure the failed prediction minus its chroma term
+            // and pass spuriously on chroma-heavy error, collapsing the range below real motion.
+            var sadTemporal = int.MaxValue;
+            if (temporalMv is { } tSeed && (tSeed.X != mvSkipPred.X || tSeed.Y != mvSkipPred.Y))
+                sadTemporal = TemporalSeedProbeSadLuma(current, strideY, mbX, mbY, tSeed);
+            if (sadTemporal < sadSkip >> 1)
+            {
+                var tmv = temporalMv!.Value;
+                var temporalIntPelMag = Math.Max(Math.Abs(tmv.X), Math.Abs(tmv.Y)) >> 2;
+                adaptiveRange = Math.Clamp(temporalIntPelMag + 4, 8, 32);
+            }
+            else
+            {
+                adaptiveRange = Math.Max(adaptiveRange, sadSkip > 4096 ? 32 : 24);
+            }
+        }
+        else if (temporalMv.HasValue && adaptiveRange < 16)
         {
             var tmv = temporalMv.Value;
             var temporalIntPelMag = Math.Max(Math.Abs(tmv.X), Math.Abs(tmv.Y)) >> 2;
@@ -2532,6 +2553,26 @@ internal sealed class H264BaselineSliceEncoder
         }
 
         return sse;
+    }
+
+    /// <summary>
+    /// One luma SAD of the current MB against the padded reference at the co-located previous-frame
+    /// MV, truncated to integer pel (arithmetic >> 2, matching the temporal seed candidate in
+    /// <see cref="H264MotionEstimator.SearchMbSubPartitions"/>). Encoder-search heuristic only — it
+    /// never affects normative prediction — used to decide whether a failed P_Skip means "widen the
+    /// search" or "the previous frame already explains this motion". Returns
+    /// <see cref="int.MaxValue"/> when the displaced window falls outside the padded reference.
+    /// </summary>
+    private int TemporalSeedProbeSadLuma(
+        ReadOnlySpan<byte> currentMb, int currentStride, int mbX, int mbY, H264MotionEstimator.Mv mv)
+    {
+        var rx = mbX + HaloLuma + (mv.X >> 2);
+        var ry = mbY + HaloLuma + (mv.Y >> 2);
+        var paddedH = _paddedRefY.Length / _paddedStrideY;
+        if (rx < 0 || ry < 0 || rx + 16 > _paddedStrideY || ry + 16 > paddedH)
+            return int.MaxValue;
+        return _kernels.Sad16x16(
+            currentMb, currentStride, _paddedRefY.AsSpan(ry * _paddedStrideY + rx), _paddedStrideY);
     }
 
     private static int ComputeInterPredictionSse(
