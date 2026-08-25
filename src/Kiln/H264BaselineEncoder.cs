@@ -479,9 +479,10 @@ public sealed class H264BaselineEncoder : IDisposable
         _ppsRbsp = H264ParameterSets.WritePpsRbsp(_picInitQpMinus26, constrainedIntraPred: refreshPeriod > 0);
         _ebspScratch = new byte[H264RbspEmulation.GetEmulationPreventionBufferSize(checked(_codedWidth * _codedHeight * 2 + 65_536))];
         // Same worst-case bound the encoder assumes internally (2 bytes per coded pixel of RBSP,
-        // plus emulation-prevention headroom), plus start-code + NAL-header framing for SPS, PPS
-        // and up to MaxSliceEncoders slice NALs.
-        RecommendedOutputBufferSize = _ebspScratch.Length + (2 + MaxSliceEncoders) * 5;
+        // plus emulation-prevention headroom), plus start-code + NAL-header framing for SPS, PPS,
+        // the recovery-point SEI a gradual-refresh wave-start access unit adds, and up to
+        // MaxSliceEncoders slice NALs.
+        RecommendedOutputBufferSize = _ebspScratch.Length + (3 + MaxSliceEncoders) * 5;
     }
 
     /// <summary>Display width as passed to the constructor — what the decoder outputs after SPS cropping.</summary>
