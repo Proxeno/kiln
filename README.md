@@ -132,9 +132,9 @@ measure:
 
 | Resolution | 1 slice | 4 slices |
 |---|---:|---:|
-| 640x480 | 12.4 ms | 7.3 ms |
-| 1280x720 | 18.3 ms | 11.5 ms |
-| 1920x1080 | 22.8 ms | 13.0 ms |
+| 640x480 | 19.8 ms | 13.0 ms |
+| 1280x720 | 26.9 ms | 15.6 ms |
+| 1920x1080 | 32.8 ms | 18.8 ms |
 
 Size your deployment from those numbers, not from the kernel microbenchmarks above. Note also that
 slices do not divide the work cleanly — most of what remains after motion estimation (skip
