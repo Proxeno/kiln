@@ -723,7 +723,6 @@ internal sealed class H264BaselineSliceEncoder
         Array.Clear(_mbSubPartMvs);
         Array.Clear(_mbPartitions);
         Array.Clear(_shared.MbRefIdx);
-        Array.Clear(_shared.MbSubPartRefIdx);
         _recU.AsSpan().Clear();
         _recV.AsSpan().Clear();
     }

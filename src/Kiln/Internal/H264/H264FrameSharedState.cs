@@ -118,8 +118,6 @@ internal sealed class H264FrameSharedState
 
     /// <summary>Per-MB winning reference index (0 or 1) for inter-coded MBs. Used by deblocking and MVP computation.</summary>
     public readonly byte[] MbRefIdx;
-    /// <summary>Per-partition winning reference index for sub-partition inter MBs (4 entries per MB, index = mbIndex*4+partIndex).</summary>
-    public readonly byte[] MbSubPartRefIdx;
 
     /// <param name="maxReferenceFrames">
     /// Effective reference cap from options, clamped to [1, <see cref="MaxDpbSize"/>]. The padded
@@ -171,6 +169,5 @@ internal sealed class H264FrameSharedState
         MbSubPartMvs = new H264MotionEstimator.Mv[mbCount * 4];
         MbPartitions = new H264MotionEstimator.McPartition[mbCount];
         MbRefIdx = new byte[mbCount];
-        MbSubPartRefIdx = new byte[mbCount * 4];
     }
 }
