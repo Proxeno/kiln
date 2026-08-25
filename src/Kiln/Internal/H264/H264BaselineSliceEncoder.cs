@@ -2226,7 +2226,13 @@ internal sealed class H264BaselineSliceEncoder
         {
             const int RestrictedRange = 8;
             var guaranteed0 = _shared.DpbGuaranteedUptoX[0];
-            var maxSafeCenterX = 4 * (MaxRefreshSafeMvIntX(mbX, guaranteed0) - RestrictedRange);
+            // Aim the window so its whole horizontal extent is admissible against ref 0's bound.
+            // When ref 0 carries no partial bound (the failure was a refIdx-1 pick against a
+            // partially-guaranteed older reference), the predictor needs no clamping — and the
+            // sentinel would overflow the arithmetic below.
+            var maxSafeCenterX = guaranteed0 == H264FrameSharedState.GuaranteedFullPicture
+                ? (int)mvPredictor.X
+                : 4 * (MaxRefreshSafeMvIntX(mbX, guaranteed0) - RestrictedRange);
             var restrictedPred = new H264MotionEstimator.Mv(
                 (short)Math.Clamp(Math.Min((int)mvPredictor.X, maxSafeCenterX), short.MinValue, short.MaxValue),
                 mvPredictor.Y);
