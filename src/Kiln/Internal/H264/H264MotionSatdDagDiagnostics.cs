@@ -26,6 +26,11 @@ internal static class H264MotionSatdDagDiagnostics
     private static long s_satdSadLowerBoundTests;
     private static long s_satdSadLowerBoundSkips;
     private static long s_candidateRingBreaks;
+    private static long s_unifiedIntegerAtomComputes;
+    private static long s_fracSatdAtomComputes;
+    private static long s_fracIntegerSatdAtomComputes;
+    private static long s_fracSadBlocks;
+    private static long s_fracQpelInterpolations;
     private static long s_mbCandidateOverlapLookups;
     private static long s_mbCandidateOverlapReuses;
     private static long s_mbCandidateOverlapUnique;
@@ -62,6 +67,11 @@ internal static class H264MotionSatdDagDiagnostics
         long SatdSadLowerBoundTests,
         long SatdSadLowerBoundSkips,
         long CandidateRingBreaks,
+        long UnifiedIntegerAtomComputes,
+        long FracSatdAtomComputes,
+        long FracIntegerSatdAtomComputes,
+        long FracSadBlocks,
+        long FracQpelInterpolations,
         long MbCandidateOverlapLookups,
         long MbCandidateOverlapReuses,
         long MbCandidateOverlapUnique,
@@ -93,6 +103,11 @@ internal static class H264MotionSatdDagDiagnostics
         Interlocked.Exchange(ref s_satdSadLowerBoundTests, 0);
         Interlocked.Exchange(ref s_satdSadLowerBoundSkips, 0);
         Interlocked.Exchange(ref s_candidateRingBreaks, 0);
+        Interlocked.Exchange(ref s_unifiedIntegerAtomComputes, 0);
+        Interlocked.Exchange(ref s_fracSatdAtomComputes, 0);
+        Interlocked.Exchange(ref s_fracIntegerSatdAtomComputes, 0);
+        Interlocked.Exchange(ref s_fracSadBlocks, 0);
+        Interlocked.Exchange(ref s_fracQpelInterpolations, 0);
         Interlocked.Exchange(ref s_mbCandidateOverlapLookups, 0);
         Interlocked.Exchange(ref s_mbCandidateOverlapReuses, 0);
         Interlocked.Exchange(ref s_mbCandidateOverlapUnique, 0);
@@ -123,6 +138,11 @@ internal static class H264MotionSatdDagDiagnostics
         Volatile.Read(ref s_satdSadLowerBoundTests),
         Volatile.Read(ref s_satdSadLowerBoundSkips),
         Volatile.Read(ref s_candidateRingBreaks),
+        Volatile.Read(ref s_unifiedIntegerAtomComputes),
+        Volatile.Read(ref s_fracSatdAtomComputes),
+        Volatile.Read(ref s_fracIntegerSatdAtomComputes),
+        Volatile.Read(ref s_fracSadBlocks),
+        Volatile.Read(ref s_fracQpelInterpolations),
         Volatile.Read(ref s_mbCandidateOverlapLookups),
         Volatile.Read(ref s_mbCandidateOverlapReuses),
         Volatile.Read(ref s_mbCandidateOverlapUnique),
@@ -169,6 +189,11 @@ internal static class H264MotionSatdDagDiagnostics
             .Append(" satdSadLowerBoundSkips=").Append(s.SatdSadLowerBoundSkips)
             .Append(" satdSadLowerBoundSkipRate=").Append(Pct(s.SatdSadLowerBoundSkips, s.SatdSadLowerBoundTests))
             .Append(" candidateRingBreaks=").Append(s.CandidateRingBreaks).AppendLine();
+        sb.Append("  unifiedIntegerAtomComputes=").Append(s.UnifiedIntegerAtomComputes)
+            .Append(" fracSatdAtomComputes=").Append(s.FracSatdAtomComputes)
+            .Append(" fracIntegerSatdAtomComputes=").Append(s.FracIntegerSatdAtomComputes)
+            .Append(" fracSadBlocks=").Append(s.FracSadBlocks)
+            .Append(" fracQpelInterpolations=").Append(s.FracQpelInterpolations).AppendLine();
         sb.Append("  mbCandidateOverlapLookups=").Append(s.MbCandidateOverlapLookups)
             .Append(" mbCandidateOverlapReuses=").Append(s.MbCandidateOverlapReuses)
             .Append(" mbCandidateOverlapUnique=").Append(s.MbCandidateOverlapUnique)
@@ -299,6 +324,33 @@ internal static class H264MotionSatdDagDiagnostics
         if (!IsEnabled)
             return;
         Interlocked.Increment(ref s_candidateRingBreaks);
+    }
+
+    public static void NotifyUnifiedIntegerAtomComputes(int count)
+    {
+        if (IsEnabled)
+            Interlocked.Add(ref s_unifiedIntegerAtomComputes, count);
+    }
+
+    public static void NotifyFracSatdAtomComputes(int count, bool integerPel)
+    {
+        if (!IsEnabled)
+            return;
+        Interlocked.Add(ref s_fracSatdAtomComputes, count);
+        if (integerPel)
+            Interlocked.Add(ref s_fracIntegerSatdAtomComputes, count);
+    }
+
+    public static void NotifyFracSadBlock()
+    {
+        if (IsEnabled)
+            Interlocked.Increment(ref s_fracSadBlocks);
+    }
+
+    public static void NotifyFracQpelInterpolation()
+    {
+        if (IsEnabled)
+            Interlocked.Increment(ref s_fracQpelInterpolations);
     }
 
     public static void NotifyUnifiedSubPartitionDepth(int maxCandidateDistance)

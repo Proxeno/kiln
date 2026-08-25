@@ -1,0 +1,30 @@
+# SATD atom split by position type (1080p default s=4, n=60, KILN probe `satd`)
+# Instrumentation added: unifiedIntegerAtomComputes, fracSatdAtomComputes,
+# fracIntegerSatdAtomComputes, fracSadBlocks, fracQpelInterpolations.
+
+Per frame:
+  integer-pel transform-domain atoms   495.9K   (the previously reported "~500K")
+    - unified sub-partition ring loop  377.0K   (76% of integer atoms; NO per-candidate SATD early exit)
+    - hex 16x16 path                   118.9K
+  fractional-pel atoms (RefineFrac)    411.9K   <- previously UNCOUNTED; ~45% of all SATD atoms
+    - of which at integer (fx=fy=0)      1.2K
+  frac SAD blocks                       41.8K
+  qpel block interpolations             20.3K   (6-tap InterpolateLuma per whole block)
+
+TOTAL SATD atoms/frame ~= 908K, not 500K. Split ~55% integer / ~45% fractional.
+
+Cache facts re-established:
+  - "candidate cache 8%" = the per-hex-search 256-slot stackalloc (dx,dy) memo in
+    ScoreInterIntegerPelCached. It costs ~4KB of stack, NOT 169MB. 8% is expected:
+    hex+diamond revisits ~8% of probes. Not a defect, not related to the atlas.
+  - The 169MB structure is H264ReferenceTransformAtlas (2 DPB slots x ~78MB), hit rate 77%,
+    integer-pel only. It can never serve the 412K fractional atoms (qpel blocks are
+    interpolated, transient, keyed by nothing atlas-addressable).
+  - Existing per-partition early exit: 78.6% of hex-path compositions bail early.
+    The unified loop (76% of integer atoms) has no SATD-level bail; only an 8x8-SAD
+    lower-bound pre-filter that always computes TL SAD and the rest lazily.
+
+Implication: the atlas 8%-hit story was a conflation. Real targets, in order of atom mass:
+  1) unified loop 377K atoms: add quadrant-level SAD-lower-bound gating (exact)
+  2) RefineFrac 412K atoms: tighten/skip refinement (mostly approximate)
+  3) atlas: integer-only, perf-neutral at s=4 (18.69 vs 18.66) -> candidate for removal

@@ -851,6 +851,8 @@ internal static class H264MotionEstimator
                     }
 
                     t_searchEffort += byLim * bxLim;
+                    if (collectDiag)
+                        H264MotionSatdDagDiagnostics.NotifyUnifiedIntegerAtomComputes(bxLim * byLim);
 
                     // Quadrant sums → shape scores
                     var sumTl = atoms[0] + atoms[1] + atoms[4] + atoms[5];
@@ -1906,6 +1908,7 @@ internal static class H264MotionEstimator
         }
 
         refinementRounds = Math.Clamp(refinementRounds, 1, 2);
+        var collectDiag = H264MotionSatdDagDiagnostics.IsEnabled;
 
         var stride = bw;
         var blockSize = bh * stride;
@@ -1948,6 +1951,8 @@ internal static class H264MotionEstimator
             {
                 var seedRefWin = OffsetWindow(reference, referenceStride, mbX + seedIx, mbY + seedIy);
                 bestSad = SadBlock(kernels, blockShape, current, currentStride, seedRefWin, referenceStride);
+                if (collectDiag)
+                    H264MotionSatdDagDiagnostics.NotifyFracSadBlock();
                 bestScore = seedSad;
             }
             else if (!QpelFits(mbX + seedIx, mbY + seedIy, bw, bh, picW, picH))
@@ -1965,6 +1970,11 @@ internal static class H264MotionEstimator
                 var block = qpelBatch.Slice(((seedFy << 2) + seedFx) * blockSize, blockSize);
                 bestSad = SadBlock(kernels, blockShape, current, currentStride, block, stride);
                 var seedSatd = SatdBlock(kernels, blockShape, current, currentStride, block, stride);
+                if (collectDiag)
+                {
+                    H264MotionSatdDagDiagnostics.NotifyFracSadBlock();
+                    H264MotionSatdDagDiagnostics.NotifyFracSatdAtomComputes((bw * bh) >> 4, integerPel: false);
+                }
                 var seedMvCost = lambda == 0 ? 0 : qpelMvCosts[(seedFy << 2) + seedFx];
                 bestScore = seedSatd + seedMvCost;
             }
@@ -2015,12 +2025,25 @@ internal static class H264MotionEstimator
                         var block = qpelBatch.Slice(((fy << 2) + fx) * blockSize, blockSize);
                         var satdStopAfter = bestScore == int.MaxValue ? int.MaxValue : bestScore - mvCost;
                         var candSad = SadBlock(kernels, blockShape, current, currentStride, block, stride);
+                        if (collectDiag)
+                            H264MotionSatdDagDiagnostics.NotifyFracSadBlock();
                         if (SatdSadLowerBoundRejects(candSad, satdStopAfter, stopOnEqual: false, (int)blockShape))
                             continue;
 
-                        var candSatd = satdStopAfter == int.MaxValue
-                            ? SatdBlock(kernels, blockShape, current, currentStride, block, stride)
-                            : SatdBlockBounded(blockShape, current, currentStride, block, stride, satdStopAfter);
+                        var candIntegerPel = fx == 0 && fy == 0;
+                        int candSatd;
+                        if (satdStopAfter == int.MaxValue)
+                        {
+                            candSatd = SatdBlock(kernels, blockShape, current, currentStride, block, stride);
+                            if (collectDiag)
+                                H264MotionSatdDagDiagnostics.NotifyFracSatdAtomComputes((bw * bh) >> 4, candIntegerPel);
+                        }
+                        else
+                        {
+                            candSatd = SatdBlockBounded(
+                                blockShape, current, currentStride, block, stride, satdStopAfter,
+                                fracDiag: collectDiag, fracIntegerPel: candIntegerPel);
+                        }
                         var candScore = candSatd + mvCost;
                         if (candScore > bestScore)
                             continue;
@@ -2039,6 +2062,8 @@ internal static class H264MotionEstimator
                             ref qpelBatchValidMask, ref qpelBatchOriginX, ref qpelBatchOriginY);
                         var block = qpelBatch.Slice(((fy << 2) + fx) * blockSize, blockSize);
                         var candSad = SadBlock(kernels, blockShape, current, currentStride, block, stride);
+                        if (collectDiag)
+                            H264MotionSatdDagDiagnostics.NotifyFracSadBlock();
                         if (IsBetterSad(candSad, mv, bestSad, bestMv))
                         {
                             bestScore = candSad;
@@ -2080,7 +2105,9 @@ internal static class H264MotionEstimator
         int currentStride,
         ReadOnlySpan<byte> reference,
         int referenceStride,
-        int stopAfter)
+        int stopAfter,
+        bool fracDiag = false,
+        bool fracIntegerPel = false)
     {
         var blocksX = blockShape is MeBlockShape.B16x16 or MeBlockShape.B16x8 ? 4 : 2;
         var blocksY = blockShape is MeBlockShape.B16x16 or MeBlockShape.B8x16 ? 4 : 2;
@@ -2095,6 +2122,8 @@ internal static class H264MotionEstimator
                 sum += H264MotionSatd.Satd4x4Strided(
                     current, currentStride, x, y,
                     reference, referenceStride, x, y);
+                if (fracDiag)
+                    H264MotionSatdDagDiagnostics.NotifyFracSatdAtomComputes(1, fracIntegerPel);
                 if (sum > stopAfter)
                     return sum;
             }
@@ -2133,6 +2162,8 @@ internal static class H264MotionEstimator
         if ((validMask & bit) != 0)
             return;
 
+        if (H264MotionSatdDagDiagnostics.IsEnabled)
+            H264MotionSatdDagDiagnostics.NotifyFracQpelInterpolation();
         kernels.InterpolateLuma(
             reference, referenceStride,
             originX, originY,
