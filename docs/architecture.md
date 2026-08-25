@@ -182,7 +182,12 @@ streaming server) feeds `EncoderNetworkFeedback` and `EncoderPipelineStats`
 into `LowLatencyRateController.Decide(...)` each frame/period, gets back an
 `EncoderAdaptationDecision` (target bitrate, max frame bytes, base QP,
 `ForceIdr`, `EnableIntraRefresh`, speed mode), and applies the relevant
-fields to the next `H264BaselineEncoderOptions` / `EncodeFrame` call.
+fields to the next `H264BaselineEncoderOptions` / `EncodeFrame` call. The
+decision's `EncoderSpeedMode` has a defined encoder-side meaning:
+`H264BaselineEncoderOptions.SpeedMode` maps each mode onto a measured preset
+over the motion-search knobs (see the README performance section). Applying
+a decision is still the caller's job — nothing in the library feeds a
+controller decision back into a running encoder automatically.
 
 - `LowLatencyRateController` ([`RateControl/LowLatencyRateController.cs`](../src/Kiln/RateControl/LowLatencyRateController.cs))
   is the main entry point. **Ownership contract:** it owns exactly one
