@@ -111,10 +111,12 @@ raster order within the slice's row range:
 
 Per-MB QP comes from an internal, encoder-private `H264RateControl`
 ([`Internal/H264/H264RateControl.cs`](../src/Kiln/Internal/H264/H264RateControl.cs)),
-a proportional controller active only when `TargetBitsPerFrame > 0`
-(constant-QP otherwise). This is a different, lower-level thing than the
-public `Kiln.RateControl` namespace described below — see that section for
-how the two relate.
+a proportional controller active only when a per-frame bit budget is in
+effect — the constructor's `TargetBitsPerFrame`, or a positive per-picture
+override passed to `EncodeFrame(targetBitsPerFrame:)` (how the streaming
+session drives a live bitrate target); constant-QP otherwise. This is a
+different, lower-level thing than the public `Kiln.RateControl` namespace
+described below — see that section for how the two relate.
 
 ## SIMD kernel structure
 
@@ -175,30 +177,36 @@ are exercised on every push — see [`.github/workflows/ci.yml`](../.github/work
 
 `Kiln.RateControl` ([`src/Kiln/RateControl/`](../src/Kiln/RateControl/)) and
 `Kiln.Recovery` ([`src/Kiln/Recovery/`](../src/Kiln/Recovery/)) are a
-**frame-level decision layer that sits above `H264BaselineEncoder`**, not
-inside it — nothing in `H264BaselineEncoder.cs` or
-`H264BaselineSliceEncoder.cs` references either namespace. A caller (e.g. a
-streaming server) feeds `EncoderNetworkFeedback` and `EncoderPipelineStats`
-into `LowLatencyRateController.Decide(...)` each frame/period, gets back an
-`EncoderAdaptationDecision` (target bitrate, max frame bytes, base QP,
-`ForceIdr`, `EnableIntraRefresh`, speed mode), and applies the relevant
-fields to the next `H264BaselineEncoderOptions` / `EncodeFrame` call. The
-decision's `EncoderSpeedMode` has a defined encoder-side meaning:
-`H264BaselineEncoderOptions.SpeedMode` maps each mode onto a measured preset
-over the motion-search knobs (see the README performance section). Applying
-a decision is still the caller's job — nothing in the library feeds a
-controller decision back into a running encoder automatically.
+frame-level decision layer above the encoder, and
+**`Kiln.H264StreamingSession`**
+([`src/Kiln/H264StreamingSession.cs`](../src/Kiln/H264StreamingSession.cs))
+is the feedback path connecting the two: it owns one `H264BaselineEncoder`
+plus one adaptive controller, and per frame turns `EncoderNetworkFeedback`
+into applied encoder settings — slice QP, a per-picture bit budget
+(`TargetBitrateBps / TargetFps`), recovery IDRs, and live speed-mode
+changes. A streaming server calls
+`session.EncodeFrame(y, u, v, …, annexB, feedback)` and gets adaptive
+encoding out without writing the glue itself. Callers who want to run their
+own loop can still drive `LowLatencyRateController.Decide(...)` directly
+and apply decisions with the same primitives the session uses
+(`EncodeFrame(sliceLumaQp:, targetBitsPerFrame:, forceKeyframe:)` and
+`ApplySpeedMode`/`ApplySpeedKnobs`).
 
 - `LowLatencyRateController` ([`RateControl/LowLatencyRateController.cs`](../src/Kiln/RateControl/LowLatencyRateController.cs))
-  is the main entry point. **Ownership contract:** it owns exactly one
-  `H264RecoveryPolicy` instance and invokes `DecideRecovery` exactly once per
-  `Decide()` call, folding the result in. Composing code must not call the
-  recovery policy a second time or construct a second instance — doing so
-  double-advances the stateful IDR cooldown and halves keyframe-storm
-  protection (a regression this codebase has hit before; see the class doc
-  comment).
+  is the per-frame decision core (bitrate up/downshift, QP tracking ~+6 per
+  halving of the target bitrate, max-frame-bytes budget). **Ownership
+  contract:** it owns exactly one `H264RecoveryPolicy` instance and invokes
+  `DecideRecovery` exactly once per `Decide()` call, folding the result in.
+  Composing code must not call the recovery policy a second time or
+  construct a second instance — doing so double-advances the stateful IDR
+  cooldown and halves keyframe-storm protection (a regression this codebase
+  has hit before; see the class doc comment). Composing layers report what
+  they actually applied via `SyncAppliedState(width, height, fps, mode)`;
+  without it the controller's internal geometry state stays at its
+  constructor defaults and ladder-based adaptation walks from fiction.
 - `RateControlConfig` / `RateControlState` hold tunables (bitrate bounds, QP
-  bounds, burst allowance, downshift factor) and mutable per-session state.
+  bounds, burst allowance, downshift factor, `SupportedWidths`/`Heights`/
+  `Fps` ladder rungs) and mutable per-session state.
 - `Kiln.Recovery.H264RecoveryPolicy` ([`Recovery/H264RecoveryPolicy.cs`](../src/Kiln/Recovery/H264RecoveryPolicy.cs))
   turns client PLI/FIR feedback into `ForceIdr`/`EnableIntraRefresh`
   decisions, with an IDR cooldown to prevent keyframe storms (FIR takes
@@ -209,34 +217,95 @@ controller decision back into a running encoder automatically.
 - `IIntraRefreshPolicy` / `IntraRefreshPolicyStub`: the interface is defined
   and consumed by the decision types, but the only implementation shipped
   today is an explicit no-op stub — gradual slice-level intra refresh
-  (as opposed to full IDR) is not yet implemented.
+  (as opposed to full IDR) is **not implemented**. The session does not
+  pretend otherwise: a recovery decision that asks for intra refresh (a
+  PLI/FIR during IDR cooldown) is surfaced on the per-frame result as
+  `IntraRefreshRequested` while a normal frame is encoded.
 
-## Experimental subsystems (not wired into the encoder)
+### What can change when: the three adaptation tiers
 
-Two internal namespaces are fully implemented and tested but have **zero**
-references from `H264BaselineEncoder`, `H264BaselineSliceEncoder`, or the
-public `Kiln.RateControl`/`Kiln.Recovery` types — confirmed by repo-wide
-grep, not just by comment. Treat them as a preview of where adaptive
-streaming support is headed, not as production surface; APIs here may change
-or move without notice.
+Every adaptation input falls into one of three tiers, and the tiering is
+what an integrator must understand to change anything mid-stream safely:
+
+1. **Free per frame** — inputs that touch no bitstream-structural state.
+   Slice luma QP (`EncodeFrame(sliceLumaQp:)`, coded as `slice_qp_delta`),
+   the per-picture bit budget (`EncodeFrame(targetBitsPerFrame:)`, driving
+   the per-MB `mb_qp_delta` chain), forced IDRs
+   (`EncodeFrame(forceKeyframe: true)`), and the three search-only speed
+   knobs (`UseMotionSatd`, `SubPartitionRangeCap`,
+   `MotionSearchEffortCapPerMb`, reassigned live via
+   `H264BaselineEncoder.ApplySpeedMode`/`ApplySpeedKnobs`). Search knobs
+   change which prediction the encoder *chooses*, never how a choice is
+   coded, so any change at a frame boundary yields a stream a decoder reads
+   exactly as if those values had been set from the start.
+2. **Bounded by the SPS: the reference-frame count.** `max_num_ref_frames`
+   is signalled once in the SPS and a decoder sizes its DPB from it
+   (§7.4.2.1) — but it is an *upper bound*, not a per-slice requirement.
+   Below it, the operating reference count is a per-frame decision: each P
+   slice signals its own active count (`num_ref_idx_active_override_flag`,
+   §7.3.3), derived here from the encoder-side DPB occupancy. Lowering the
+   cap takes effect immediately (the occupancy is clamped); raising it takes
+   effect one frame later, after the reference rotation refills the retired
+   DPB slot from fresh reconstructions — the decoder's sliding window
+   (§8.2.5.3) retained both pictures throughout, so **no IDR is needed in
+   either direction**. This is why `SpeedMode` swaps freely mid-GOP.
+   The one hard rule: the cap can never exceed the signalled maximum, so
+   `ApplySpeedKnobs` clamps to it. The session therefore reserves the full
+   DPB in the SPS (signalling 2) unless the caller explicitly set
+   `MaxReferenceFrames` — an explicit value (e.g. 1 for strict hardware
+   decoders) is a compatibility contract that caps every mode for the whole
+   session. The v0.3.0 assessment that the DPB is "constructor-baked" was
+   true only of the signalled maximum, not the operating count.
+3. **Requires a new encoder: resolution.** A resolution change means a new
+   SPS and new buffers. `H264StreamingSession.ChangeResolution` handles it
+   by recreating the encoder transparently — the next frame is an IDR
+   carrying the new parameter sets, and decoders (ffmpeg verified)
+   reconfigure at that boundary. It cannot be automatic because Kiln has no
+   scaler: the controller's resolution recommendations are surfaced
+   (`ResolutionChangeRecommended`) until the caller can supply rescaled
+   frames and calls `ChangeResolution`.
+
+Frame rate is not on the ladder at all: the SPS carries no VUI timing
+(`timing_info_present_flag = 0`), so `TargetFps` has zero bitstream effect.
+It is a pacing contract — the session budgets per-frame bits at the decided
+fps and the caller is expected to pace capture accordingly (pin
+`RateControlConfig.SupportedFps` to a single rung to keep it fixed).
+
+Determinism holds through all three tiers: adaptation inputs are ordinary
+inputs, applied between frames, so identical frames plus identical feedback
+produce identical bitstreams. The session derives `EncoderPipelineStats`
+from the bitstream itself (bytes/QP/IDR of the previous frame) and reports
+wall-clock fields as zero unless the caller passes `EncoderPipelineTimings`
+explicitly — timings are then inputs too, and replaying them replays the
+stream.
+
+Tests: `tests/Kiln.Tests/H264StreamingSessionTests.cs` (adaptation taking
+effect + ffmpeg oracle across every tier transition),
+`H264DynamicReconfigurationTests.cs` (mid-GOP knob/reference changes,
+byte-exact reconstruction parity), and
+`AdaptiveRateControlTests/Phase1..5` (controller-level behaviour).
+
+## Experimental subsystems
 
 - **`Internal/H264/Adaptation/`** — resolution/fps ladder-based adaptation.
-  `ResolutionLadder` (1080p→900p→720p→540p→360p by default) and `FpsLadder`
-  (60→30→15) step one rung at a time; `AdaptationPolicy` cascades down
-  speed-mode → fps → resolution under sustained congestion and walks back up
-  under sustained stability, with a cooldown to prevent flapping.
-  `H264AdaptiveRateController` is a would-be single entry point that
-  composes `LowLatencyRateController` (bitrate/QP/recovery) with
-  `AdaptationPolicy` (resolution/fps/speed) into one
-  `EncoderAdaptationDecision` per frame.
-- **`Internal/H264/Queue/`** — `LatestFrameQueue<T>`, a thread-safe
-  depth-≤1 "newest frame wins" queue (older pending frame is dropped when a
-  newer one arrives), and `FrameDropPolicy`, which decides whether the frame
-  currently being encoded is stale enough (default 50 ms / ~3 frame periods
-  at 60fps) and has newer frames pending to justify dropping it.
-
-Tests: `tests/Kiln.Tests/AdaptiveRateControlTests/Phase1_InterfacesTests.cs`
-through `Phase5_AdaptationTests.cs`.
+  `ResolutionLadder` and `FpsLadder` (built from
+  `RateControlConfig.SupportedWidths`/`Heights`/`Fps`; defaults
+  1080p→900p→720p→540p→360p and 60→30→15) step one rung at a time;
+  `AdaptationPolicy` cascades down speed-mode → fps → resolution under
+  sustained congestion and walks back up under sustained stability, with a
+  cooldown to prevent flapping. `H264AdaptiveRateController` composes
+  `LowLatencyRateController` (bitrate/QP/recovery) with `AdaptationPolicy`
+  into one `EncoderAdaptationDecision` per frame. **This layer is now
+  consumed in production by `H264StreamingSession`** (it is the session's
+  controller); the types themselves remain internal and may change shape.
+- **`Internal/H264/Queue/`** — still unwired, preview only:
+  `LatestFrameQueue<T>`, a thread-safe depth-≤1 "newest frame wins" queue
+  (older pending frame is dropped when a newer one arrives), and
+  `FrameDropPolicy`, which decides whether the frame currently being
+  encoded is stale enough (default 50 ms / ~3 frame periods at 60fps) and
+  has newer frames pending to justify dropping it. Nothing in the encoder
+  or the session references them; a server wanting latest-frame semantics
+  composes them around its own capture loop.
 
 ## Diagnostics (`KILN_*` environment variables)
 
