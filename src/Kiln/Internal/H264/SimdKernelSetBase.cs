@@ -14,6 +14,9 @@ internal abstract class SimdKernelSetBase : IH264KernelSet
 
     public abstract int SadChromaPair(ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV, ReadOnlySpan<byte> predU, ReadOnlySpan<byte> predV);
 
+    public abstract int Ssd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
+    public abstract int Ssd8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
+
     public int Satd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
         H264MotionSatd.Satd16x16Simd(a, strideA, b, strideB);
 

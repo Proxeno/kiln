@@ -185,6 +185,14 @@ internal static class H264PInterDiagnostics
     public static bool DisableSlicePartitionBalance { get; set; }
 
     /// <summary>
+    /// Measurement-only A/B kill switch for the SIMD prediction-SSE kernels in the Phase-1 P_Skip
+    /// acceptance gate: when true the gate computes its SSE with the scalar helper instead.
+    /// Bitstream-identical either way (every kernel returns the exact integer sum); keep false in
+    /// normal operation.
+    /// </summary>
+    public static bool DisableSkipSseKernels { get; set; }
+
+    /// <summary>
     /// Measurement-only A/B kill switch for the unified sub-partition search's quadrant-level
     /// SAD-lower-bound gate (skipping a quadrant's SATD atoms when no partition shape using that
     /// quadrant can strictly improve). Bitstream-identical either way; keep false in normal operation.

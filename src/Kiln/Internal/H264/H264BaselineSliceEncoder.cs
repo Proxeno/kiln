@@ -1840,7 +1840,13 @@ internal sealed class H264BaselineSliceEncoder
                 // once the P_Skip MV fix (refIdx>0 neighbours no longer force a zero skip MV)
                 // made those skips reachable.
                 var skipSseThreshold = Math.Min(8192, Math.Max(768, 8192 * LambdaSatdForQp(qpThisMb) / LambdaSatdForQp(28)));
-                var skipSse = ComputeInterPredictionSse(srcY, strideY, srcU, srcV, strideUv, mbX, mbY, predY, predU, predV);
+                // SIMD SSD kernels return the exact integer sum the scalar helper computes, so the
+                // gate decision (and therefore the bitstream) is identical on every ISA tier.
+                var skipSse = H264PInterDiagnostics.DisableSkipSseKernels
+                    ? ComputeInterPredictionSse(srcY, strideY, srcU, srcV, strideUv, mbX, mbY, predY, predU, predV)
+                    : _kernels.Ssd16x16(srcY.Slice(mbY * strideY + mbX), strideY, predY, 16)
+                        + _kernels.Ssd8x8(srcU.Slice(chromaMbY * strideUv + chromaMbX), strideUv, predU, 8)
+                        + _kernels.Ssd8x8(srcV.Slice(chromaMbY * strideUv + chromaMbX), strideUv, predV, 8);
                 if (collectPhase1Timing)
                 {
                     phase1SseTicks = Stopwatch.GetTimestamp() - phase1LapTicks;
