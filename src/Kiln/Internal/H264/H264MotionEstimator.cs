@@ -1119,6 +1119,7 @@ internal static class H264MotionEstimator
                     if (useMotionSatd &&
                         CanUseTransformDomainSatd4x4(sourceTransformCoefficients, refTransformCache, referenceTransformAtlas))
                     {
+                        t_searchEffort += (bw * bh) >> 4;
                         s = SatdBlockTransformDomain(blockShape, currentMb, currentMbStride, reference, referenceStride,
                             currentBlockX, currentBlockY, candidate.ReferenceX, candidate.ReferenceY,
                             sourceTransformCoefficients, refTransformCache, referenceTransformAtlas,
@@ -1419,6 +1420,10 @@ internal static class H264MotionEstimator
                 }
             }
 
+            // Same effort unit as ScoreBlock: a WxH SATD is ~area/16 4x4 atoms. Without this the
+            // hex seed search (which always takes this branch in the default config) is invisible
+            // to ThreadSearchEffort, blinding the slice balancer and the ME effort budget to it.
+            t_searchEffort += (bw * bh) >> 4;
             s = SatdBlockFromReferenceAtlas(
                 blockShape,
                 sourceTransformCoefficients,
@@ -1450,6 +1455,7 @@ internal static class H264MotionEstimator
                     return;
                 }
 
+                t_searchEffort += (bw * bh) >> 4;
                 s = SatdBlockBounded(blockShape, current, currentStride, refWin, referenceStride, satdStopAfter);
             }
             else
