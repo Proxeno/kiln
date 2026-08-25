@@ -226,13 +226,21 @@ and apply decisions with the same primitives the session uses
 - `IdrBudget` ([`Recovery/IdrBudget.cs`](../src/Kiln/Recovery/IdrBudget.cs))
   computes the larger byte budget IDR frames are allowed (2× the normal
   per-frame budget by default).
-- `IIntraRefreshPolicy` / `IntraRefreshPolicyStub`: the interface is defined
-  and consumed by the decision types, but the only implementation shipped
-  today is an explicit no-op stub — gradual slice-level intra refresh
-  (as opposed to full IDR) is **not implemented**. The session does not
-  pretend otherwise: a recovery decision that asks for intra refresh (a
-  PLI/FIR during IDR cooldown) is surfaced on the per-frame result as
-  `IntraRefreshRequested` while a normal frame is encoded.
+- Gradual intra refresh is a real encoder feature (the former
+  `IIntraRefreshPolicy` interface and its no-op stub are gone): construct
+  the encoder with `H264BaselineEncoderOptions.IntraRefreshPeriodFrames > 0`
+  and call `H264BaselineEncoder.RequestIntraRefresh()` to start a wave — a
+  band of forced-intra MB columns sweeping the picture over up to N frames,
+  with `constrained_intra_pred_flag` in the PPS and motion vectors of
+  already-refreshed MBs restricted to the refreshed region of their
+  reference, so a decoder joining at the wave's first access unit (which
+  repeats SPS/PPS and carries a recovery-point SEI, `exact_match_flag=1`)
+  reconstructs the picture bit-exactly once the wave completes. The
+  session acts on a recovery decision that asks for intra refresh (a
+  PLI/FIR during IDR cooldown) by starting/queueing a wave when the
+  feature is enabled, and still surfaces the request on the per-frame
+  result as `IntraRefreshRequested`; with the feature disabled it encodes
+  a normal frame and only surfaces the request.
 
 ### What can change when: the three adaptation tiers
 

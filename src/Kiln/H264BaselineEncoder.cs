@@ -142,6 +142,30 @@ public sealed class H264BaselineEncoderOptions
     public int? ExperimentalZeroMvSkipSadThreshold { get; set; }
 
     /// <summary>
+    /// Gradual intra refresh (gradual decoder refresh): 0 (default) disables the feature and keeps
+    /// the bitstream byte-identical to previous releases; a positive value N enables it, spreading
+    /// each refresh wave's full sweep of intra-coded MB columns over (up to) N frames. A wave is
+    /// started with <see cref="H264BaselineEncoder.RequestIntraRefresh"/> (or by
+    /// <see cref="H264StreamingSession"/> when its recovery policy asks for refresh instead of an
+    /// IDR): a band of forced-intra MB columns sweeps left to right, ⌈mbWidth/N⌉ columns per frame,
+    /// so recovery costs a roughly constant per-frame bitrate premium instead of one IDR-sized
+    /// spike. A decoder that starts at the wave's first access unit (which carries SPS/PPS and a
+    /// recovery-point SEI) reconstructs the picture <em>bit-exactly</em> once the wave completes:
+    /// the PPS sets <c>constrained_intra_pred_flag</c> so refresh-band intra MBs never predict from
+    /// unrefreshed inter neighbours (§8.3), and motion vectors of already-refreshed MBs are
+    /// restricted to the refreshed region of their reference (with interpolation and deblocking
+    /// margins), so corruption cannot leak back across the wave boundary.
+    /// <para>
+    /// Costs when non-zero, even with no wave running: <c>constrained_intra_pred_flag</c> makes
+    /// every intra macroblock in P slices predict without inter neighbours, a small stream-wide
+    /// quality tax on intra-fallback MBs. Scheduled IDRs (<see cref="KeyframeIntervalFrames"/>)
+    /// cancel an in-flight wave — an IDR is already a full recovery — so callers using refresh for
+    /// recovery typically set a very large keyframe interval.
+    /// </para>
+    /// </summary>
+    public int IntraRefreshPeriodFrames { get; set; } = 0;
+
+    /// <summary>
     /// Trellis quantization level: 0=off (default, byte-identical to previous encoder),
     /// 1=greedy per-coefficient trellis quantization (improves RD at ~5% encode CPU cost).
     /// </summary>
@@ -324,6 +348,25 @@ public sealed class H264BaselineEncoder : IDisposable
     private bool _disposed;
 
     /// <summary>
+    /// Luma pixels the §8.7 deblocking filter can modify on the refreshed side of the wave's
+    /// leading vertical edge (bS=4 strong filter touches p0..p2, §8.7.2.3). The join-guarantee
+    /// bound excludes this strip so motion compensation never reads samples mixed with unrefreshed
+    /// content.
+    /// </summary>
+    private const int RefreshDeblockMarginLuma = 3;
+
+    /// <summary>Gradual intra refresh: forced-intra MB columns per wave frame; 0 = feature disabled.</summary>
+    private readonly int _refreshColumnsPerFrame;
+    /// <summary>Frames one full wave takes (⌈mbW / columnsPerFrame⌉); 0 = feature disabled.</summary>
+    private readonly int _refreshWaveFrames;
+    /// <summary>Recovery-point SEI RBSP emitted at each wave start (constant per encoder geometry).</summary>
+    private readonly byte[]? _refreshSeiRbsp;
+    /// <summary>Next MB column the active wave will intra-code, or -1 when no wave is in flight.</summary>
+    private int _refreshNextCol = -1;
+    /// <summary>A refresh wave has been requested and will start on the next non-IDR frame after any in-flight wave completes.</summary>
+    private bool _refreshPending;
+
+    /// <summary>
     /// <c>max_num_ref_frames</c> as signalled in the SPS at construction — the immutable upper bound
     /// for the live reference cap (<see cref="ApplySpeedKnobs"/> clamps to it). The SPS is written
     /// once; a decoder allocates its DPB from this value, so the live cap may sit below it but never
@@ -388,6 +431,17 @@ public sealed class H264BaselineEncoder : IDisposable
         _subPartitionRangeCap = Math.Max(1, _options.SubPartitionRangeCap);
         _motionSearchEffortCapPerMb = Math.Max(0, _options.MotionSearchEffortCapPerMb);
         var effortSliceBudget = ComputeEffortSliceBudget(_motionSearchEffortCapPerMb);
+        // Gradual intra refresh geometry (see H264BaselineEncoderOptions.IntraRefreshPeriodFrames):
+        // fixed at construction because the PPS constrained_intra_pred_flag is written once.
+        var refreshPeriod = Math.Max(0, _options.IntraRefreshPeriodFrames);
+        if (refreshPeriod > 0)
+        {
+            var effectivePeriod = Math.Min(refreshPeriod, _mbW);
+            _refreshColumnsPerFrame = (_mbW + effectivePeriod - 1) / effectivePeriod;
+            _refreshWaveFrames = (_mbW + _refreshColumnsPerFrame - 1) / _refreshColumnsPerFrame;
+            _refreshSeiRbsp = H264ParameterSets.WriteRecoveryPointSeiRbsp(_refreshWaveFrames - 1);
+        }
+
         _sliceEncoders = new H264BaselineSliceEncoder[encoderCount];
         _slicePartitionRows = new int[encoderCount + 1];
         _rowEffortWindow = new long[_mbH];
@@ -411,7 +465,8 @@ public sealed class H264BaselineEncoder : IDisposable
                 _options.EnableIntraInPFallback,
                 _options.ExperimentalZeroMvSkipSadThreshold,
                 _options.SubPartitionRangeCap,
-                effortSliceBudget);
+                effortSliceBudget,
+                constrainedIntraPred: refreshPeriod > 0);
         }
         // LevelIdc = 0 means auto: lowest Table A-1 level whose MaxFS admits the coded picture,
         // floored at Level 3.1 (see H264BaselineEncoderOptions.LevelIdc). An explicit level is
@@ -423,7 +478,7 @@ public sealed class H264BaselineEncoder : IDisposable
             _codedWidth, _codedHeight, _options.ProfileIdc, LevelIdc,
             Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize),
             displayWidth: width, displayHeight: height);
-        _ppsRbsp = H264ParameterSets.WritePpsRbsp(_picInitQpMinus26);
+        _ppsRbsp = H264ParameterSets.WritePpsRbsp(_picInitQpMinus26, constrainedIntraPred: refreshPeriod > 0);
         _ebspScratch = new byte[H264RbspEmulation.GetEmulationPreventionBufferSize(checked(_codedWidth * _codedHeight * 2 + 65_536))];
         // Same worst-case bound the encoder assumes internally (2 bytes per coded pixel of RBSP,
         // plus emulation-prevention headroom), plus start-code + NAL-header framing for SPS, PPS
@@ -625,6 +680,11 @@ public sealed class H264BaselineEncoder : IDisposable
 
         var isP = !isIdr;
 
+        // Gradual intra refresh: advance the wave schedule and publish this frame's band and
+        // join-guarantee bound to the shared state before any slice encodes. Counted from coded
+        // frames only — never wall clock — so identical inputs and requests give identical bytes.
+        var refreshWaveStarting = _refreshWaveFrames > 0 && AdvanceIntraRefreshSchedule(isIdr);
+
         if (isP && _frameShared.PaddedRefValid)
             Array.Copy(_frameShared.MbMvs, _frameShared.PrevMbMvs, _frameShared.MbMvs.Length);
 
@@ -636,6 +696,15 @@ public sealed class H264BaselineEncoder : IDisposable
         {
             pos += WriteNal(annexB[pos..], 3, 7, _spsRbsp);
             pos += WriteNal(annexB[pos..], 3, 8, _ppsRbsp);
+        }
+        else if (refreshWaveStarting)
+        {
+            // A gradual-refresh joiner tunes in at exactly this access unit: repeat SPS/PPS so it
+            // can start parsing without an IDR, and announce the recovery point (§D.2.8) so it
+            // knows after how many frames its output is bit-exact.
+            pos += WriteNal(annexB[pos..], 3, 7, _spsRbsp);
+            pos += WriteNal(annexB[pos..], 3, 8, _ppsRbsp);
+            pos += WriteNal(annexB[pos..], 0, 6, _refreshSeiRbsp!);
         }
 
         var sliceArg = sliceLumaQp.HasValue ? sliceLumaQp.Value : -1;
@@ -724,6 +793,112 @@ public sealed class H264BaselineEncoder : IDisposable
         {
             LastFrameMotionComplexity = Math.Clamp(sumIntPel / (double)inter / 16.0, 0.0, 1.0);
         }
+
+    /// <summary>
+    /// Begin a gradual intra refresh wave (see
+    /// <see cref="H264BaselineEncoderOptions.IntraRefreshPeriodFrames"/>): starting with the next
+    /// non-IDR frame, a band of forced-intra MB columns sweeps the picture left to right, after
+    /// which a decoder that joined at the wave's first access unit has a bit-exact picture. If a
+    /// wave is already in flight the request is queued and a fresh wave starts as soon as the
+    /// current one completes (loss during a wave is only fully repaired by a sweep that starts
+    /// after it). A scheduled or forced IDR cancels the wave and the queue — an IDR is already a
+    /// full recovery. Same threading contract as <see cref="EncodeFrame"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The encoder was constructed with <see cref="H264BaselineEncoderOptions.IntraRefreshPeriodFrames"/>
+    /// = 0: refresh needs the PPS <c>constrained_intra_pred_flag</c>, which is written once at
+    /// construction, so it cannot be enabled on a live encoder.
+    /// </exception>
+    public void RequestIntraRefresh()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_refreshWaveFrames == 0)
+        {
+            throw new InvalidOperationException(
+                "Gradual intra refresh is disabled: construct the encoder with " +
+                $"{nameof(H264BaselineEncoderOptions)}.{nameof(H264BaselineEncoderOptions.IntraRefreshPeriodFrames)} > 0 " +
+                "(the PPS constrained_intra_pred_flag is written once at construction).");
+        }
+
+        _refreshPending = true;
+    }
+
+    /// <summary>Whether gradual intra refresh is available on this encoder (constructed with a positive
+    /// <see cref="H264BaselineEncoderOptions.IntraRefreshPeriodFrames"/>).</summary>
+    public bool IntraRefreshEnabled => _refreshWaveFrames > 0;
+
+    /// <summary>True while a refresh wave is in flight or queued (<see cref="RequestIntraRefresh"/>).</summary>
+    public bool IntraRefreshActive => _refreshNextCol >= 0 || _refreshPending;
+
+    /// <summary>Coded frames one full refresh wave spans (0 when the feature is disabled) — how long a
+    /// joining decoder waits from wave start until its output is bit-exact.</summary>
+    public int IntraRefreshWaveFrames => _refreshWaveFrames;
+
+    /// <summary>
+    /// Per-frame wave bookkeeping (called only when the feature is enabled): publishes this frame's
+    /// forced-intra band and join-guarantee bound (see
+    /// <see cref="H264FrameSharedState.CurrentFrameGuaranteedUptoX"/>) to the shared state, starts a
+    /// queued wave, and returns whether a wave starts on this frame (which is when SPS/PPS and the
+    /// recovery-point SEI are re-emitted). An IDR cancels everything: it is itself a full recovery,
+    /// and its reconstruction is whole-picture guaranteed for any decoder from that point on.
+    /// </summary>
+    private bool AdvanceIntraRefreshSchedule(bool isIdr)
+    {
+        var shared = _frameShared;
+        if (isIdr)
+        {
+            _refreshNextCol = -1;
+            _refreshPending = false;
+            shared.RefreshBandStartMbX = -1;
+            shared.RefreshBandEndMbX = -1;
+            shared.CurrentFrameGuaranteedUptoX = H264FrameSharedState.GuaranteedFullPicture;
+            Array.Fill(shared.DpbGuaranteedUptoX, H264FrameSharedState.GuaranteedFullPicture);
+            shared.RefreshConstraintsActive = false;
+            return false;
+        }
+
+        var starting = false;
+        if (_refreshNextCol < 0 && _refreshPending)
+        {
+            _refreshPending = false;
+            _refreshNextCol = 0;
+            starting = true;
+            // A joiner at this access unit has none of the stored reference content: guarantees
+            // carried by the DPB belong to the previous join epoch, so nothing is guaranteed until
+            // the wave re-establishes it column band by column band.
+            Array.Fill(shared.DpbGuaranteedUptoX, 0);
+        }
+
+        if (_refreshNextCol >= 0)
+        {
+            var bandStart = _refreshNextCol;
+            var bandEnd = Math.Min(bandStart + _refreshColumnsPerFrame, _mbW);
+            shared.RefreshBandStartMbX = bandStart;
+            shared.RefreshBandEndMbX = bandEnd;
+            // Everything left of the band is restricted-inter or intra this frame, so the frame is
+            // join-guaranteed up to the band's right edge minus the deblocking strip the §8.7
+            // filter mixes with the unrefreshed MB column to the band's right. When the band
+            // reaches the picture edge there is no such neighbour and the whole picture is clean.
+            shared.CurrentFrameGuaranteedUptoX = bandEnd >= _mbW
+                ? H264FrameSharedState.GuaranteedFullPicture
+                : bandEnd * 16 - RefreshDeblockMarginLuma;
+            _refreshNextCol = bandEnd >= _mbW ? -1 : bandEnd;
+        }
+        else
+        {
+            shared.RefreshBandStartMbX = -1;
+            shared.RefreshBandEndMbX = -1;
+            shared.CurrentFrameGuaranteedUptoX = H264FrameSharedState.GuaranteedFullPicture;
+        }
+
+        // Constraints stay active while any DPB slot still carries a partial guarantee: for up to
+        // two frames after a wave completes, refIdx-1 references reach the partially-guaranteed
+        // pre-completion pictures and must stay restricted.
+        shared.RefreshConstraintsActive =
+            shared.RefreshBandStartMbX >= 0
+            || shared.DpbGuaranteedUptoX[0] != H264FrameSharedState.GuaranteedFullPicture
+            || shared.DpbGuaranteedUptoX[1] != H264FrameSharedState.GuaranteedFullPicture;
+        return starting;
     }
 
     private int GetEffectiveSliceCount()

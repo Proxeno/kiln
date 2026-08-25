@@ -280,40 +280,9 @@ public sealed class Phase4_RecoveryPolicyTests
         Assert.False(exceeded, "IDR frame is within budget");
     }
 
-    /// <summary>
-    /// Test 10: Intra refresh policy stub can be enabled and disabled.
-    /// </summary>
-    [Fact]
-    public void IntraRefreshPolicyStub_CanBeEnabledAndDisabled()
-    {
-        var logger = new NullLogger<IntraRefreshPolicyStub>();
-        var policy = new IntraRefreshPolicyStub(logger);
-
-        policy.Enable();
-        Assert.NotNull(policy);
-
-        policy.Disable();
-        Assert.NotNull(policy);
-
-        policy.Reset();
-        // Should not throw
-    }
-
-    /// <summary>
-    /// Test 11: Intra refresh policy stub returns expected values.
-    /// </summary>
-    [Fact]
-    public void IntraRefreshPolicyStub_ReturnsExpectedValues()
-    {
-        var logger = new NullLogger<IntraRefreshPolicyStub>();
-        var policy = new IntraRefreshPolicyStub(logger);
-
-        Assert.Equal(expected: 30, actual: policy.EstimatedRecoveryFrames);
-
-        var (refreshed, total) = policy.GetProgress();
-        Assert.Equal(expected: 0, actual: refreshed);
-        Assert.Equal(expected: 0, actual: total);
-    }
+    // Tests 10/11 covered the former IIntraRefreshPolicy stub, removed when gradual intra refresh
+    // became a real encoder feature (H264BaselineEncoderOptions.IntraRefreshPeriodFrames,
+    // H264BaselineEncoder.RequestIntraRefresh); see H264IntraRefreshTests for its coverage.
 
     /// <summary>
     /// Test 12: Recovery policy exposes accurate metrics.
