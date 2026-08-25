@@ -345,7 +345,7 @@ internal sealed class H264BaselineSliceEncoder
         // caches so multiple parallel slice encoders coding the same access unit operate on a single
         // logical frame. Writes from each slice land in disjoint MB indices / row ranges; the existing
         // slice-aware neighbour guards (_firstMbRowInSlice) prevent cross-slice reads.
-        _shared = sharedState ?? new H264FrameSharedState(width, height);
+        _shared = sharedState ?? new H264FrameSharedState(width, height, useMotionSatd: useMotionSatd);
         _recY = _shared.RecY;
         _recU = _shared.RecU;
         _recV = _shared.RecV;
@@ -626,7 +626,7 @@ internal sealed class H264BaselineSliceEncoder
         {
             _shared.DpbCount = 0;
             foreach (var atlas in _shared.DpbLumaAtlas)
-                atlas.Reset();
+                atlas?.Reset();
         }
 
         ResetForFrame();
@@ -664,14 +664,14 @@ internal sealed class H264BaselineSliceEncoder
             Array.Copy(_shared.DpbPaddedY[0], _shared.DpbPaddedY[1], _shared.DpbPaddedY[0].Length);
             Array.Copy(_shared.DpbPaddedU[0], _shared.DpbPaddedU[1], _shared.DpbPaddedU[0].Length);
             Array.Copy(_shared.DpbPaddedV[0], _shared.DpbPaddedV[1], _shared.DpbPaddedV[0].Length);
-            _shared.DpbLumaAtlas[1].Reset();
+            _shared.DpbLumaAtlas[1]?.Reset();
         }
         if (_shared.DpbCount < effectiveMaxRefs)
             _shared.DpbCount++;
         H264ReferencePicturePadder.Pad(recY, width, width, _height, HaloLuma, _shared.DpbPaddedY[0], _paddedStrideY);
         H264ReferencePicturePadder.Pad(recU, uvW, uvW, uvH, HaloChroma, _shared.DpbPaddedU[0], _paddedStrideUv);
         H264ReferencePicturePadder.Pad(recV, uvW, uvW, uvH, HaloChroma, _shared.DpbPaddedV[0], _paddedStrideUv);
-        _shared.DpbLumaAtlas[0].Reset();
+        _shared.DpbLumaAtlas[0]?.Reset();
     }
 
     /// <summary>

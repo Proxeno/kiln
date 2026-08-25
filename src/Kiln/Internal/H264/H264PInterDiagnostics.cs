@@ -1,8 +1,43 @@
 using System.Text;
 using System.Threading;
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 namespace Kiln.Internal.H264;
+
+/// <summary>
+/// Interpolated-string handler for <see cref="H264PInterDiagnostics.TraceMbDecision"/> that skips
+/// all formatting (and evaluation of the interpolation-hole expressions) unless the macroblock is
+/// actually being traced. Without this, every call site materialised its message string per
+/// macroblock even with tracing disabled — measured at ~2 MiB of string garbage per 1080p P-frame,
+/// enough to drive periodic gen2 pauses in steady-state encoding.
+/// </summary>
+[InterpolatedStringHandler]
+internal ref struct H264MbTraceInterpolatedStringHandler
+{
+    private DefaultInterpolatedStringHandler _handler;
+    private readonly bool _enabled;
+
+    public H264MbTraceInterpolatedStringHandler(
+        int literalLength, int formattedCount, int frameNum, int mbX, int mbY, out bool shouldAppend)
+    {
+        _enabled = H264PInterDiagnostics.ShouldTraceMb(frameNum, mbX, mbY);
+        shouldAppend = _enabled;
+        _handler = _enabled ? new DefaultInterpolatedStringHandler(literalLength, formattedCount) : default;
+    }
+
+    /// <summary>True when this macroblock matched a trace target and the message was formatted.</summary>
+    public readonly bool IsEnabled => _enabled;
+
+    public void AppendLiteral(string value) => _handler.AppendLiteral(value);
+
+    public void AppendFormatted<T>(T value) => _handler.AppendFormatted(value);
+
+    public void AppendFormatted<T>(T value, string? format) => _handler.AppendFormatted(value, format);
+
+    /// <summary>Only valid when <see cref="IsEnabled"/>; the compiler never appends otherwise.</summary>
+    public string ToStringAndClear() => _handler.ToStringAndClear();
+}
 
 /// <summary>
 /// Optional diagnostics for P-slice macroblock costing in <see cref="H264BaselineSliceEncoder"/>.
@@ -102,11 +137,18 @@ internal static class H264PInterDiagnostics
             || Check(s_runtimeTraceMbTargets, frameNum, mbX, mbY);
     }
 
-    public static void TraceMbDecision(int frameNum, int codedFrameIndex, int mbX, int mbY, string message)
+    public static void TraceMbDecision(
+        int frameNum,
+        int codedFrameIndex,
+        int mbX,
+        int mbY,
+        [InterpolatedStringHandlerArgument(nameof(frameNum), nameof(mbX), nameof(mbY))] H264MbTraceInterpolatedStringHandler message)
     {
-        if (!ShouldTraceMb(frameNum, mbX, mbY))
+        // The handler already evaluated ShouldTraceMb; when it said no, the compiler skipped every
+        // append (and the hole expressions), so the disabled path allocates nothing at all.
+        if (!message.IsEnabled)
             return;
-        var line = $"[H264PInter MBTrace] frameNum={frameNum} codedFrame={codedFrameIndex} mb=({mbX},{mbY}) {message}";
+        var line = $"[H264PInter MBTrace] frameNum={frameNum} codedFrame={codedFrameIndex} mb=({mbX},{mbY}) {message.ToStringAndClear()}";
         s_mbTraceLines.Enqueue(line);
         var newCount = Interlocked.Increment(ref s_mbTraceLineCount);
         while (newCount > MaxMbTraceLines && s_mbTraceLines.TryDequeue(out _))

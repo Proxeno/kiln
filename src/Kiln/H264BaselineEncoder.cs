@@ -209,8 +209,10 @@ public sealed class H264BaselineEncoder : IDisposable
         // One shared frame state owns the picture-sized buffers; each slice encoder sees the same
         // reconstruction & reference arrays, so disjoint per-slice writes assemble into one frame.
         // Everything below the public API operates on coded (macroblock-aligned) dimensions.
-        var sharedState = new H264FrameSharedState(_codedWidth, _codedHeight);
-        sharedState.MaxReferenceFrames = Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize);
+        var sharedState = new H264FrameSharedState(
+            _codedWidth, _codedHeight,
+            maxReferenceFrames: Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize),
+            useMotionSatd: _options.UseMotionSatd);
         _frameShared = sharedState;
         var kernels = _options.PreferHardwareIntrinsics ? H264KernelSet.CreateBest() : new ScalarKernelSet();
         var encoderCount = Math.Max(1, Math.Min(MaxSliceEncoders, _mbH));

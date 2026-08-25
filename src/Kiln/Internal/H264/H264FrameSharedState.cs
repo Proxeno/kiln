@@ -26,13 +26,13 @@ internal sealed class H264FrameSharedState
 
     /// <summary>
     /// Effective cap on how many reference frames the encoder will actually use and signal, in
-    /// [1, <see cref="MaxDpbSize"/>]. Set once by <see cref="H264BaselineEncoder"/> from options.
+    /// [1, <see cref="MaxDpbSize"/>]. Set once at construction from options.
     /// 1 forces a single-reference stream (ref_idx_l0 always 0, num_ref_idx_l0_active = 1,
     /// max_num_ref_frames = 1) — what real-time WebRTC peers and hardware (VideoToolbox) decoders
     /// expect; multi-reference P-frames are decoded fine by browser software decoders but are dropped
     /// by some strict hardware decoders, which manifests as "stop motion" (only IDRs survive).
     /// </summary>
-    public int MaxReferenceFrames = MaxDpbSize;
+    public readonly int MaxReferenceFrames;
 
     public readonly byte[] RecY;
     public readonly byte[] RecU;
@@ -46,7 +46,14 @@ internal sealed class H264FrameSharedState
     public readonly byte[][] DpbPaddedY;
     public readonly byte[][] DpbPaddedU;
     public readonly byte[][] DpbPaddedV;
-    public readonly H264ReferenceTransformAtlas[] DpbLumaAtlas;
+
+    /// <summary>
+    /// Per-DPB-slot Hadamard-coefficient atlases for SATD motion scoring. Entries are null when the
+    /// slot can never be scored with SATD: the atlas costs 36 bytes per padded reference sample
+    /// (~78 MB per slot at 1080p), so slots are only backed when <c>UseMotionSatd</c> is on, and
+    /// slot 1 additionally requires a multi-reference DPB (<see cref="MaxReferenceFrames"/> ≥ 2).
+    /// </summary>
+    public readonly H264ReferenceTransformAtlas?[] DpbLumaAtlas;
 
     /// <summary>
     /// Number of valid reference frames in <see cref="DpbPaddedY"/>/<see cref="DpbPaddedU"/>/<see cref="DpbPaddedV"/>.
@@ -63,7 +70,6 @@ internal sealed class H264FrameSharedState
 
     public readonly int PaddedStrideY;
     public readonly int PaddedStrideUv;
-    public H264ReferenceTransformAtlas LumaReferenceTransformAtlas => DpbLumaAtlas[0];
 
     public readonly byte[] NonZeros;
     public readonly byte[] ChromaNonZeros;
@@ -84,8 +90,19 @@ internal sealed class H264FrameSharedState
     /// <summary>Per-partition winning reference index for sub-partition inter MBs (4 entries per MB, index = mbIndex*4+partIndex).</summary>
     public readonly byte[] MbSubPartRefIdx;
 
-    public H264FrameSharedState(int width, int height)
+    /// <param name="maxReferenceFrames">
+    /// Effective reference cap from options, clamped to [1, <see cref="MaxDpbSize"/>]. Controls
+    /// which DPB slots get SATD atlases; the padded reference planes themselves are always
+    /// allocated for every slot (they are cheap relative to the atlases).
+    /// </param>
+    /// <param name="useMotionSatd">
+    /// Whether the encoder scores integer-pel ME candidates with SATD. When false no atlas is
+    /// allocated at all — the SAD path never reads them, and at 1080p the two slots would
+    /// otherwise pin ~157 MB of dead memory.
+    /// </param>
+    public H264FrameSharedState(int width, int height, int maxReferenceFrames = MaxDpbSize, bool useMotionSatd = true)
     {
+        MaxReferenceFrames = Math.Clamp(maxReferenceFrames, 1, MaxDpbSize);
         var mbW = width / 16;
         var mbH = height / 16;
         var mbCount = mbW * mbH;
@@ -109,7 +126,8 @@ internal sealed class H264FrameSharedState
             DpbPaddedY[i] = new byte[paddedYSize];
             DpbPaddedU[i] = new byte[paddedUvSize];
             DpbPaddedV[i] = new byte[paddedUvSize];
-            DpbLumaAtlas[i] = new H264ReferenceTransformAtlas(PaddedStrideY, height + 2 * HaloLuma);
+            if (useMotionSatd && i < MaxReferenceFrames)
+                DpbLumaAtlas[i] = new H264ReferenceTransformAtlas(PaddedStrideY, height + 2 * HaloLuma);
         }
         DpbCount = 0;
 
