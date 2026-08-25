@@ -710,15 +710,6 @@ public sealed class H264BaselineEncoder : IDisposable
 
         Array.Clear(_rowEffortWindow);
         _partitionWindowFrames = 0;
-
-        if (Environment.GetEnvironmentVariable("KILN_DEBUG_PARTITION") == "1")
-        {
-            var sb = new System.Text.StringBuilder();
-            sb.Append("// part f=").Append(_codedFrameIndex).Append(" rows:");
-            for (var k = 0; k <= sliceCount; k++)
-                sb.Append(' ').Append(rows[k]);
-            Console.WriteLine(sb.ToString());
-        }
     }
 
     private int WriteNal(Span<byte> dest, byte nri, byte nalType, ReadOnlySpan<byte> rbsp) =>
