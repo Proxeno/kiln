@@ -56,6 +56,8 @@ public sealed class H264KernelDispatchPathTests
         public void SadMany4x4(ReadOnlySpan<byte> src, ReadOnlySpan<byte> predConcat, Span<int> sads, int count) => _inner.SadMany4x4(src, predConcat, sads, count);
         public int SadIntra16x16(ReadOnlySpan<byte> src256, ReadOnlySpan<byte> pred256, int srcStride) => _inner.SadIntra16x16(src256, pred256, srcStride);
         public int SadChromaPair(ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV, ReadOnlySpan<byte> predU, ReadOnlySpan<byte> predV) => _inner.SadChromaPair(srcU, srcV, predU, predV);
+        public int Ssd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Ssd16x16(a, strideA, b, strideB);
+        public int Ssd8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Ssd8x8(a, strideA, b, strideB);
         public int Satd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Satd16x16(a, strideA, b, strideB);
         public int Satd16x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Satd16x8(a, strideA, b, strideB);
         public int Satd8x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Satd8x16(a, strideA, b, strideB);

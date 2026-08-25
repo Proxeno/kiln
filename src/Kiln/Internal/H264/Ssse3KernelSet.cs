@@ -22,4 +22,10 @@ internal class Ssse3KernelSet : SimdKernelSetBase
 
     public override int SadChromaPair(ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV, ReadOnlySpan<byte> predU, ReadOnlySpan<byte> predV) =>
         H264ChromaSadSimd.SadU8x8PairSsse2(srcU, srcV, predU, predV);
+
+    public override int Ssd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
+        H264MotionSsd.Ssd16x16Ssse3(a, strideA, b, strideB);
+
+    public override int Ssd8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
+        H264MotionSsd.Ssd8x8Ssse3(a, strideA, b, strideB);
 }

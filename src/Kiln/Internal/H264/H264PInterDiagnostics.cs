@@ -86,6 +86,19 @@ internal static class H264PInterDiagnostics
     private static long s_phase2TimingLumaTicks;
     private static long s_phase2TimingChromaTicks;
     private static long s_phase2TimingWriteTicks;
+    private static long s_phase1TimingCount;
+    private static long s_phase1TimingTotalTicks;
+    private static long s_phase1TimingPredLumaTicks;
+    private static long s_phase1TimingPredChromaTicks;
+    private static long s_phase1TimingSadTicks;
+    private static long s_phase1TimingSseTicks;
+    private static long s_phase1MvUnsafeCount;
+    private static long s_phase1SadRejectCount;
+    private static long s_phase1SseRejectCount;
+    private static long s_phase1AcceptCount;
+    private static long s_phase1FractionalLumaCount;
+    private static long s_phase2ReconCallCount;
+    private static long s_phase2ReconSkipMvRebuildCount;
     private static readonly ConcurrentQueue<string> s_mbTraceLines = new();
     private static int s_mbTraceLineCount;
     private const int MaxMbTraceLines = 4096;
@@ -150,6 +163,14 @@ internal static class H264PInterDiagnostics
     public static bool CollectPhase2Timing { get; set; }
 
     /// <summary>
+    /// Measurement-only per-macroblock Phase-1 (P_Skip pre-check) timing and outcome accounting:
+    /// prediction-build / SAD / SSE tick split plus accept/reject mix and how often the Phase-2
+    /// inter prediction rebuild duplicates the Phase-1 prediction (16x16, refIdx 0, skip MV).
+    /// Keep false in normal operation; the perf probe enables it around bounded runs.
+    /// </summary>
+    public static bool CollectPhase1Timing { get; set; }
+
+    /// <summary>
     /// Measurement-only frame-phase wall-clock accounting for the multi-slice orchestrator:
     /// serial prologue/epilogue versus the parallel slice region, and slice load imbalance.
     /// Keep false in normal operation; the perf probe enables it around bounded runs.
@@ -162,6 +183,14 @@ internal static class H264PInterDiagnostics
     /// Keep false in normal operation.
     /// </summary>
     public static bool DisableSlicePartitionBalance { get; set; }
+
+    /// <summary>
+    /// Measurement-only A/B kill switch for the SIMD prediction-SSE kernels in the Phase-1 P_Skip
+    /// acceptance gate: when true the gate computes its SSE with the scalar helper instead.
+    /// Bitstream-identical either way (every kernel returns the exact integer sum); keep false in
+    /// normal operation.
+    /// </summary>
+    public static bool DisableSkipSseKernels { get; set; }
 
     /// <summary>
     /// Measurement-only A/B kill switch for the unified sub-partition search's quadrant-level
@@ -422,6 +451,115 @@ internal static class H264PInterDiagnostics
         Interlocked.Exchange(ref s_phase2TimingLumaTicks, 0);
         Interlocked.Exchange(ref s_phase2TimingChromaTicks, 0);
         Interlocked.Exchange(ref s_phase2TimingWriteTicks, 0);
+    }
+
+    public static void ResetPhase1Timing()
+    {
+        Interlocked.Exchange(ref s_phase1TimingCount, 0);
+        Interlocked.Exchange(ref s_phase1TimingTotalTicks, 0);
+        Interlocked.Exchange(ref s_phase1TimingPredLumaTicks, 0);
+        Interlocked.Exchange(ref s_phase1TimingPredChromaTicks, 0);
+        Interlocked.Exchange(ref s_phase1TimingSadTicks, 0);
+        Interlocked.Exchange(ref s_phase1TimingSseTicks, 0);
+        Interlocked.Exchange(ref s_phase1MvUnsafeCount, 0);
+        Interlocked.Exchange(ref s_phase1SadRejectCount, 0);
+        Interlocked.Exchange(ref s_phase1SseRejectCount, 0);
+        Interlocked.Exchange(ref s_phase1AcceptCount, 0);
+        Interlocked.Exchange(ref s_phase1FractionalLumaCount, 0);
+        Interlocked.Exchange(ref s_phase2ReconCallCount, 0);
+        Interlocked.Exchange(ref s_phase2ReconSkipMvRebuildCount, 0);
+    }
+
+    /// <summary>Phase-1 outcome for <see cref="NotifyPhase1Timing"/> (measurement accounting only).</summary>
+    internal enum Phase1Outcome
+    {
+        MvUnsafe,
+        SadReject,
+        SseReject,
+        Accept,
+    }
+
+    /// <summary>Records one macroblock's Phase-1 tick split (gated by <see cref="CollectPhase1Timing"/>).</summary>
+    internal static void NotifyPhase1Timing(
+        long totalTicks,
+        long predLumaTicks,
+        long predChromaTicks,
+        long sadTicks,
+        long sseTicks,
+        Phase1Outcome outcome,
+        bool fractionalLumaMv)
+    {
+        if (!CollectPhase1Timing)
+            return;
+
+        Interlocked.Increment(ref s_phase1TimingCount);
+        Interlocked.Add(ref s_phase1TimingTotalTicks, totalTicks);
+        Interlocked.Add(ref s_phase1TimingPredLumaTicks, predLumaTicks);
+        Interlocked.Add(ref s_phase1TimingPredChromaTicks, predChromaTicks);
+        Interlocked.Add(ref s_phase1TimingSadTicks, sadTicks);
+        Interlocked.Add(ref s_phase1TimingSseTicks, sseTicks);
+        if (fractionalLumaMv)
+            Interlocked.Increment(ref s_phase1FractionalLumaCount);
+        switch (outcome)
+        {
+            case Phase1Outcome.MvUnsafe: Interlocked.Increment(ref s_phase1MvUnsafeCount); break;
+            case Phase1Outcome.SadReject: Interlocked.Increment(ref s_phase1SadRejectCount); break;
+            case Phase1Outcome.SseReject: Interlocked.Increment(ref s_phase1SseRejectCount); break;
+            default: Interlocked.Increment(ref s_phase1AcceptCount); break;
+        }
+    }
+
+    /// <summary>
+    /// Records one Phase-2 inter-prediction rebuild (gated by <see cref="CollectPhase1Timing"/>);
+    /// <paramref name="duplicatesPhase1Pred"/> marks rebuilds whose output is identical to the
+    /// prediction Phase 1 already produced (16x16 partition, refIdx 0, MV equal to the skip MV).
+    /// </summary>
+    internal static void NotifyPhase2InterPredRebuild(bool duplicatesPhase1Pred)
+    {
+        if (!CollectPhase1Timing)
+            return;
+
+        Interlocked.Increment(ref s_phase2ReconCallCount);
+        if (duplicatesPhase1Pred)
+            Interlocked.Increment(ref s_phase2ReconSkipMvRebuildCount);
+    }
+
+    public static string BuildPhase1TimingReport(bool reset = false)
+    {
+        var count = Volatile.Read(ref s_phase1TimingCount);
+        if (count <= 0)
+            return "P-Inter Phase1 timing: no macroblocks recorded.";
+
+        var totalTicks = Volatile.Read(ref s_phase1TimingTotalTicks);
+        var predLumaTicks = Volatile.Read(ref s_phase1TimingPredLumaTicks);
+        var predChromaTicks = Volatile.Read(ref s_phase1TimingPredChromaTicks);
+        var sadTicks = Volatile.Read(ref s_phase1TimingSadTicks);
+        var sseTicks = Volatile.Read(ref s_phase1TimingSseTicks);
+        var otherTicks = Math.Max(0, totalTicks - (predLumaTicks + predChromaTicks + sadTicks + sseTicks));
+
+        static double Ms(long ticks) => ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        static string Pct(long ticks, long total) => total <= 0 ? "0.0%" : ((double)ticks * 100.0 / total).ToString("F1") + "%";
+
+        var sb = new StringBuilder(512);
+        sb.Append("P-Inter Phase1 timing: mb=").Append(count)
+            .Append(" totalMs=").Append(Ms(totalTicks).ToString("F1"))
+            .Append(" avgUs=").Append((Ms(totalTicks) * 1000.0 / count).ToString("F3")).AppendLine();
+        sb.Append("  predLuma=").Append(Pct(predLumaTicks, totalTicks))
+            .Append(" predChroma=").Append(Pct(predChromaTicks, totalTicks))
+            .Append(" sad=").Append(Pct(sadTicks, totalTicks))
+            .Append(" sse=").Append(Pct(sseTicks, totalTicks))
+            .Append(" other=").Append(Pct(otherTicks, totalTicks)).AppendLine();
+        sb.Append("  outcomes: accept=").Append(Volatile.Read(ref s_phase1AcceptCount))
+            .Append(" sadReject=").Append(Volatile.Read(ref s_phase1SadRejectCount))
+            .Append(" sseReject=").Append(Volatile.Read(ref s_phase1SseRejectCount))
+            .Append(" mvUnsafe=").Append(Volatile.Read(ref s_phase1MvUnsafeCount))
+            .Append(" fractionalLumaMv=").Append(Volatile.Read(ref s_phase1FractionalLumaCount)).AppendLine();
+        sb.Append("  phase2 pred rebuilds=").Append(Volatile.Read(ref s_phase2ReconCallCount))
+            .Append(" duplicatingPhase1=").Append(Volatile.Read(ref s_phase2ReconSkipMvRebuildCount));
+
+        if (reset)
+            ResetPhase1Timing();
+        return sb.ToString();
     }
 
     public static (long Phase1Skip, long Phase2Entered, long Phase2bIntraWin) ReadPhaseCounts() =>
