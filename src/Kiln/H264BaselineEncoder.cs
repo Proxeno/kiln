@@ -310,6 +310,7 @@ public sealed class H264BaselineEncoder : IDisposable
     /// slice-header metadata) is independent so <see cref="Parallel.For"/> can drive them concurrently.
     /// </summary>
     private readonly H264BaselineSliceEncoder[] _sliceEncoders;
+    private readonly IH264KernelSet _kernels;
     private readonly byte[] _spsRbsp;
     private readonly byte[] _ppsRbsp;
     private readonly byte[] _ebspScratch;
@@ -378,6 +379,7 @@ public sealed class H264BaselineEncoder : IDisposable
             useMotionSatd: _options.UseMotionSatd);
         _frameShared = sharedState;
         var kernels = _options.PreferHardwareIntrinsics ? H264KernelSet.CreateBest() : new ScalarKernelSet();
+        _kernels = kernels;
         var encoderCount = Math.Max(1, Math.Min(MaxSliceEncoders, _mbH));
         // Live speed-knob state starts as the constructor options and may be reassigned between
         // frames (ApplySpeedKnobs); the SPS reference signalling below stays construction-time.
@@ -528,6 +530,35 @@ public sealed class H264BaselineEncoder : IDisposable
     public bool LastFrameWasIdr { get; private set; }
 
     /// <summary>
+    /// Motion complexity of the most recent P frame's content in [0, 1]: the mean integer-pel
+    /// magnitude (Chebyshev, |mv|∞) of the winning 16×16 motion vectors over all inter-coded MBs
+    /// (skips included — a P_Skip inherits real predicted motion), normalised so a mean displacement
+    /// of 16 integer pel (the default sub-partition search-range cap) or more reads 1.0. Encoder
+    /// heuristic, not a spec quantity. Frames without inter MBs (IDRs, all-intra P frames) carry the
+    /// previous value forward — content motion does not vanish at a keyframe. 0 before the first
+    /// P frame. Deterministic: derived only from encoding decisions on the supplied frames.
+    /// </summary>
+    public double LastFrameMotionComplexity { get; private set; }
+
+    /// <summary>
+    /// Texture complexity of the most recent frame's luma in [0, 1]: the mean log₂ MB activity
+    /// (activity = max(variance, 1), same 16×16 population variance the adaptive-QP path uses)
+    /// over a deterministic quarter grid (every second MB in each axis), normalised so a mean
+    /// activity of 2¹² — a per-sample σ of 64, near the practical ceiling for 8-bit luma — reads
+    /// 1.0. Encoder heuristic, not a spec quantity. Deterministic for identical input frames.
+    /// </summary>
+    public double LastFrameTextureComplexity { get; private set; }
+
+    /// <summary>
+    /// True when the most recent frame was a P frame that coded a majority of its MBs as intra —
+    /// inter prediction failed across most of the picture, the signature of a scene cut (requires
+    /// <see cref="H264BaselineEncoderOptions.EnableIntraInPFallback"/>, on by default; with the
+    /// fallback disabled a P frame cannot code intra MBs and this stays false). Always false for
+    /// IDR frames. Deterministic: derived only from encoding decisions on the supplied frames.
+    /// </summary>
+    public bool LastFrameSceneChange { get; private set; }
+
+    /// <summary>
     /// Encode one frame into Annex B. Returns number of bytes written.
     /// Planar I420 at <em>display</em> size (<see cref="Width"/> × <see cref="Height"/>):
     /// <paramref name="u"/> / <paramref name="v"/> are half dimensions; strides may exceed width/2.
@@ -635,7 +666,64 @@ public sealed class H264BaselineEncoder : IDisposable
         _codedFrameIndex++;
         _h264FrameNum = (_h264FrameNum + 1) & 0xF;
         LastFrameWasIdr = isIdr;
+        UpdateContentActivity(y, strideY, isP);
         return pos;
+    }
+
+    /// <summary>
+    /// Refresh <see cref="LastFrameMotionComplexity"/> / <see cref="LastFrameTextureComplexity"/> /
+    /// <see cref="LastFrameSceneChange"/> from the frame just encoded. Runs single-threaded after
+    /// the (possibly parallel) slice section, reading the completed shared per-MB decision arrays
+    /// and the coded source luma. Cost is bounded: one pass over the per-MB arrays plus one SIMD
+    /// 16×16 variance per quarter-grid MB (~mbCount/4 calls).
+    /// </summary>
+    private void UpdateContentActivity(ReadOnlySpan<byte> y, int strideY, bool isP)
+    {
+        // Texture: mean log2 MB activity over a deterministic quarter grid (every second MB per
+        // axis), mapped so mean activity 2^12 → 1.0 (see LastFrameTextureComplexity docs).
+        double sumLog = 0;
+        var sampled = 0;
+        for (var mby = 0; mby < _mbH; mby += 2)
+        {
+            var rowOff = mby * 16 * strideY;
+            for (var mbx = 0; mbx < _mbW; mbx += 2)
+            {
+                var variance = _kernels.VarianceMb16x16(y.Slice(rowOff + mbx * 16), strideY);
+                sumLog += Math.Log2(Math.Max(variance, 1));
+                sampled++;
+            }
+        }
+
+        LastFrameTextureComplexity = Math.Clamp(sumLog / sampled / 12.0, 0.0, 1.0);
+
+        if (!isP)
+        {
+            // IDR: no inter decisions to read. Motion carries over (a keyframe does not stop the
+            // content moving); scene change is a P-frame signal by construction.
+            LastFrameSceneChange = false;
+            return;
+        }
+
+        var mbCount = _mbW * _mbH;
+        var isInter = _frameShared.MbIsInter;
+        var mvs = _frameShared.MbMvs;
+        var inter = 0;
+        long sumIntPel = 0;
+        for (var mb = 0; mb < mbCount; mb++)
+        {
+            if (isInter[mb])
+            {
+                inter++;
+                var mv = mvs[mb];
+                sumIntPel += Math.Max(Math.Abs((int)mv.X), Math.Abs((int)mv.Y)) >> 2;
+            }
+        }
+
+        LastFrameSceneChange = (mbCount - inter) * 2 > mbCount;
+        if (inter > 0)
+        {
+            LastFrameMotionComplexity = Math.Clamp(sumIntPel / (double)inter / 16.0, 0.0, 1.0);
+        }
     }
 
     private int GetEffectiveSliceCount()

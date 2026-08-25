@@ -232,8 +232,9 @@ public sealed class LowLatencyRateController
             SpeedMode: _state.SpeedMode
         );
 
-        // 8. Integrate recovery policy (Phase 4)
-        var recovery = _recoveryPolicy.DecideRecovery(feedback, decision);
+        // 8. Integrate recovery policy (Phase 4). Stats carry the encoder's scene-change signal;
+        // the policy turns it into a cooldown-guarded IDR right after the cut.
+        var recovery = _recoveryPolicy.DecideRecovery(feedback, decision, stats);
         decision = decision with
         {
             ForceIdr = recovery.ForceIdr || decision.ForceIdr,

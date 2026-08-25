@@ -45,7 +45,20 @@ public readonly record struct H264StreamingEncodeResult(
     bool IntraRefreshRequested,
 
     /// <summary>The full controller decision this frame was encoded under.</summary>
-    EncoderAdaptationDecision Decision);
+    EncoderAdaptationDecision Decision,
+
+    /// <summary>Content motion complexity of this frame in [0, 1]
+    /// (see <see cref="H264BaselineEncoder.LastFrameMotionComplexity"/>).</summary>
+    double MotionComplexity,
+
+    /// <summary>Content texture complexity of this frame in [0, 1]
+    /// (see <see cref="H264BaselineEncoder.LastFrameTextureComplexity"/>).</summary>
+    double TextureComplexity,
+
+    /// <summary>True when this frame's encoding detected a scene cut
+    /// (see <see cref="H264BaselineEncoder.LastFrameSceneChange"/>). The controller reacts on the
+    /// next frame: the recovery policy schedules an IDR there, subject to the IDR cooldown.</summary>
+    bool SceneChangeDetected);
 
 /// <summary>
 /// The feedback loop between <see cref="Kiln.RateControl"/> and <see cref="H264BaselineEncoder"/>:
@@ -108,6 +121,9 @@ public sealed class H264StreamingSession : IDisposable
     private int _lastFrameBytes;
     private int _lastFrameQp;
     private bool _lastFrameWasIdr;
+    private double _lastMotionComplexity;
+    private double _lastTextureComplexity;
+    private bool _lastSceneChange;
     private bool _disposed;
 
     /// <summary>
@@ -243,9 +259,9 @@ public sealed class H264StreamingSession : IDisposable
             LastEncodedFrameBytes: _lastFrameBytes,
             LastFrameQp: _lastFrameQp,
             LastFrameWasIdr: _lastFrameWasIdr,
-            MotionComplexity: 0.0,
-            TextureComplexity: 0.0,
-            SceneChangeDetected: false);
+            MotionComplexity: _lastMotionComplexity,
+            TextureComplexity: _lastTextureComplexity,
+            SceneChangeDetected: _lastSceneChange);
 
         var decision = _controller.GetDecision(feedback, stats);
 
@@ -268,6 +284,10 @@ public sealed class H264StreamingSession : IDisposable
         _lastFrameBytes = bytesWritten;
         _lastFrameQp = qp;
         _lastFrameWasIdr = _encoder.LastFrameWasIdr;
+        // Session-held so ChangeResolution's encoder swap does not blank the signals mid-stream.
+        _lastMotionComplexity = _encoder.LastFrameMotionComplexity;
+        _lastTextureComplexity = _encoder.LastFrameTextureComplexity;
+        _lastSceneChange = _encoder.LastFrameSceneChange;
         LastDecision = decision;
 
         // Report what was actually applied: real geometry (a resolution recommendation is not a
@@ -283,7 +303,10 @@ public sealed class H264StreamingSession : IDisposable
             AppliedSpeedMode: _appliedSpeedMode,
             ResolutionChangeRecommended: decision.Width != _encoder.Width || decision.Height != _encoder.Height,
             IntraRefreshRequested: decision.EnableIntraRefresh,
-            Decision: decision);
+            Decision: decision,
+            MotionComplexity: _lastMotionComplexity,
+            TextureComplexity: _lastTextureComplexity,
+            SceneChangeDetected: _lastSceneChange);
     }
 
     /// <summary>
