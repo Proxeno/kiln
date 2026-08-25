@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!--
+    FlashCap is the sample's only dependency: an Apache-2.0, fully-managed camera
+    capture library (AVFoundation / V4L2 / DirectShow / Media Foundation). It ships
+    no native binaries, so the capture -> encode -> mux pipeline stays free of
+    native code end to end. src/Kiln itself takes no dependency on it.
+  -->
+  <ItemGroup>
+    <PackageReference Include="FlashCap" Version="1.12.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Kiln/Kiln.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Kiln.Tests" />
+  </ItemGroup>
+
+</Project>

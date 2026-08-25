@@ -133,10 +133,16 @@ streaming; `SliceCount > 1` parallelizes further. Perf discipline is part of the
 
 ## What Kiln is not
 
-Not an x264 competitor. No B-frames, no CABAC, no 8×8 transform, no interlace; 4:2:0 8-bit only;
-dimensions must be multiples of 16. If you need maximum compression at any CPU cost, use a
-full-profile encoder. If you need clean-licensed, dependency-free, low-latency H.264 inside a .NET
-process, you are in the right place.
+Not an x264 competitor. No B-frames, no CABAC, no 8×8 transform, no interlace; 4:2:0 8-bit only.
+If you need maximum compression at any CPU cost, use a full-profile encoder. If you need
+clean-licensed, dependency-free, low-latency H.264 inside a .NET process, you are in the right place.
+
+Frame dimensions need not be multiples of 16: sizes like 1920×1080 or 1366×768 are supported via
+SPS frame cropping — the encoder pads to the 16×16 macroblock grid internally and signals the true
+display size, which is what decoders output. Dimensions must be **even** (4:2:0 chroma is
+subsampled 2×2, so odd extents are unrepresentable). Note that level limits are checked against the
+*padded* size: 1920×1080 codes as 1920×1088 (8160 macroblocks), which needs
+`H264BaselineEncoderOptions.LevelIdc = 40` — the default Level 3.1 tops out at 1280×720.
 
 The `Adaptation` (resolution/fps ladders) and `Queue` (latest-frame dropping) namespaces ship inside
 the library, fully tested but not yet wired into the encoder — **experimental**, and their APIs may
@@ -151,8 +157,20 @@ id is `Proxeno.Kiln`; the assembly and namespace stay `Kiln`, so code uses `usin
 dotnet add package Proxeno.Kiln
 ```
 
+## Try it
+
+[`samples/Kiln.Capture`](samples/Kiln.Capture) records your camera to a playable `.m4v` — capture,
+colour conversion, H.264 encode and MP4 muxing, all managed, no native binaries anywhere in the
+pipeline:
+
+```
+dotnet run --project samples/Kiln.Capture -- list
+dotnet run --project samples/Kiln.Capture -- record --seconds 10 --output capture.m4v
+```
+
 ## Documentation
 
+- [samples/Kiln.Capture](samples/Kiln.Capture) — camera → `.m4v` sample, and how the MP4 muxing works
 - [docs/architecture.md](docs/architecture.md) — pipeline stages, SIMD kernel structure, subsystems
 - [docs/perf-gate.md](docs/perf-gate.md) — benchmark baseline + regression gate workflow
 - [CONTRIBUTING.md](CONTRIBUTING.md) — build, test, and contribution rules

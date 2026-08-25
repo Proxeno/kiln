@@ -4,3 +4,4 @@ artifacts/
 *.user
 .DS_Store
 BenchmarkDotNet.Artifacts/
+.claude/worktrees/

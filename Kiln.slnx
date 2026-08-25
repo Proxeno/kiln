@@ -2,6 +2,9 @@
   <Folder Name="/bench/">
     <Project Path="bench/Kiln.Benchmarks/Kiln.Benchmarks.csproj" />
   </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/Kiln.Capture/Kiln.Capture.csproj" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/Kiln/Kiln.csproj" />
   </Folder>

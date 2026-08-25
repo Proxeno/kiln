@@ -17,10 +17,31 @@ internal static class H264ParameterSets
     /// </summary>
     public const int MaxNumRefFrames = 2;
 
-    /// <param name="width">Multiple of 16.</param>
-    /// <param name="height">Multiple of 16.</param>
+    /// <summary>
+    /// Luma samples per crop unit for 4:2:0 (<c>ChromaArrayType == 1</c>):
+    /// <c>CropUnitX = SubWidthC = 2</c>, <c>CropUnitY = SubHeightC · (2 − frame_mbs_only_flag) = 2</c>
+    /// (§7.4.2.1.1, Table 6-1). Crop offsets move in 2-luma-sample units, so odd display extents
+    /// are unrepresentable — callers must reject odd dimensions, not round them.
+    /// </summary>
+    public const int CropUnit = 2;
+
+    /// <param name="codedWidth">Coded (padded) picture width — multiple of 16.</param>
+    /// <param name="codedHeight">Coded (padded) picture height — multiple of 16.</param>
     /// <param name="maxNumRefFrames">max_num_ref_frames to signal (1..<see cref="MaxNumRefFrames"/>); must match the encoder's effective DPB usage.</param>
-    public static byte[] WriteSpsRbsp(int width, int height, byte profileIdc, byte levelIdc, int maxNumRefFrames = MaxNumRefFrames)
+    /// <param name="displayWidth">
+    /// Display width in luma samples; 0 (default) or equal to <paramref name="codedWidth"/> means no
+    /// horizontal cropping. When smaller, the difference is signalled as <c>frame_crop_right_offset</c>
+    /// (§7.3.2.1.1) in <see cref="CropUnit"/>-luma-sample units; left offset stays 0 so the MB grid
+    /// stays aligned to the visible origin.
+    /// </param>
+    /// <param name="displayHeight">
+    /// Display height in luma samples; 0 (default) or equal to <paramref name="codedHeight"/> means no
+    /// vertical cropping. When smaller, the difference is signalled as <c>frame_crop_bottom_offset</c>
+    /// (§7.3.2.1.1); top offset stays 0.
+    /// </param>
+    public static byte[] WriteSpsRbsp(
+        int codedWidth, int codedHeight, byte profileIdc, byte levelIdc, int maxNumRefFrames = MaxNumRefFrames,
+        int displayWidth = 0, int displayHeight = 0)
     {
         if (profileIdc != 66)
         {
@@ -30,9 +51,28 @@ internal static class H264ParameterSets
                 "syntax that this encoder does not emit (see §7.3.2.1, Annex A).");
         }
 
+        if (displayWidth == 0)
+        {
+            displayWidth = codedWidth;
+        }
+
+        if (displayHeight == 0)
+        {
+            displayHeight = codedHeight;
+        }
+
+        if (displayWidth < 2 || displayWidth > codedWidth || (displayWidth & 1) != 0
+            || displayHeight < 2 || displayHeight > codedHeight || (displayHeight & 1) != 0)
+        {
+            throw new ArgumentException(
+                $"Display size {displayWidth}×{displayHeight} must be even and within the coded size " +
+                $"{codedWidth}×{codedHeight}: 4:2:0 crop offsets move in CropUnitX=CropUnitY=2 luma-sample " +
+                "units (§7.4.2.1.1, Table 6-1), so odd display extents are unrepresentable.");
+        }
+
         var bs = new H264RbspBitBuffer();
-        var mbW = width / 16;
-        var mbH = height / 16;
+        var mbW = codedWidth / 16;
+        var mbH = codedHeight / 16;
 
         H264LevelLimits.ValidateFrameSize(levelIdc, mbW, mbH);
 
@@ -71,7 +111,26 @@ internal static class H264ParameterSets
         bs.WriteUe((uint)(mbH - 1)); // pic_height_in_map_units_minus1
         bs.WriteBit(true); // frame_mbs_only_flag
         bs.WriteBit(true); // direct_8x8_inference_flag (required when frame_mbs_only_flag is 1)
-        bs.WriteBit(false); // frame_cropping_flag
+
+        // frame_cropping_flag + frame_crop_{left,right,top,bottom}_offset (§7.3.2.1.1). Cropping is
+        // display-stage-only: the decoder's DPB and loop filter operate on the uncropped coded
+        // picture (§7.4.2.1.1), so only the SPS changes when display < coded. Offsets are in
+        // CropUnitX = CropUnitY = 2 luma-sample units for 4:2:0 (§7.4.2.1.1, Table 6-1).
+        var cropRight = codedWidth - displayWidth;
+        var cropBottom = codedHeight - displayHeight;
+        if (cropRight != 0 || cropBottom != 0)
+        {
+            bs.WriteBit(true); // frame_cropping_flag
+            bs.WriteUe(0); // frame_crop_left_offset — 0 keeps the MB grid aligned to the visible origin
+            bs.WriteUe((uint)(cropRight / CropUnit)); // frame_crop_right_offset
+            bs.WriteUe(0); // frame_crop_top_offset
+            bs.WriteUe((uint)(cropBottom / CropUnit)); // frame_crop_bottom_offset
+        }
+        else
+        {
+            bs.WriteBit(false); // frame_cropping_flag
+        }
+
         bs.WriteBit(true);  // vui_parameters_present_flag
         // vui_parameters() — H.264 Annex E
         bs.WriteBit(false); // aspect_ratio_info_present_flag

@@ -55,10 +55,14 @@ internal static class H264LevelLimits
             {
                 if (totalMbs > maxFs)
                 {
+                    var minimumLevel = MinimumLevelForFrameSize(mbW, mbH);
+                    var remedy = minimumLevel != 0
+                        ? $"Set level_idc {minimumLevel} (the lowest level whose MaxFS admits this frame size) or reduce resolution."
+                        : "No level in Annex A Table A-1 admits this frame size; reduce resolution.";
                     throw new ArgumentException(
-                        $"Frame size {mbW}×{mbH} = {totalMbs} macroblocks exceeds MaxFS={maxFs} " +
-                        $"for level_idc {levelIdc} (H.264 Annex A Table A-1). " +
-                        "Increase level_idc or reduce resolution.",
+                        $"Frame size {mbW}×{mbH} = {totalMbs} macroblocks — counted on the padded coded picture, " +
+                        "whose dimensions are the display dimensions rounded up to multiples of 16 — " +
+                        $"exceeds MaxFS={maxFs} for level_idc {levelIdc} (H.264 Annex A Table A-1). {remedy}",
                         nameof(levelIdc));
                 }
 
@@ -67,5 +71,26 @@ internal static class H264LevelLimits
         }
 
         // Unknown level: skip silently (forward-compatibility).
+    }
+
+    /// <summary>
+    /// Lowest <c>level_idc</c> whose <c>MaxFS</c> (Annex A Table A-1) admits a
+    /// <paramref name="mbW"/> × <paramref name="mbH"/> macroblock picture, or 0 when no level does.
+    /// The table is ordered by ascending level, so the first fit is the minimum.
+    /// </summary>
+    /// <param name="mbW">Coded (padded) picture width in macroblocks.</param>
+    /// <param name="mbH">Coded (padded) picture height in macroblocks.</param>
+    public static byte MinimumLevelForFrameSize(int mbW, int mbH)
+    {
+        var totalMbs = mbW * mbH;
+        foreach (var (lvl, maxFs) in Table)
+        {
+            if (totalMbs <= maxFs)
+            {
+                return lvl;
+            }
+        }
+
+        return 0;
     }
 }
