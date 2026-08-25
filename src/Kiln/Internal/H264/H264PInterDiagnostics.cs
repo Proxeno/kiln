@@ -161,6 +161,13 @@ internal static class H264PInterDiagnostics
     /// </summary>
     public static bool DisableRefTransformAtlas { get; set; }
 
+    /// <summary>
+    /// Measurement-only A/B kill switch for the effort-balanced slice partition: when true the
+    /// multi-slice orchestrator keeps the historical equal-height row split every frame.
+    /// Keep false in normal operation.
+    /// </summary>
+    public static bool DisableSlicePartitionBalance { get; set; }
+
     private static long s_fpFrames;
     private static long s_fpBeginFrameTicks;
     private static long s_fpParallelWallTicks;
@@ -171,6 +178,14 @@ internal static class H264PInterDiagnostics
     private static long s_fpSliceCopyTicks;
     private static long s_fpSliceDeblockTicks;
     private static readonly long[] s_fpSliceTicksByIndex = new long[16];
+    private const int MaxRowStats = 1024;
+    private static readonly long[] s_rowTicks = new long[MaxRowStats];
+    private static readonly long[] s_rowSkip = new long[MaxRowStats];
+    private static readonly long[] s_rowInter16 = new long[MaxRowStats];
+    private static readonly long[] s_rowInterSub = new long[MaxRowStats];
+    private static readonly long[] s_rowIntra = new long[MaxRowStats];
+    private static readonly long[] s_rowEffort = new long[MaxRowStats];
+    private static long s_rowStatFrames;
 
     /// <summary>Clears the frame-phase accumulators recorded via <see cref="NotifyFramePhases"/>.</summary>
     public static void ResetFramePhases()
@@ -222,6 +237,57 @@ internal static class H264PInterDiagnostics
             return;
         Interlocked.Add(ref s_fpSliceCopyTicks, copyTicks);
         Interlocked.Add(ref s_fpSliceDeblockTicks, deblockTicks);
+    }
+
+    /// <summary>Accumulates one MB row's wall ticks and outcome mix (see the slice encoder's per-row flush).</summary>
+    internal static void NotifyRowStats(int mbRow, long ticks, long effort, int skip, int inter16, int interSub, int intra)
+    {
+        if (!CollectFramePhases || (uint)mbRow >= MaxRowStats)
+            return;
+        Interlocked.Add(ref s_rowTicks[mbRow], ticks);
+        Interlocked.Add(ref s_rowEffort[mbRow], effort);
+        Interlocked.Add(ref s_rowSkip[mbRow], skip);
+        Interlocked.Add(ref s_rowInter16[mbRow], inter16);
+        Interlocked.Add(ref s_rowInterSub[mbRow], interSub);
+        Interlocked.Add(ref s_rowIntra[mbRow], intra);
+        if (mbRow == 0)
+            Interlocked.Increment(ref s_rowStatFrames);
+    }
+
+    /// <summary>Per-row average time and MB outcome mix over the frames recorded since the last reset.</summary>
+    public static string BuildRowStatsReport(bool reset = false)
+    {
+        var frames = Volatile.Read(ref s_rowStatFrames);
+        if (frames <= 0)
+            return "Row stats: no rows recorded.";
+        var sb = new StringBuilder(4096);
+        sb.Append("Row stats (avg per frame over n=").Append(frames).AppendLine("): row: us | effort | skip/16x16/subPart/intra");
+        for (var r = 0; r < MaxRowStats; r++)
+        {
+            var t = Volatile.Read(ref s_rowTicks[r]);
+            if (t == 0)
+                continue;
+            var us = t * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency / frames;
+            sb.Append("  ").Append(r).Append(": ").Append(us.ToString("F0")).Append(" | ")
+                .Append(((double)s_rowEffort[r] / frames).ToString("F0")).Append(" | ")
+                .Append(((double)s_rowSkip[r] / frames).ToString("F1")).Append('/')
+                .Append(((double)s_rowInter16[r] / frames).ToString("F1")).Append('/')
+                .Append(((double)s_rowInterSub[r] / frames).ToString("F1")).Append('/')
+                .Append(((double)s_rowIntra[r] / frames).ToString("F1")).AppendLine();
+        }
+
+        if (reset)
+        {
+            Interlocked.Exchange(ref s_rowStatFrames, 0);
+            Array.Clear(s_rowTicks);
+            Array.Clear(s_rowSkip);
+            Array.Clear(s_rowInter16);
+            Array.Clear(s_rowInterSub);
+            Array.Clear(s_rowIntra);
+            Array.Clear(s_rowEffort);
+        }
+
+        return sb.ToString();
     }
 
     /// <summary>Per-frame averages of the phase ticks recorded since the last reset.</summary>

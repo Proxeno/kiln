@@ -85,6 +85,16 @@ internal sealed class H264FrameSharedState
     public readonly H264MotionEstimator.Mv[] MbSubPartMvs;
     public readonly H264MotionEstimator.McPartition[] MbPartitions;
 
+    /// <summary>
+    /// Per-MB-row motion-search effort recorded during the most recent frame, in the deterministic
+    /// candidate-evaluation units of <c>H264MotionEstimator.ThreadSearchEffort</c>. Each row is
+    /// written exactly once per frame by the slice encoder that owns it (rows are disjoint across
+    /// slices), and read by the multi-slice orchestrator before the next frame's parallel region to
+    /// balance the slice partition. Rows keep their previous value on frames whose owner slice did
+    /// no motion search (IDR), which leaves the partition unchanged for that frame.
+    /// </summary>
+    public readonly long[] RowMeEffort;
+
     /// <summary>Per-MB winning reference index (0 or 1) for inter-coded MBs. Used by deblocking and MVP computation.</summary>
     public readonly byte[] MbRefIdx;
     /// <summary>Per-partition winning reference index for sub-partition inter MBs (4 entries per MB, index = mbIndex*4+partIndex).</summary>
@@ -140,6 +150,7 @@ internal sealed class H264FrameSharedState
         QpUv = new int[mbCount];
         MbIsInter = new bool[mbCount];
         MbIsSkip = new bool[mbCount];
+        RowMeEffort = new long[mbH];
         MbMvs = new H264MotionEstimator.Mv[mbCount];
         PrevMbMvs = new H264MotionEstimator.Mv[mbCount];
         MbSubPartMvs = new H264MotionEstimator.Mv[mbCount * 4];

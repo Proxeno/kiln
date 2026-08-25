@@ -17,7 +17,7 @@ internal static class H264PerfProbe
     private const int W = 1920;
     private const int H = 1080;
 
-    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false, bool AtlasOff = false);
+    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false, bool AtlasOff = false, bool BalanceOff = false);
 
     private static Arm ResolveArm(string name, int slices) => name switch
     {
@@ -57,6 +57,14 @@ internal static class H264PerfProbe
                     new Arm("fast-s2", Satd: false, MaxRef: 1, Slices: 2),
                     new Arm("fast-s4", Satd: false, MaxRef: 1, Slices: 4),
                     new Arm("fast-s8", Satd: false, MaxRef: 1, Slices: 8),
+                ]);
+                break;
+            case "balance":
+                Measure([
+                    ResolveArm("default", 4), ResolveArm("default", 4) with { Name = "default-s4-eq", BalanceOff = true },
+                    ResolveArm("default", 8), ResolveArm("default", 8) with { Name = "default-s8-eq", BalanceOff = true },
+                    ResolveArm("fast", 4), ResolveArm("fast", 4) with { Name = "fast-s4-eq   ", BalanceOff = true },
+                    ResolveArm("fast", 8), ResolveArm("fast", 8) with { Name = "fast-s8-eq   ", BalanceOff = true },
                 ]);
                 break;
             case "atlas":
@@ -141,6 +149,7 @@ internal static class H264PerfProbe
             ms[a] = new double[Rounds];
             H264PInterDiagnostics.DisableRef1TieMargin = arms[a].DisableRef1Margin;
             H264PInterDiagnostics.DisableRefTransformAtlas = arms[a].AtlasOff;
+            H264PInterDiagnostics.DisableSlicePartitionBalance = arms[a].BalanceOff;
             Encode(encs[a].Enc, encs[a].Frames, encs[a].Annex, frameIdx[a]++, idr: true);
             for (var i = 0; i < 3; i++)
                 Encode(encs[a].Enc, encs[a].Frames, encs[a].Annex, frameIdx[a]++, idr: false);
@@ -154,6 +163,7 @@ internal static class H264PerfProbe
             {
                 H264PInterDiagnostics.DisableRef1TieMargin = arms[a].DisableRef1Margin;
                 H264PInterDiagnostics.DisableRefTransformAtlas = arms[a].AtlasOff;
+                H264PInterDiagnostics.DisableSlicePartitionBalance = arms[a].BalanceOff;
                 H264PInterDiagnostics.ResetPhaseCounts();
                 sw.Restart();
                 for (var i = 0; i < ChunkFrames; i++)
@@ -170,6 +180,7 @@ internal static class H264PerfProbe
         H264PInterDiagnostics.CollectPhaseCounts = false;
         H264PInterDiagnostics.DisableRef1TieMargin = false;
         H264PInterDiagnostics.DisableRefTransformAtlas = false;
+        H264PInterDiagnostics.DisableSlicePartitionBalance = false;
         for (var a = 0; a < arms.Length; a++)
         {
             Array.Sort(ms[a]);
@@ -232,6 +243,8 @@ internal static class H264PerfProbe
             case "phases":
                 H264PInterDiagnostics.CollectFramePhases = false;
                 Console.WriteLine(H264PInterDiagnostics.BuildFramePhaseReport(reset: true));
+                if (Environment.GetEnvironmentVariable("KILN_PROBE_ROWSTATS") == "1")
+                    Console.WriteLine(H264PInterDiagnostics.BuildRowStatsReport(reset: true));
                 break;
             case "mb":
                 H264PInterDiagnostics.CollectPhase2Timing = false;
