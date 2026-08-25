@@ -51,3 +51,15 @@ Implication: the atlas 8%-hit story was a conflation. Real targets, in order of 
   wall (qgate probe): default-s4 15.08/14.75 -> 13.73 ms/frame; cumulative vs pre-gate 17.0 -> 13.7 (-19%)
   atlasOff-s4 13.73 == default-s4 13.73 (atlas now exactly neutral at s=4 with both changes)
   tests: 2207 green.
+
+# Optimisation 3 (landed): H264ReferenceTransformAtlas DELETED
+# Rationale (measured, post gate+round-dedup):
+#   - integer-only by design; cannot serve the ~45% of atoms at fractional positions
+#   - dump default vs atlasOff byte-identical (transform-domain SATD exact by Hadamard linearity)
+#   - s=4: neutral (14.40/14.68 then 14.12/13.51 -- inside noise)
+#   - s=1: atlasOff consistently FASTER: 26.72/26.07 (atlas) vs 25.68/24.73 (off)
+#   - cost: ~169 MB at 1080p (2 DPB slots x (1952x1144) x 36 B), ~610 MB at 4K
+# The per-MB rented refTransformCache grid stays and now serves the unified loop's
+# transform-domain SATD; the hex 16x16 path scores from pixels with SAD-LB + bounded SATD
+# (exactly the measured atlasOff configuration). Post-removal: byte-identical stream,
+# 2207 tests green, default-s4 13.49 ms / default-s1 26.03 ms.
