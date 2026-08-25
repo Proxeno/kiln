@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Kiln.Internal.H264;
+using Kiln.RateControl;
 
 namespace Kiln;
 
@@ -10,6 +11,25 @@ public sealed class H264BaselineEncoderOptions
 {
     /// <summary>QP [0,51].</summary>
     public int QuantizationParameter { get; set; } = 28;
+
+    /// <summary>
+    /// Speed/quality preset over the four measured motion-search knobs:
+    /// <see cref="MaxReferenceFrames"/>, <see cref="UseMotionSatd"/>,
+    /// <see cref="SubPartitionRangeCap"/> and <see cref="MotionSearchEffortCapPerMb"/>.
+    /// Default <see cref="EncoderSpeedMode.HighQuality"/> applies no overrides, so streams from
+    /// default options stay byte-identical to earlier releases. See <see cref="EncoderSpeedMode"/>
+    /// for what each rung sets and its measured cost.
+    /// <para>
+    /// Composition rule: an explicit assignment to any of the four knobs always wins over the mode
+    /// — the mode only fills in knobs the caller never assigned. Assigning a knob its own default
+    /// value still counts as explicit. All other options (<see cref="SliceCount"/>,
+    /// <see cref="LightweightDeblocking"/>, QP, …) are never touched by a mode. Every preset keeps
+    /// the effort-counted work budgets of <see cref="MotionSearchEffortCapPerMb"/>, so bitstreams
+    /// remain deterministic: identical inputs produce identical bytes regardless of wall clock or
+    /// thread scheduling. Like every option, the mode is read when the encoder is constructed.
+    /// </para>
+    /// </summary>
+    public EncoderSpeedMode SpeedMode { get; set; } = EncoderSpeedMode.HighQuality;
 
     /// <summary>IDR NAL every N coded frames (first frame is always IDR).</summary>
     public int KeyframeIntervalFrames { get; set; } = 60;
@@ -31,8 +51,21 @@ public sealed class H264BaselineEncoderOptions
     /// Number of reference frames the encoder may use/signal, clamped to [1, <see cref="Internal.H264.H264FrameSharedState.MaxDpbSize"/>].
     /// 1 = single-reference (WebRTC / hardware-decoder safe); 2 = multi-reference. See
     /// <see cref="Internal.H264.H264FrameSharedState.MaxReferenceFrames"/>.
+    /// When never assigned, <see cref="SpeedMode"/> presets may lower this (reads return the
+    /// preset's value); an explicit assignment always wins over the mode.
     /// </summary>
-    public int MaxReferenceFrames { get; set; } = 2;
+    public int MaxReferenceFrames
+    {
+        get => _maxReferenceFramesIsSet ? _maxReferenceFrames : SpeedModePreset(SpeedMode).MaxReferenceFrames;
+        set
+        {
+            _maxReferenceFrames = value;
+            _maxReferenceFramesIsSet = true;
+        }
+    }
+
+    private int _maxReferenceFrames = 2;
+    private bool _maxReferenceFramesIsSet;
 
     /// <summary>
     /// RD weight λ for chroma-DC refinement (<c>J = D + λ·R</c>). If null, derived from <see cref="QuantizationParameter"/>.
@@ -71,8 +104,21 @@ public sealed class H264BaselineEncoderOptions
 
     /// <summary>
     /// When true (default), integer-pel inter ME scores candidates with SATD; fractional refinement still uses SAD.
+    /// When never assigned, <see cref="SpeedMode"/> presets may disable this (reads return the
+    /// preset's value); an explicit assignment always wins over the mode.
     /// </summary>
-    public bool UseMotionSatd { get; set; } = true;
+    public bool UseMotionSatd
+    {
+        get => _useMotionSatdIsSet ? _useMotionSatd : SpeedModePreset(SpeedMode).UseMotionSatd;
+        set
+        {
+            _useMotionSatd = value;
+            _useMotionSatdIsSet = true;
+        }
+    }
+
+    private bool _useMotionSatd = true;
+    private bool _useMotionSatdIsSet;
 
     /// <summary>
     /// When true (default), P-slices may emit Intra_16×16 macroblocks: each inter MB is scored
@@ -135,8 +181,21 @@ public sealed class H264BaselineEncoderOptions
     /// the radius drops to 4 for the slice's remaining MBs regardless of this setting — a worst-case
     /// complexity bound that only binds on sustained high-motion content. The budget is proportional
     /// to the slice's MB count, so the per-frame total is independent of <see cref="SliceCount"/>.
+    /// When never assigned, <see cref="SpeedMode"/> presets may lower this (reads return the
+    /// preset's value); an explicit assignment always wins over the mode.
     /// </summary>
-    public int SubPartitionRangeCap { get; set; } = 16;
+    public int SubPartitionRangeCap
+    {
+        get => _subPartitionRangeCapIsSet ? _subPartitionRangeCap : SpeedModePreset(SpeedMode).SubPartitionRangeCap;
+        set
+        {
+            _subPartitionRangeCap = value;
+            _subPartitionRangeCapIsSet = true;
+        }
+    }
+
+    private int _subPartitionRangeCap = 16;
+    private bool _subPartitionRangeCapIsSet;
 
     /// <summary>
     /// Deterministic per-frame motion-search complexity ceiling, in candidate-evaluation units per
@@ -153,8 +212,45 @@ public sealed class H264BaselineEncoderOptions
     /// content measures ~150 units/MB and is unaffected by ceilings ≥ 512; divergent-motion stress
     /// content measures ~700 unbounded. See the README options table for measured latency/quality
     /// trade-offs.
+    /// When never assigned, <see cref="SpeedMode"/> presets set a cap (reads return the preset's
+    /// value); an explicit assignment — including an explicit 0 — always wins over the mode.
     /// </summary>
-    public int MotionSearchEffortCapPerMb { get; set; }
+    public int MotionSearchEffortCapPerMb
+    {
+        get => _motionSearchEffortCapPerMbIsSet ? _motionSearchEffortCapPerMb : SpeedModePreset(SpeedMode).MotionSearchEffortCapPerMb;
+        set
+        {
+            _motionSearchEffortCapPerMb = value;
+            _motionSearchEffortCapPerMbIsSet = true;
+        }
+    }
+
+    private int _motionSearchEffortCapPerMb;
+    private bool _motionSearchEffortCapPerMbIsSet;
+
+    /// <summary>
+    /// The knob values a <see cref="EncoderSpeedMode"/> preset supplies for any of the four
+    /// speed-ladder options the caller never assigned (see <see cref="SpeedMode"/> for the
+    /// composition rule). <see cref="EncoderSpeedMode.HighQuality"/> returns exactly the historical
+    /// option defaults, keeping default-options streams byte-identical to earlier releases. The
+    /// non-default rungs are measured positions on the speed/quality curve — see the
+    /// <see cref="EncoderSpeedMode"/> member docs and the README performance section for numbers.
+    /// </summary>
+    private static (int MaxReferenceFrames, bool UseMotionSatd, int SubPartitionRangeCap, int MotionSearchEffortCapPerMb) SpeedModePreset(EncoderSpeedMode mode) => mode switch
+    {
+        // Historical defaults: everything on, no caps.
+        EncoderSpeedMode.HighQuality => (2, true, 16, 0),
+        // Single reference (the bulk of the wall-clock win on coherent content) plus a worst-case
+        // effort ceiling. Coherent motion puts only a few percent of MBs into the ceiling's first
+        // degradation tiers; sustained high-motion / scene-cut content does bind it, trading PSNR
+        // there for the latency bound.
+        EncoderSpeedMode.Balanced => (1, true, 16, 512),
+        // Adds the sub-partition radius cap and a tighter effort ceiling.
+        EncoderSpeedMode.Fast => (1, true, 8, 256),
+        // SAD-scored integer ME plus a hard effort ceiling — the visible-quality-cost rung.
+        EncoderSpeedMode.VeryFast => (1, false, 8, 128),
+        _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown EncoderSpeedMode."),
+    };
 }
 
 /// <summary>Baseline H.264 encoder (I and P slices, intra macroblocks only in P). Emits Annex B byte stream.</summary>

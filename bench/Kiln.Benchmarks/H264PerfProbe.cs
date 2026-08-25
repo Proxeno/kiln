@@ -362,7 +362,7 @@ internal static class H264PerfProbe
     /// vertically in opposite directions. Macroblocks on the half boundary and around the squares
     /// have genuinely divergent per-quadrant motion (12 px/frame split, 24 px against ref1).
     /// </summary>
-    private static byte[][] GenerateDivergentFrames(int w, int h)
+    internal static byte[][] GenerateDivergentFrames(int w, int h)
     {
         const int Cycle = H264ResolutionSliceSweepBenchmarks.FrameCycle;
         const int Step = 6;

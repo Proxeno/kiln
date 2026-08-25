@@ -51,12 +51,14 @@ video, such as:
 
 ```csharp
 using Kiln;
+using Kiln.RateControl;
 
 var encoder = new H264BaselineEncoder(1280, 720, new H264BaselineEncoderOptions
 {
     QuantizationParameter = 28,
     KeyframeIntervalFrames = 120,
-    SliceCount = 4,               // parallel slice encoding
+    SliceCount = 4,                         // parallel slice encoding
+    SpeedMode = EncoderSpeedMode.Balanced,  // measured speed/quality preset
 });
 
 var annexB = new byte[1280 * 720 * 2];
@@ -78,6 +80,9 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
   sub-pel SATD motion search, P_Skip, and multiple reference frames.
 - **Quality knobs.** In-loop deblocking, optional greedy trellis quantization, variance-based
   spatial adaptive QP, and per-frame rate control.
+- **A measured speed ladder.** Four `SpeedMode` presets over the motion-search knobs, each a
+  measured point on the speed/quality curve, plus a deterministic per-frame motion-search work
+  budget that bounds the worst-case frame time without making bitstreams timing-dependent.
 - **Parallelism built in.** Multi-slice frames encode their slices in parallel and bound the region a
   lost packet can damage.
 - **SIMD with a safety net.** NEON/AdvSimd, AVX2 and SSSE3 kernels selected at runtime, each covered
@@ -86,7 +91,7 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
 - **Streaming companions.** `Kiln.RateControl` (a low-latency rate controller with network feedback)
   and `Kiln.Recovery` (IDR budgeting / keyframe recovery policy) are public companion namespaces for
   server use.
-- **Verified.** 2,174 tests — spec-roundtrip decoding, SIMD/scalar parity, golden-frame regression,
+- **Verified.** 2,226 tests — spec-roundtrip decoding, SIMD/scalar parity, golden-frame regression,
   PSNR fidelity floors, adversarial neighbour-availability sweeps, and independent-decoder smoke
   tests over every produced stream.
 
@@ -95,6 +100,7 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
 | Option | Default | What it does |
 |---|---|---|
 | `QuantizationParameter` | 28 | Base QP, 0–51. |
+| `SpeedMode` | `HighQuality` | Measured speed/quality preset ladder (`HighQuality`/`Balanced`/`Fast`/`VeryFast`) over `MaxReferenceFrames`, `UseMotionSatd`, `SubPartitionRangeCap` and `MotionSearchEffortCapPerMb`. Any of those four you assign explicitly wins over the mode; other options are never touched. See [Performance](#performance) for what each rung buys and costs. |
 | `KeyframeIntervalFrames` | 60 | IDR every N coded frames (frame 0 is always IDR). `EncodeFrame(forceKeyframe: true)` overrides. |
 | `SliceCount` | 1 | Slices per frame; >1 encodes slices in parallel and bounds loss regions. |
 | `MaxReferenceFrames` | 2 | 1 = single-ref (WebRTC / hardware-decoder safe), 2 = multi-reference P. |
@@ -104,18 +110,86 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
 | `EnableIntraInPFallback` | true | Allows I16x16/I4x4 macroblocks inside P-frames when inter prediction fails. |
 | `TrellisLevel` | 0 | 1 = greedy per-coefficient trellis quantization (better RD, ~5% CPU). |
 | `AdaptiveQuantStrength` | 0.0 | Variance-based spatial AQ; 1.0 = standard, typical 0.5–1.5. |
-| `PreferRealtimeLatencyTuning` | false | Speed-biased P-frame ME / chroma-DC handling. |
+| `PreferRealtimeLatencyTuning` | false | Skips chroma-DC RD refinement for inter-coded chroma. Does not bound motion-search cost — that's `MotionSearchEffortCapPerMb`. |
 | `LightweightDeblocking` | false | Disables in-loop deblocking (bitstream-signalled) to cut CPU. |
 | `PreferHardwareIntrinsics` | true | Runtime SIMD kernel selection; false forces scalar. |
 | `SubPartitionRangeCap` | 16 | Sub-partition ME radius cap (per-frame complexity budget applies). A speed knob: 8 is ~20% faster per frame and 4 ~30% faster. Quality-neutral (±0.01 dB) on coherent motion; on divergent motion 8 costs about −0.17 dB / +13.5% bits at QP 24. |
-| `MotionSearchEffortCapPerMb` | 0 (off) | Deterministic worst-case frame-time bound: caps motion-search work per frame (units/MB; each slice gets an equal share) and degrades search in steps as the budget depletes. Typical content uses ~150 units/MB and is untouched by 512; pathological divergent motion is bounded from ~7× to ~2× typical frame time at 512 (~2.4× fewer ms at 128), paying bitrate/PSNR only when the cap binds. Bitstreams stay reproducible — the count is algorithmic work, not wall clock. |
+| `MotionSearchEffortCapPerMb` | 0 (off) | Deterministic worst-case frame-time bound: caps motion-search work per frame (units/MB; each slice gets an equal share) and degrades the search in steps as the budget depletes, paying bitrate/PSNR only when the cap binds. Bitstreams stay reproducible — the count is algorithmic work, not wall clock. Set by the non-default `SpeedMode` presets; see [Performance](#performance) for measured bounds and prices. |
 | `ProfileIdc` / `LevelIdc` | 66 / 0 (auto) | Signalled profile (baseline) and level. `LevelIdc = 0` auto-selects the lowest level whose MaxFS admits the frame, floored at 3.1; set explicitly to pin a level. |
 | `ChromaDcRdLambda`, `Intra4x4SadLambda` | derived | Expert RD-lambda overrides; leave null. |
 
 ## Performance
 
-Measured on Apple M5 Max (arm64, NEON/AdvSimd), .NET 10, BenchmarkDotNet, quiet machine — the
-committed perf-gate baseline numbers (`perf/`).
+Measured on Apple M5 Max (arm64, NEON/AdvSimd), .NET 10, quiet machine, QP 28, steady P-frames
+over deterministic synthetic content. Every number is reproducible from the harnesses in
+`bench/Kiln.Benchmarks` (`--slice-quick`, `--speed-modes`, `--speed-modes-timing`,
+`--speed-modes-tiers`), with competing configurations interleaved in one process so scheduling
+drift hits every arm equally. Three questions, in the order a deployment asks them: what does the
+default cost, what can a speed mode buy, and what is the worst case.
+
+### Default quality on realistic content
+
+Steady P-frame medians on textured scroll-plus-noise content ("coherent motion" — a camera pan or
+game scroll; neither a best case nor a stress case), default options:
+
+| Resolution | 1 slice | 2 slices | 4 slices | 8 slices |
+|---|---:|---:|---:|---:|
+| 640x480 | 17.3 ms | 8.6 ms | 5.6 ms | 4.0 ms |
+| 1280x720 | 19.9 ms | 16.0 ms | 9.4 ms | 7.5 ms |
+| 1920x1080 | 24.4 ms | 16.9 ms | 10.9 ms | 10.8 ms |
+
+Slices do not divide the work cleanly. Four slices buy about 2.2x at 1080p — not 4x — and eight
+buy essentially nothing beyond four: per-slice motion cost doesn't balance perfectly, and the
+frame still pays serial per-frame work. Slices also cost bits, because slice boundaries reset
+MV/skip prediction: measured +5% to +26% bitrate at QP 28 going from 1 to 4 slices depending on
+content (up to ~+40% on cheap coherent frames at QP 23). Choose `SliceCount` for latency and
+packet-loss confinement and budget for both costs; do not expect linear returns.
+
+### The speed-mode ladder: best achievable and its price
+
+`H264BaselineEncoderOptions.SpeedMode` selects a measured preset over four motion-search knobs
+(`MaxReferenceFrames`, `UseMotionSatd`, `SubPartitionRangeCap`, `MotionSearchEffortCapPerMb`); any
+of those you assign explicitly wins over the mode. All rungs keep bitstreams deterministic — the
+effort budgets count algorithmic work, never wall clock. 1080p steady-P medians:
+
+| Mode | Sets | Coherent, s=1 / s=4 | Divergent worst case, s=1 / s=4 |
+|---|---|---:|---:|
+| `HighQuality` (default) | 2 refs, SATD ME, full sub-partition range, no cap | 26.6 / 10.0 ms | 205 / 70 ms |
+| `Balanced` | 1 ref, effort cap 512/MB | 18.8 / 8.2 ms | 80 / 30 ms |
+| `Fast` | + sub-partition radius 8, cap 256 | 15.6 / 7.7 ms | 64 / 24 ms |
+| `VeryFast` | + SAD-scored ME, cap 128 | 8.9 / 4.0 ms | 20 / 7.8 ms |
+
+And the quality price, 1080p QP 28, PSNR / bitrate versus `HighQuality` by content class:
+
+| Mode | Static | Coherent motion | High motion | Scene cut | Divergent motion |
+|---|---|---|---|---|---|
+| `Balanced` | 0 | −0.1 dB, +1% | −1.6 dB, +12% | +0.3 dB, −3% | −0.4 dB, +40% |
+| `Fast` | 0 | −0.1 dB, +1% | −1.7 dB, +11% | +0.4 dB, −4% | −0.5 dB, +55% |
+| `VeryFast` | 0 | −1.2 dB, +7% | −3.5 dB, +21% | −0.9 dB, +2% | −1.5 dB, +64% |
+
+Read it as: on static and coherent content `Balanced` and `Fast` are near-free and `VeryFast`
+costs about a decibel; when content turns violent, the capped modes hold their frame time and pay
+in quality and bits exactly there. The price concentrates at low QP, where frames that genuinely
+need a wide search are cut off hardest — at QP 23 `Balanced` measures −6.8 dB on the high-motion
+generator and −3.7 dB on scene cuts. If you run QP ≤ 23 on demanding content, prefer
+`HighQuality`, or compose your own point on the curve (e.g. `SpeedMode = Balanced` with an
+explicit, higher `MotionSearchEffortCapPerMb` — the explicit knob wins).
+
+### Worst case
+
+The number that breaks a real-time deployment is not the mean but the hostile frame. On the
+divergent-motion stress generator (opposing half-screen scrolls plus counter-moving blocks) the
+default configuration measures **205 ms/frame** at 1080p single-slice (70 ms at 4 slices) against
+27/10 ms on coherent content in the same run — a ~7x content-dependent swing with no bound. The bound is
+`MotionSearchEffortCapPerMb` (set by every non-default speed mode): a deterministic per-frame
+work budget that degrades the search in steps as it depletes, cutting that worst case to 80 ms
+(`Balanced`) / 64 ms (`Fast`) / 20 ms (`VeryFast`) single-slice, while charging quality only when
+it actually binds. If your content is unusual, size the cap yourself — the
+`--speed-modes-tiers` harness shows how hard a given cap binds per content class.
+
+### Microbenchmarks and the perf gate
+
+The committed perf-gate baselines (`perf/`, BenchmarkDotNet):
 
 | Benchmark | Mean | Min |
 |---|---:|---:|
@@ -126,22 +200,9 @@ committed perf-gate baseline numbers (`perf/`).
 | Full-MB 16x16 ME search, range 8 | 76.4 us | 76.1 us |
 | Steady P-frame encode, 1280x720, 1 slice | 2.24 ms | 2.20 ms |
 
-That 2.24 ms figure is measured on the committed benchmark's **near-static synthetic content**, and
-it is not what a camera or a game scene costs. Textured, moving content is roughly an order of
-magnitude more expensive per frame. On a deterministic scroll-plus-noise source, steady P-frames
-measure:
-
-| Resolution | 1 slice | 4 slices |
-|---|---:|---:|
-| 640x480 | 19.8 ms | 13.0 ms |
-| 1280x720 | 26.9 ms | 15.6 ms |
-| 1920x1080 | 32.8 ms | 18.8 ms |
-
-Size your deployment from those numbers, not from the kernel microbenchmarks above. Note also that
-slices do not divide the work cleanly — most of what remains after motion estimation (skip
-evaluation, deblocking, CAVLC) does not parallelize, so 4 slices buys roughly 1.75x at 1080p rather
-than 4x. Perf discipline is part of the repo:
-`bench/Kiln.Benchmarks` (BenchmarkDotNet) plus `scripts/h264-simd-capture-baseline.sh` and
+That 2.24 ms row is measured on **near-static synthetic content** — size deployments from the
+realistic-content tables above, not from it. Perf discipline is part of the repo:
+`bench/Kiln.Benchmarks` plus `scripts/h264-simd-capture-baseline.sh` and
 `scripts/h264-simd-perf-gate.sh` gate changes against the committed baseline in `perf/`. See
 [docs/perf-gate.md](docs/perf-gate.md).
 
@@ -167,9 +228,16 @@ small for the frame throws, naming the lowest sufficient level. The chosen level
 > and encode instead of throwing. `EncodeFrame`'s output span now has a documented recommended size,
 > `H264BaselineEncoder.RecommendedOutputBufferSize`.
 
-The `Adaptation` (resolution/fps ladders) and `Queue` (latest-frame dropping) namespaces ship inside
-the library, fully tested but not yet wired into the encoder — **experimental**, and their APIs may
-change or move without notice. See [docs/architecture.md](docs/architecture.md).
+On the real-time story, be precise about what is wired and what is not. The encoder side is real:
+`SpeedMode` presets and the deterministic motion-search effort cap give measured, bounded per-frame
+cost, and `Kiln.RateControl`'s `LowLatencyRateController` turns network feedback into per-frame
+`EncoderAdaptationDecision`s (bitrate, QP, fps, resolution, and a recommended `SpeedMode`, which
+now has a defined encoder mapping). What does **not** exist yet is the automatic loop: nothing in the
+library applies a controller decision to a running encoder. Your server reads the decision and acts
+on it — construct encoder options with the recommended `SpeedMode`, resize, drop frames — itself.
+Likewise the `Adaptation` (resolution/fps ladders) and `Queue` (latest-frame dropping) namespaces
+ship inside the library, fully tested but not yet wired into the encoder — **experimental**, and
+their APIs may change or move without notice. See [docs/architecture.md](docs/architecture.md).
 
 ## Installing
 
