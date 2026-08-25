@@ -187,6 +187,25 @@ work budget that degrades the search in steps as it depletes, cutting that worst
 it actually binds. If your content is unusual, size the cap yourself — the
 `--speed-modes-tiers` harness shows how hard a given cap binds per content class.
 
+**For most real-time use, bound the tail without taking the quality trade.** The default
+`HighQuality` is the only mode that leaves `MotionSearchEffortCapPerMb` at 0, so it is also the only
+one with no worst-case bound — 10 ms typical at 1080p 4-slice, but 70 ms (14 fps) on a hostile
+frame. Because an explicitly-set option always beats the mode, you can keep every `HighQuality`
+coding decision and add just the bound:
+
+```csharp
+var encoder = new H264BaselineEncoder(1920, 1080, new H264BaselineEncoderOptions
+{
+    SpeedMode = EncoderSpeedMode.HighQuality,   // 2 refs, SATD ME, full sub-partition range
+    MotionSearchEffortCapPerMb = 512,           // explicit assignment overrides the mode's 0
+});
+```
+
+That costs about −0.01 dB on coherent content — the cap charges quality only where it binds — and
+pulls the hostile case in to roughly 35-40 ms at 4 slices. Prefer it over `Balanced` when you want
+the bound but not the single-reference trade, which is what costs `Balanced` its −0.7 to −2.9 dB on
+high-motion content at QP ≤ 28.
+
 ### Microbenchmarks and the perf gate
 
 The committed perf-gate baselines (`perf/`, BenchmarkDotNet):
