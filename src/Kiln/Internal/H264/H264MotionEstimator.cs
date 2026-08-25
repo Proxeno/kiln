@@ -108,7 +108,8 @@ internal static class H264MotionEstimator
         int fastSeedSearchRange = 0,
         bool allowSubPartitionSearch = true,
         H264ReferenceTransformAtlas? referenceTransformAtlas = null,
-        int subPartitionRangeCap = 8)
+        int subPartitionRangeCap = 8,
+        bool allowExhaustiveFallback = true)
     {
         var best = new PartitionResult(McPartition.Mb16x16, default, default, default, default, int.MaxValue);
 
@@ -169,7 +170,7 @@ internal static class H264MotionEstimator
         // keep whichever is better. This only fires on macroblocks the fast search failed on, so the
         // well-predicted common case keeps its speed.
         var fallbackThreshold = useMotionSatd ? FastSearchFullFallbackSatd : FastSearchFullFallbackSad;
-        if (fastSearch && r0.BestSad > fallbackThreshold)
+        if (fastSearch && allowExhaustiveFallback && r0.BestSad > fallbackThreshold)
         {
             H264PInterDiagnostics.NotifyMeExhaustiveFallback();
             var full = SearchMb16x16(

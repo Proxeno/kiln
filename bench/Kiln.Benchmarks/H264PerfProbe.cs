@@ -17,7 +17,7 @@ internal static class H264PerfProbe
     private const int W = 1920;
     private const int H = 1080;
 
-    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false, bool AtlasOff = false, bool BalanceOff = false, int RangeCap = 16, int Qp = 28, bool Divergent = false, int? SubPartDivisor = null);
+    private sealed record Arm(string Name, bool Satd, int MaxRef, int Slices, bool DisableRef1Margin = false, bool AtlasOff = false, bool BalanceOff = false, int RangeCap = 16, int Qp = 28, bool Divergent = false, int? SubPartDivisor = null, int EffortCap = 0);
 
     private static Arm ResolveArm(string name, int slices) => name switch
     {
@@ -34,6 +34,12 @@ internal static class H264PerfProbe
         "ref1div" => new Arm($"ref1div-s{slices}", Satd: true, MaxRef: 1, Slices: slices, Divergent: true),
         "satdOffDiv" => new Arm($"satdOffDiv-s{slices}", Satd: false, MaxRef: 2, Slices: slices, Divergent: true),
         "bud64div" => new Arm($"bud64div-s{slices}", Satd: true, MaxRef: 2, Slices: slices, Divergent: true, SubPartDivisor: 64),
+        "cap512" => new Arm($"cap512-s{slices}", Satd: true, MaxRef: 2, Slices: slices, EffortCap: 512),
+        "cap256" => new Arm($"cap256-s{slices}", Satd: true, MaxRef: 2, Slices: slices, EffortCap: 256),
+        "cap128" => new Arm($"cap128-s{slices}", Satd: true, MaxRef: 2, Slices: slices, EffortCap: 128),
+        "cap512div" => new Arm($"cap512div-s{slices}", Satd: true, MaxRef: 2, Slices: slices, Divergent: true, EffortCap: 512),
+        "cap256div" => new Arm($"cap256div-s{slices}", Satd: true, MaxRef: 2, Slices: slices, Divergent: true, EffortCap: 256),
+        "cap128div" => new Arm($"cap128div-s{slices}", Satd: true, MaxRef: 2, Slices: slices, Divergent: true, EffortCap: 128),
         _ => throw new ArgumentException(name),
     };
 
@@ -97,6 +103,22 @@ internal static class H264PerfProbe
                     ResolveArm("rc4div", 4),
                 ]);
                 break;
+            case "budget-div":
+                Measure([
+                    ResolveArm("div", 4),
+                    ResolveArm("cap512div", 4),
+                    ResolveArm("cap256div", 4),
+                    ResolveArm("cap128div", 4),
+                ]);
+                break;
+            case "budget":
+                Measure([
+                    ResolveArm("default", 4),
+                    ResolveArm("cap512", 4),
+                    ResolveArm("cap256", 4),
+                    ResolveArm("cap128", 4),
+                ]);
+                break;
             case "div-parts":
                 Measure([
                     ResolveArm("div", 4),
@@ -158,6 +180,7 @@ internal static class H264PerfProbe
             UseMotionSatd = arm.Satd,
             MaxReferenceFrames = arm.MaxRef,
             SubPartitionRangeCap = arm.RangeCap,
+            MotionSearchEffortCapPerMb = arm.EffortCap,
         });
         return (enc, frames, annex);
     }
@@ -179,11 +202,13 @@ internal static class H264PerfProbe
         var ms = new double[arms.Length][];
         var hex = new long[arms.Length];
         var fb = new long[arms.Length];
+        var tiers = new long[arms.Length][];
         var mbs = new long[arms.Length];
         for (var a = 0; a < arms.Length; a++)
         {
             encs[a] = Setup(arms[a]);
             ms[a] = new double[Rounds];
+            tiers[a] = new long[3];
             H264PInterDiagnostics.DisableRef1TieMargin = arms[a].DisableRef1Margin;
             H264PInterDiagnostics.DisableRefTransformAtlas = arms[a].AtlasOff;
             H264PInterDiagnostics.DisableSlicePartitionBalance = arms[a].BalanceOff;
@@ -210,8 +235,12 @@ internal static class H264PerfProbe
                 sw.Stop();
                 ms[a][round] = sw.Elapsed.TotalMilliseconds / ChunkFrames;
                 var (hx, f1) = H264PInterDiagnostics.ReadMeSearchCounts();
+                var (t1, t2, t3) = H264PInterDiagnostics.ReadMeBudgetTierCounts();
                 hex[a] += hx;
                 fb[a] += f1;
+                tiers[a][0] += t1;
+                tiers[a][1] += t2;
+                tiers[a][2] += t3;
                 mbs[a] += ChunkFrames;
             }
         }
@@ -227,7 +256,8 @@ internal static class H264PerfProbe
             var med = ms[a][ms[a].Length / 2];
             Console.WriteLine(
                 $"{arms[a].Name} {med,7:F2} ms/frame (min {ms[a][0]:F2} max {ms[a][^1]:F2})  " +
-                $"hex/frame={(double)hex[a] / mbs[a],8:F1} exhaustive/frame={(double)fb[a] / mbs[a],6:F1}");
+                $"hex/frame={(double)hex[a] / mbs[a],8:F1} exhaustive/frame={(double)fb[a] / mbs[a],6:F1}  " +
+                $"tierMbs/frame={(double)tiers[a][0] / mbs[a]:F0}/{(double)tiers[a][1] / mbs[a]:F0}/{(double)tiers[a][2] / mbs[a]:F0}");
             encs[a].Enc.Dispose();
         }
     }
