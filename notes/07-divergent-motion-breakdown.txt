@@ -42,3 +42,16 @@ Divergent content pushes 58% of Phase2 MBs into unified search vs 8% on coherent
 SubPartBudget = SliceMbCount/4 = 510/slice = 2040/frame; unified MBs/frame = 505 (~126/slice)
 -> the budget NEVER BINDS on this content. It caps a pathological 100%-of-MBs case at 25%,
    but 25% of MBs at ~300us each is already ~60ms/frame of thread work. (VERIFY semantics.)
+
+## Mechanism decomposition (div-parts, interleaved, median of 6x10)
+div-s4        85.38 ms (min 71.8 max 111.6)  hex 1106 exh 12.3
+ref1div-s4    60.18 ms (MaxRef=1)            -> ref1 competition ~25 ms (29%)
+satdOffDiv-s4 30.50 ms (UseMotionSatd=false) -> SATD unified sub-partition machinery ~55 ms (64%)
+bud64div-s4   47.58 ms (SubPartBudget divisor 64 -> binds at 32 MBs/slice)
+-> Even a hard-binding budget floors at ~48 ms: over-budget MBs only drop the sub-partition
+   range cap to 4; shapes, both refs, fractional refinement and the 16x16 search all still run.
+
+## SubPartBudget semantics (H264BaselineSliceEncoder.cs:1893-1896)
+_subPartMbCount++ for EVERY Phase2 MB with variance>=64 (whether or not unified search runs);
+over budget => rangeCapThisMb = min(4, cap). That is all it does. It bounds nothing else.
+On div content: ~505 unified MBs/frame ~= 126/slice vs budget 510/slice -> never binds.
