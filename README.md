@@ -125,8 +125,21 @@ committed perf-gate baseline numbers (`perf/`).
 | Full-MB 16x16 ME search, range 8 | 76.4 us | 76.1 us |
 | Steady P-frame encode, 1280x720, 1 slice | 2.24 ms | 2.20 ms |
 
-A ~2.2 ms steady-state P-frame at 720p on one slice leaves comfortable headroom for 60 fps game
-streaming; `SliceCount > 1` parallelizes further. Perf discipline is part of the repo:
+That 2.24 ms figure is measured on the committed benchmark's **near-static synthetic content**, and
+it is not what a camera or a game scene costs. Textured, moving content is roughly an order of
+magnitude more expensive per frame. On a deterministic scroll-plus-noise source, steady P-frames
+measure:
+
+| Resolution | 1 slice | 4 slices |
+|---|---:|---:|
+| 640x480 | 12.4 ms | 7.3 ms |
+| 1280x720 | 18.3 ms | 11.5 ms |
+| 1920x1080 | 22.8 ms | 13.0 ms |
+
+Size your deployment from those numbers, not from the kernel microbenchmarks above. Note also that
+slices do not divide the work cleanly — most of what remains after motion estimation (skip
+evaluation, deblocking, CAVLC) does not parallelize, so 4 slices buys roughly 1.75x at 1080p rather
+than 4x. Perf discipline is part of the repo:
 `bench/Kiln.Benchmarks` (BenchmarkDotNet) plus `scripts/h264-simd-capture-baseline.sh` and
 `scripts/h264-simd-perf-gate.sh` gate changes against the committed baseline in `perf/`. See
 [docs/perf-gate.md](docs/perf-gate.md).

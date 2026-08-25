@@ -15,7 +15,7 @@
     <Authors>Kiln contributors</Authors>
     <Description>Pure-managed SIMD H.264 baseline-profile encoder for real-time streaming. No native dependencies; NEON, AVX2 and SSSE3 accelerated.</Description>
     <Copyright>Copyright (c) Kiln contributors</Copyright>
-    <PackageReleaseNotes>First public release. Pure-managed H.264 baseline-profile encoder for .NET 10 with runtime SIMD kernel selection (NEON/AVX2/SSSE3), P-frames, rate control and keyframe recovery.</PackageReleaseNotes>
+    <PackageReleaseNotes>0.2.0 — Frame dimensions no longer need to be multiples of 16; sizes such as 1920x1080 are supported via SPS frame cropping (dimensions must be even). BREAKING: Width/Height are now display dimensions, with new CodedWidth/CodedHeight for the macroblock-aligned size, and LastReconstructedY/U/V return the uncropped coded plane. LevelIdc now defaults to 0 (auto-select from frame size). Rate-aware reference selection makes 1080p P-frames ~2.4x faster and improves quality on moving content. See the GitHub release notes for the full list.</PackageReleaseNotes>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/Proxeno/kiln</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Proxeno/kiln</RepositoryUrl>
