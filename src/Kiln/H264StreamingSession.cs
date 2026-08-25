@@ -36,11 +36,12 @@ public readonly record struct H264StreamingEncodeResult(
 
     /// <summary>
     /// True when the recovery policy asked for gradual intra refresh instead of an IDR (typically a
-    /// PLI/FIR during IDR cooldown). Kiln does not implement intra refresh — the only
-    /// <see cref="IIntraRefreshPolicy"/> implementation is an explicit no-op stub — so the session
-    /// encodes a normal frame and surfaces the request here instead of pretending. Callers with no
-    /// refresh mechanism of their own should treat it as "recovery is pending until the cooldown
-    /// permits the next IDR".
+    /// PLI/FIR during IDR cooldown). When the session's encoder options enable the feature
+    /// (<see cref="H264BaselineEncoderOptions.IntraRefreshPeriodFrames"/> &gt; 0) the session acts
+    /// on it — a refresh wave starts with this frame (or is queued behind an in-flight wave) via
+    /// <see cref="H264BaselineEncoder.RequestIntraRefresh"/>. With the feature disabled the session
+    /// encodes a normal frame and only surfaces the request; such callers should treat it as
+    /// "recovery is pending until the cooldown permits the next IDR".
     /// </summary>
     bool IntraRefreshRequested,
 
@@ -253,6 +254,15 @@ public sealed class H264StreamingSession : IDisposable
         if (decision.SpeedMode != _appliedSpeedMode)
         {
             ApplyMode(decision.SpeedMode);
+        }
+
+        // Recovery tier between "nothing" and "IDR": when the policy asks for gradual intra
+        // refresh (PLI/FIR during IDR cooldown) and the encoder was built with the feature enabled,
+        // start (or queue) a refresh wave — spec-exact recovery for the cost of a roughly constant
+        // per-frame bitrate premium instead of an IDR-sized spike.
+        if (decision.EnableIntraRefresh && _encoder.IntraRefreshEnabled)
+        {
+            _encoder.RequestIntraRefresh();
         }
 
         _targetFps = Math.Max(1, decision.TargetFps);

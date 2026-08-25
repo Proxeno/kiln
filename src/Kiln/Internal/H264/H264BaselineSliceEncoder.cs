@@ -319,6 +319,15 @@ internal sealed class H264BaselineSliceEncoder
     private readonly bool _fastSearch;
     private bool _useMotionSatd;
     private readonly bool _enableIntraInPFallback;
+    /// <summary>
+    /// Mirrors the PPS <c>constrained_intra_pred_flag</c> this stream was constructed with
+    /// (§7.4.2.2). When true, every intra prediction path in a P slice must treat inter-coded
+    /// neighbouring macroblocks as unavailable — for prediction samples (§8.3.1.2, §8.3.2, §8.3.4)
+    /// and for the Intra_4×4 most-probable-mode derivation (§8.3.1.1, dcPredModePredictedFlag) —
+    /// exactly as a conformant decoder will. False keeps every availability derivation identical to
+    /// the historical encoder, so non-refresh streams stay byte-identical.
+    /// </summary>
+    private readonly bool _constrainedIntraPred;
     private readonly int? _experimentalZeroMvSkipSadThreshold;
     private readonly bool _useTrellis;
     private readonly double _aqStrength;
@@ -343,7 +352,8 @@ internal sealed class H264BaselineSliceEncoder
         bool enableIntraInPFallback = true,
         int? experimentalZeroMvSkipSadThreshold = null,
         int subPartitionRangeCap = 16,
-        long motionSearchEffortSliceBudget = 0)
+        long motionSearchEffortSliceBudget = 0,
+        bool constrainedIntraPred = false)
     {
         if (width <= 0 || height <= 0 || (width & 15) != 0 || (height & 15) != 0)
         {
@@ -413,6 +423,7 @@ internal sealed class H264BaselineSliceEncoder
         _kernels = kernels ?? H264KernelSet.CreateBest();
         _subPartitionRangeCap = Math.Max(1, subPartitionRangeCap);
         _meEffortBudget = motionSearchEffortSliceBudget > 0 ? motionSearchEffortSliceBudget : long.MaxValue;
+        _constrainedIntraPred = constrainedIntraPred;
     }
 
     private void ComputeAqOffsets(ReadOnlySpan<byte> srcY, int strideY)
@@ -542,6 +553,15 @@ internal sealed class H264BaselineSliceEncoder
         // to the existing intra-only path.
         var canUseInter = isPslice && _paddedRefValid;
 
+        // Gradual intra refresh: the frame's forced-intra band (a run of MB columns, full slice
+        // height). Band MBs bypass the inter path entirely and code through the P-slice intra path;
+        // with constrained_intra_pred_flag set they then predict only from other intra MBs, so a
+        // decoder joining at the wave start reconstructs them exactly. Inactive (start < 0) on
+        // every frame of a non-refresh stream — the per-MB test below is gated on that.
+        var refreshBandStartMbX = _shared.RefreshBandStartMbX;
+        var refreshBandEndMbX = _shared.RefreshBandEndMbX;
+        var refreshBandActive = canUseInter && _shared.RefreshConstraintsActive && refreshBandStartMbX >= 0;
+
         if (_aqStrength > 0)
             ComputeAqOffsets(y, strideY);
 
@@ -596,7 +616,14 @@ internal sealed class H264BaselineSliceEncoder
             var qpThisMb = Math.Clamp(_rateControl.NextMbQp(mbLocal, complexity: 0) - aqOffset, 0, 51);
 
             var didSkip = false;
-            if (canUseInter)
+            var inRefreshBand = false;
+            if (refreshBandActive)
+            {
+                var mbColumn = mb % _mbW;
+                inRefreshBand = mbColumn >= refreshBandStartMbX && mbColumn < refreshBandEndMbX;
+            }
+
+            if (canUseInter && !inRefreshBand)
             {
                 didSkip = TryEncodePInterMacroblock(_rbspBuffer, mb, y, strideY, u, v, strideUv, qpThisMb, useTrellis, ref pendingSkipRun);
             }
@@ -803,12 +830,16 @@ internal sealed class H264BaselineSliceEncoder
             Array.Copy(_shared.DpbPaddedY[0], _shared.DpbPaddedY[1], _shared.DpbPaddedY[0].Length);
             Array.Copy(_shared.DpbPaddedU[0], _shared.DpbPaddedU[1], _shared.DpbPaddedU[0].Length);
             Array.Copy(_shared.DpbPaddedV[0], _shared.DpbPaddedV[1], _shared.DpbPaddedV[0].Length);
+            _shared.DpbGuaranteedUptoX[1] = _shared.DpbGuaranteedUptoX[0];
         }
         if (_shared.DpbCount < effectiveMaxRefs)
             _shared.DpbCount++;
         H264ReferencePicturePadder.Pad(recY, width, width, _height, HaloLuma, _shared.DpbPaddedY[0], _paddedStrideY);
         H264ReferencePicturePadder.Pad(recU, uvW, uvW, uvH, HaloChroma, _shared.DpbPaddedU[0], _paddedStrideUv);
         H264ReferencePicturePadder.Pad(recV, uvW, uvW, uvH, HaloChroma, _shared.DpbPaddedV[0], _paddedStrideUv);
+        // The picture just padded into slot 0 carries the join guarantee its frame established
+        // (see H264FrameSharedState.CurrentFrameGuaranteedUptoX; full-picture outside refresh use).
+        _shared.DpbGuaranteedUptoX[0] = _shared.CurrentFrameGuaranteedUptoX;
     }
 
     /// <summary>
@@ -1114,23 +1145,22 @@ internal sealed class H264BaselineSliceEncoder
     /// <paramref name="topRow"/> length 8 (T0..T7), <paramref name="leftCol"/> length 8 (L0..L7), and
     /// <paramref name="topLeft"/> as the corner sample at (bx-1, by-1).
     /// </summary>
-    /// <param name="firstChromaRowInSlice">
-    /// First chroma pixel row (= _firstMbRowInSlice * 8) of the slice currently being encoded. Top
-    /// neighbour samples whose row is below this threshold belong to a prior slice and must read as
-    /// unavailable per H.264 6.4.4 so the encoder's prediction matches a slice-aware decoder. Set to
-    /// <c>0</c> for the single-slice / whole-picture path so behaviour is byte-identical to pre-slice
-    /// code.
-    /// </param>
+    /// <remarks>
+    /// The usability flags are the complete §8.3.4 neighbour availability — picture edges, slice
+    /// boundaries (§6.4.4), and the <c>constrained_intra_pred_flag</c> inter-neighbour exclusion —
+    /// derived by callers via <see cref="GetIntraMbNeighbourUsability"/>.
+    /// </remarks>
     private static void GatherChromaNeighbors(
-        int mbx, int mby, int firstChromaRowInSlice, ReadOnlySpan<byte> recon, int reconStride,
+        int mbx, int mby, bool topUsable, bool leftUsable, bool topLeftUsable,
+        ReadOnlySpan<byte> recon, int reconStride,
         Span<byte> topRow, Span<byte> leftCol,
         out bool hasTop, out bool hasLeft, out bool hasTopLeft, out byte topLeft)
     {
         var bx = mbx * 8;
         var by = mby * 8;
-        hasTop = by > firstChromaRowInSlice;
-        hasLeft = bx > 0;
-        hasTopLeft = hasTop && hasLeft;
+        hasTop = topUsable;
+        hasLeft = leftUsable;
+        hasTopLeft = topLeftUsable;
         topLeft = hasTopLeft ? recon[(by - 1) * reconStride + bx - 1] : (byte)0;
         if (hasTop)
         {
@@ -1159,15 +1189,17 @@ internal sealed class H264BaselineSliceEncoder
     }
 
     /// <summary>Fill <paramref name="pred8x8"/> with the chroma 8x8 prediction for <paramref name="mode"/>
-    /// (0=DC, 1=Horizontal, 2=Vertical, 3=Plane) per H.264 8.3.4. <paramref name="firstChromaRowInSlice"/>
-    /// gates the "top" neighbour: chroma pixels with row &lt;= <paramref name="firstChromaRowInSlice"/>
-    /// belong to a prior slice and must read as unavailable per H.264 6.4.4.</summary>
+    /// (0=DC, 1=Horizontal, 2=Vertical, 3=Plane) per H.264 8.3.4. The usability flags carry the
+    /// full §8.3.4 neighbour availability: outside-picture and other-slice neighbours (§6.4.4) and —
+    /// with <c>constrained_intra_pred_flag</c> — inter-coded neighbours all report unavailable
+    /// (callers derive them via <see cref="GetIntraMbNeighbourUsability"/>).</summary>
     private static void ComputeChromaPrediction(
-        int mode, int mbx, int mby, int firstChromaRowInSlice, ReadOnlySpan<byte> recon, int reconStride, Span<byte> pred8x8)
+        int mode, int mbx, int mby, bool topUsable, bool leftUsable, bool topLeftUsable,
+        ReadOnlySpan<byte> recon, int reconStride, Span<byte> pred8x8)
     {
         Span<byte> topRow = stackalloc byte[8];
         Span<byte> leftCol = stackalloc byte[8];
-        GatherChromaNeighbors(mbx, mby, firstChromaRowInSlice, recon, reconStride, topRow, leftCol,
+        GatherChromaNeighbors(mbx, mby, topUsable, leftUsable, topLeftUsable, recon, reconStride, topRow, leftCol,
             out var hasTop, out var hasLeft, out var hasTopLeft, out var topLeft);
 
         switch (mode)
@@ -1176,7 +1208,7 @@ internal sealed class H264BaselineSliceEncoder
             {
                 if (!hasLeft)
                 {
-                    ComputeChromaDcPrediction(mbx, mby, firstChromaRowInSlice, recon, reconStride, pred8x8);
+                    ComputeChromaDcPrediction(mbx, mby, hasTop, hasLeft, recon, reconStride, pred8x8);
                     return;
                 }
 
@@ -1197,7 +1229,7 @@ internal sealed class H264BaselineSliceEncoder
             {
                 if (!hasTop)
                 {
-                    ComputeChromaDcPrediction(mbx, mby, firstChromaRowInSlice, recon, reconStride, pred8x8);
+                    ComputeChromaDcPrediction(mbx, mby, hasTop, hasLeft, recon, reconStride, pred8x8);
                     return;
                 }
 
@@ -1217,7 +1249,7 @@ internal sealed class H264BaselineSliceEncoder
             {
                 if (!hasTop || !hasLeft || !hasTopLeft)
                 {
-                    ComputeChromaDcPrediction(mbx, mby, firstChromaRowInSlice, recon, reconStride, pred8x8);
+                    ComputeChromaDcPrediction(mbx, mby, hasTop, hasLeft, recon, reconStride, pred8x8);
                     return;
                 }
 
@@ -1246,7 +1278,7 @@ internal sealed class H264BaselineSliceEncoder
             }
 
             default: // DC (mode 0): per-sub-block DC predictors.
-                ComputeChromaDcPrediction(mbx, mby, firstChromaRowInSlice, recon, reconStride, pred8x8);
+                ComputeChromaDcPrediction(mbx, mby, hasTop, hasLeft, recon, reconStride, pred8x8);
                 return;
         }
     }
@@ -1257,10 +1289,10 @@ internal sealed class H264BaselineSliceEncoder
     /// can consume it like any other mode.
     /// </summary>
     private static void ComputeChromaDcPrediction(
-        int mbx, int mby, int firstChromaRowInSlice, ReadOnlySpan<byte> recon, int reconStride, Span<byte> pred8x8)
+        int mbx, int mby, bool topUsable, bool leftUsable, ReadOnlySpan<byte> recon, int reconStride, Span<byte> pred8x8)
     {
         Span<byte> subBlkPreds = stackalloc byte[4];
-        ComputeChromaDcSubblockPredictions(mbx, mby, firstChromaRowInSlice, recon, reconStride, subBlkPreds);
+        ComputeChromaDcSubblockPredictions(mbx, mby, topUsable, leftUsable, recon, reconStride, subBlkPreds);
         for (var blk = 0; blk < 4; blk++)
         {
             var ox = (blk & 1) * 4;
@@ -1284,12 +1316,12 @@ internal sealed class H264BaselineSliceEncoder
     /// used by <see cref="PrepareChroma8x8"/>.
     /// </summary>
     private static void ComputeChromaDcSubblockPredictions(
-        int mbx, int mby, int firstChromaRowInSlice, ReadOnlySpan<byte> recon, int reconStride, Span<byte> preds)
+        int mbx, int mby, bool topUsable, bool leftUsable, ReadOnlySpan<byte> recon, int reconStride, Span<byte> preds)
     {
         var bx = mbx * 8;
         var by = mby * 8;
-        var hasTop = by > firstChromaRowInSlice;
-        var hasLeft = bx > 0;
+        var hasTop = topUsable;
+        var hasLeft = leftUsable;
 
         Span<int> top = stackalloc int[8];
         Span<int> left = stackalloc int[8];
@@ -1360,13 +1392,10 @@ internal sealed class H264BaselineSliceEncoder
     {
         var bx = mbx * 8;
         var by = mby * 8;
-        // H.264 6.4.4: top chroma row in a prior slice reports unavailable. _firstMbRowInSlice * 8
-        // is the slice's first chroma row; samples above it must not contribute to mode SAD or to
-        // the candidate prediction kernel.
-        var firstChromaRowInSlice = _firstMbRowInSlice * 8;
-        var hasTop = by > firstChromaRowInSlice;
-        var hasLeft = bx > 0;
-        var hasTopLeft = hasTop && hasLeft;
+        // §8.3.4 neighbour availability: §6.4.4 (picture / slice edges) plus the
+        // constrained_intra_pred_flag inter-neighbour exclusion, both via the shared helper so mode
+        // selection and the emitted prediction agree with the decoder.
+        GetIntraMbNeighbourUsability(mbx, mby, out var hasTop, out var hasLeft, out var hasTopLeft);
 
         Span<byte> predU = stackalloc byte[64];
         Span<byte> predV = stackalloc byte[64];
@@ -1389,8 +1418,8 @@ internal sealed class H264BaselineSliceEncoder
                 case 3 when !hasTopLeft: continue;
             }
 
-            ComputeChromaPrediction(mode, mbx, mby, firstChromaRowInSlice, recU, reconStride, predU);
-            ComputeChromaPrediction(mode, mbx, mby, firstChromaRowInSlice, recV, reconStride, predV);
+            ComputeChromaPrediction(mode, mbx, mby, hasTop, hasLeft, hasTopLeft, recU, reconStride, predU);
+            ComputeChromaPrediction(mode, mbx, mby, hasTop, hasLeft, hasTopLeft, recV, reconStride, predV);
 
             var sad = _kernels.SadChromaPair(srcUBlk, srcVBlk, predU, predV);
 
@@ -1769,6 +1798,14 @@ internal sealed class H264BaselineSliceEncoder
         var chromaMbX = mbX / 2;
         var chromaMbY = mbY / 2;
 
+        // Gradual intra refresh: an MB whose right luma edge lies inside the frame's join-guarantee
+        // bound must keep every inter prediction inside the guaranteed region of the reference it
+        // uses (IsMvRefreshSafeForBlock), or corruption a joining decoder starts with leaks back
+        // across the wave boundary and the refresh never converges. False on every frame of a
+        // non-refresh stream (RefreshConstraintsActive), so the checks below stay off the hot path.
+        var refreshGuardActive = _shared.RefreshConstraintsActive
+            && mbX + 15 < _shared.CurrentFrameGuaranteedUptoX;
+
         Span<byte> predY = stackalloc byte[256];
         Span<byte> predU = stackalloc byte[64];
         Span<byte> predV = stackalloc byte[64];
@@ -1802,7 +1839,9 @@ internal sealed class H264BaselineSliceEncoder
         var phase1Outcome = H264PInterDiagnostics.Phase1Outcome.MvUnsafe;
         var phase1PredBuilt = false;
         if (H264InterReconstructor.IsMvSafeForInter16x16AtMb(
-                _width, _height, mbX, mbY, mvSkipPred.X, mvSkipPred.Y, HaloLuma, HaloChroma))
+                _width, _height, mbX, mbY, mvSkipPred.X, mvSkipPred.Y, HaloLuma, HaloChroma)
+            && (!refreshGuardActive
+                || IsMvRefreshSafeForBlock(mbX, 16, mvSkipPred.X, _shared.DpbGuaranteedUptoX[0])))
         {
             phase1PredBuilt = true;
             H264InterReconstructor.ReconstructLuma(
@@ -2171,6 +2210,65 @@ internal sealed class H264BaselineSliceEncoder
                 $"sliceSeq={_sliceSeq} phase2 fallback-safe16x16 mv=({safe.BestMv.X},{safe.BestMv.Y}) sad={safe.BestSad}");
         }
 
+        // Gradual intra refresh: validate the search outcome against the used reference's
+        // join-guarantee bound. On violation, re-search 16×16 against ref 0 with the window aimed
+        // left of the bound; when even that cannot produce a safe vector (the admissible window
+        // narrows to nothing right at the wave front), hand the MB to the P-slice intra path —
+        // always safe under constrained_intra_pred_flag. Deterministic: depends only on committed
+        // MB state and the frame-counted wave position.
+        if (refreshGuardActive && !ArePartitionMvsRefreshSafe(partResult, mbX, _shared.DpbGuaranteedUptoX[winRefIdx]))
+        {
+            const int RestrictedRange = 8;
+            var guaranteed0 = _shared.DpbGuaranteedUptoX[0];
+            var maxSafeCenterX = 4 * (MaxRefreshSafeMvIntX(mbX, guaranteed0) - RestrictedRange);
+            var restrictedPred = new H264MotionEstimator.Mv(
+                (short)Math.Clamp(Math.Min((int)mvPredictor.X, maxSafeCenterX), short.MinValue, short.MaxValue),
+                mvPredictor.Y);
+            var restricted = H264MotionEstimator.SearchMb16x16(
+                current, strideY,
+                _paddedRefY, _paddedStrideY,
+                mbX + HaloLuma, mbY + HaloLuma,
+                restrictedPred,
+                RestrictedRange,
+                _useMotionSatd,
+                _kernels,
+                pictureWidth: _width,
+                pictureHeight: _height,
+                fractionalPelRefinementRounds: 2,
+                lambda: lambdaThisMb);
+            var restrictedSafe =
+                IsMvRefreshSafeForBlock(mbX, 16, restricted.BestMv.X, guaranteed0)
+                && H264InterReconstructor.IsMvSafeForInter16x16AtMb(
+                    _width, _height, mbX, mbY, restricted.BestMv.X, restricted.BestMv.Y, HaloLuma, HaloChroma);
+            if (!restrictedSafe)
+            {
+                H264PInterDiagnostics.TraceMbDecision(
+                    _currentFrameNum, _currentCodedFrameIndex, mbx, mby,
+                    $"sliceSeq={_sliceSeq} phase2 refresh-guard: no safe inter MV, intra fallback");
+                return false;
+            }
+
+            partResult = new H264MotionEstimator.PartitionResult(
+                H264MotionEstimator.McPartition.Mb16x16,
+                restricted.BestMv,
+                default,
+                default,
+                default,
+                restricted.BestSad);
+            winRefIdx = 0;
+            GatherInterNeighbourMvs(mbx, mby,
+                out mvA, out aAvail, out aRefIdx,
+                out mvB, out bAvail, out bRefIdx,
+                out var mvC3, out var cAvail3, out var cRefIdx3,
+                out var mvD3, out var dAvail3, out var dRefIdx3);
+            mvPredictor = H264MotionEstimator.PredictMvWithRefIdx(
+                mvA, aRefIdx, mvB, bRefIdx, mvC3, cRefIdx3, mvD3, dRefIdx3, currentRefIdx: 0,
+                aAbsent, bAbsent, cAbsent, dAbsent);
+            H264PInterDiagnostics.TraceMbDecision(
+                _currentFrameNum, _currentCodedFrameIndex, mbx, mby,
+                $"sliceSeq={_sliceSeq} phase2 refresh-guard fallback mv=({restricted.BestMv.X},{restricted.BestMv.Y}) sad={restricted.BestSad}");
+        }
+
         if (collectPhase2Timing)
             phase2MeTicks = Stopwatch.GetTimestamp() - phase2MeStartTicks;
 
@@ -2210,9 +2308,9 @@ internal sealed class H264BaselineSliceEncoder
             Span<byte> i16Left = stackalloc byte[16];
             // H.264 6.4.4: top neighbour MB belongs to the prior slice when mby == _firstMbRowInSlice;
             // decoder treats it as unavailable. Match it so encoder/decoder pick the same I_16×16 mode.
-            var i16TopAvail = mby > _firstMbRowInSlice;
-            var i16LeftAvail = mbx > 0;
-            var i16TopLeftAvail = i16TopAvail && i16LeftAvail;
+            // §8.3.2 with constrained_intra_pred_flag additionally excludes inter-coded neighbours —
+            // in a P slice that is most of them — which the shared usability helper folds in.
+            GetIntraMbNeighbourUsability(mbx, mby, out var i16TopAvail, out var i16LeftAvail, out var i16TopLeftAvail);
             byte i16TopLeft = 0;
 
             if (i16TopAvail)
@@ -2657,10 +2755,11 @@ internal sealed class H264BaselineSliceEncoder
 
         // ── Chroma ─────────────────────────────────────────────────────────────
         var chromaMode = ChooseChromaIntraMode(mbx, mby, srcU, srcV, strideUv, _recU.AsSpan(), _recV.AsSpan(), uvW, qpThisMb);
+        GetIntraMbNeighbourUsability(mbx, mby, out var chromaTop, out var chromaLeft, out var chromaTopLeft);
         Span<byte> chromaPredU = stackalloc byte[64];
         Span<byte> chromaPredV = stackalloc byte[64];
-        ComputeChromaPrediction(chromaMode, mbx, mby, _firstMbRowInSlice * 8, _recU.AsSpan(), uvW, chromaPredU);
-        ComputeChromaPrediction(chromaMode, mbx, mby, _firstMbRowInSlice * 8, _recV.AsSpan(), uvW, chromaPredV);
+        ComputeChromaPrediction(chromaMode, mbx, mby, chromaTop, chromaLeft, chromaTopLeft, _recU.AsSpan(), uvW, chromaPredU);
+        ComputeChromaPrediction(chromaMode, mbx, mby, chromaTop, chromaLeft, chromaTopLeft, _recV.AsSpan(), uvW, chromaPredV);
 
         Span<short> chromaDcU = stackalloc short[4];
         Span<short> chromaDcV = stackalloc short[4];
@@ -2843,6 +2942,77 @@ internal sealed class H264BaselineSliceEncoder
                 IsSafe(_width, _height, mbX + 8, mbY + 8, 8, 8, part.Mv3),
         };
     }
+
+    /// <summary>
+    /// Gradual intra refresh: whether an inter prediction for a luma block at unpadded x
+    /// <paramref name="blockX"/> of width <paramref name="blockW"/> with quarter-pel horizontal MV
+    /// <paramref name="mvXQpel"/> reads only the join-guaranteed region of a reference whose
+    /// guarantee bound is <paramref name="guaranteedUptoX"/> (see
+    /// <see cref="H264FrameSharedState.DpbGuaranteedUptoX"/>). Luma reads extend 3 samples past the
+    /// block for the §8.4.2.2.1 six-tap interpolator whenever the MV has a fractional part; chroma
+    /// (half resolution, §8.4.2.2.2 bilinear) reads 1 sample past, and its guarantee bound is one
+    /// chroma column tighter than half the luma bound because the §8.7.2.4 chroma filter mixes one
+    /// sample across the wave's leading edge. Only the horizontal axis is constrained: the refresh
+    /// band spans full picture height, so the guarantee region is a left-anchored pixel column set.
+    /// </summary>
+    private static bool IsMvRefreshSafeForBlock(int blockX, int blockW, int mvXQpel, int guaranteedUptoX)
+    {
+        if (guaranteedUptoX == H264FrameSharedState.GuaranteedFullPicture)
+        {
+            return true;
+        }
+
+        var lumaLastRead = blockX + blockW - 1 + (mvXQpel >> 2) + ((mvXQpel & 3) != 0 ? 3 : 0);
+        if (lumaLastRead >= guaranteedUptoX)
+        {
+            return false;
+        }
+
+        var chromaLastRead = (blockX >> 1) + (blockW >> 1) - 1 + (mvXQpel >> 3) + ((mvXQpel & 7) != 0 ? 1 : 0);
+        return chromaLastRead < (guaranteedUptoX >> 1) - 1;
+    }
+
+    /// <summary>
+    /// Gradual intra refresh: <see cref="IsMvRefreshSafeForBlock"/> over every active partition of
+    /// an inter macroblock decision (the horizontal-axis analogue of
+    /// <see cref="AreActivePartitionMvsChromaSafe"/>).
+    /// </summary>
+    private static bool ArePartitionMvsRefreshSafe(
+        H264MotionEstimator.PartitionResult part, int mbX, int guaranteedUptoX)
+    {
+        if (guaranteedUptoX == H264FrameSharedState.GuaranteedFullPicture)
+        {
+            return true;
+        }
+
+        return part.Partition switch
+        {
+            H264MotionEstimator.McPartition.Mb16x16 =>
+                IsMvRefreshSafeForBlock(mbX, 16, part.Mv0.X, guaranteedUptoX),
+            H264MotionEstimator.McPartition.Mb16x8 =>
+                IsMvRefreshSafeForBlock(mbX, 16, part.Mv0.X, guaranteedUptoX) &&
+                IsMvRefreshSafeForBlock(mbX, 16, part.Mv1.X, guaranteedUptoX),
+            H264MotionEstimator.McPartition.Mb8x16 =>
+                IsMvRefreshSafeForBlock(mbX, 8, part.Mv0.X, guaranteedUptoX) &&
+                IsMvRefreshSafeForBlock(mbX + 8, 8, part.Mv1.X, guaranteedUptoX),
+            _ =>
+                IsMvRefreshSafeForBlock(mbX, 8, part.Mv0.X, guaranteedUptoX) &&
+                IsMvRefreshSafeForBlock(mbX + 8, 8, part.Mv1.X, guaranteedUptoX) &&
+                IsMvRefreshSafeForBlock(mbX, 8, part.Mv2.X, guaranteedUptoX) &&
+                IsMvRefreshSafeForBlock(mbX + 8, 8, part.Mv3.X, guaranteedUptoX),
+        };
+    }
+
+    /// <summary>
+    /// Gradual intra refresh: largest integer-pel horizontal MV component certain to satisfy
+    /// <see cref="IsMvRefreshSafeForBlock"/> for a 16-wide macroblock at <paramref name="mbX"/>
+    /// against guarantee bound <paramref name="guaranteedUptoX"/>, with the fractional-MV margins
+    /// assumed at their worst (luma +3, plus the chroma rounding slack) so quarter-pel refinement
+    /// around it stays safe. Used to aim the restricted fallback search window; final decisions are
+    /// still validated exactly, so a conservative value here costs quality only, never correctness.
+    /// </summary>
+    private static int MaxRefreshSafeMvIntX(int mbX, int guaranteedUptoX) =>
+        guaranteedUptoX - mbX - 21;
 
     private static int ComputeLumaPredictionSse(ReadOnlySpan<byte> src, ReadOnlySpan<byte> pred)
     {
@@ -3354,7 +3524,7 @@ internal sealed class H264BaselineSliceEncoder
 
         Span<sbyte> modeCtx = stackalloc sbyte[LumaCtxSlots];
         FillIntra4x4ModeContext(mbIndex, modeCtx);
-        GetIntraNeighbourMbAvailability(mbx, mby, out var leftMbAvailable, out var aboveMbAvailable);
+        GetIntraNeighbourMbAvailability(mbx, mby, out var leftMbAvailable, out var aboveMbAvailable, out var aboveLeftMbAvailable);
 
         if (!isPslice)
         {
@@ -3442,7 +3612,7 @@ internal sealed class H264BaselineSliceEncoder
                     // Variance fast-path: flat blocks only evaluate DC(2), V(0), H(1).
                     if (isFlat1 && cand > 2)
                         continue;
-                    if (!IsIntra4x4ModeAllowed(cand, br, bc, leftMbAvailable, aboveMbAvailable))
+                    if (!IsIntra4x4ModeAllowed(cand, br, bc, leftMbAvailable, aboveMbAvailable, aboveLeftMbAvailable))
                         continue;
                     _kernels.Predict4x4(cand, topRow1, leftCol1, topAvail1, leftAvail1, candPredsBuf1.Slice(numValid1 * 16, 16));
                     candModes1[numValid1] = cand;
@@ -3574,7 +3744,7 @@ internal sealed class H264BaselineSliceEncoder
                 modeCtx[slot2] = (sbyte)bestMode;
             }
 
-            if (!AreIntra4x4ModesDecodable(modeCtx, leftMbAvailable, aboveMbAvailable))
+            if (!AreIntra4x4ModesDecodable(modeCtx, leftMbAvailable, aboveMbAvailable, aboveLeftMbAvailable))
                 throw new InvalidOperationException(
                     "Selected Intra_4x4 prediction modes read neighbouring samples that are unavailable (H.264 8.3.1.2).");
 
@@ -3583,10 +3753,11 @@ internal sealed class H264BaselineSliceEncoder
             var chosenChromaModeI = ChooseChromaIntraMode(mbx, mby, u, v, strideUv, _recU.AsSpan(), _recV.AsSpan(), uvW, qpThisMb);
             bs.WriteUe((uint)chosenChromaModeI);
 
+            GetIntraMbNeighbourUsability(mbx, mby, out var chromaTopI, out var chromaLeftI, out var chromaTopLeftI);
             Span<byte> chromaPredUI = stackalloc byte[64];
             Span<byte> chromaPredVI = stackalloc byte[64];
-            ComputeChromaPrediction(chosenChromaModeI, mbx, mby, _firstMbRowInSlice * 8, _recU.AsSpan(), uvW, chromaPredUI);
-            ComputeChromaPrediction(chosenChromaModeI, mbx, mby, _firstMbRowInSlice * 8, _recV.AsSpan(), uvW, chromaPredVI);
+            ComputeChromaPrediction(chosenChromaModeI, mbx, mby, chromaTopI, chromaLeftI, chromaTopLeftI, _recU.AsSpan(), uvW, chromaPredUI);
+            ComputeChromaPrediction(chosenChromaModeI, mbx, mby, chromaTopI, chromaLeftI, chromaTopLeftI, _recV.AsSpan(), uvW, chromaPredVI);
 
             Span<short> chromaDcUI = stackalloc short[4];
             Span<short> chromaDcVI = stackalloc short[4];
@@ -3714,7 +3885,7 @@ internal sealed class H264BaselineSliceEncoder
                 // Variance fast-path: flat blocks only evaluate DC(2), V(0), H(1).
                 if (isFlat && cand > 2)
                     continue;
-                if (!IsIntra4x4ModeAllowed(cand, br, bc, leftMbAvailable, aboveMbAvailable))
+                if (!IsIntra4x4ModeAllowed(cand, br, bc, leftMbAvailable, aboveMbAvailable, aboveLeftMbAvailable))
                 {
                     continue;
                 }
@@ -3808,7 +3979,7 @@ internal sealed class H264BaselineSliceEncoder
             modeCtx[slot] = (sbyte)bestMode;
         }
 
-        if (!AreIntra4x4ModesDecodable(modeCtx, leftMbAvailable, aboveMbAvailable))
+        if (!AreIntra4x4ModesDecodable(modeCtx, leftMbAvailable, aboveMbAvailable, aboveLeftMbAvailable))
         {
             throw new InvalidOperationException(
                 "Selected Intra_4x4 prediction modes read neighbouring samples that are unavailable (H.264 8.3.1.2).");
@@ -3821,10 +3992,11 @@ internal sealed class H264BaselineSliceEncoder
         var chosenChromaMode = ChooseChromaIntraMode(mbx, mby, u, v, strideUv, _recU.AsSpan(), _recV.AsSpan(), uvW, qpThisMb);
         bs.WriteUe((uint)chosenChromaMode);
 
+        GetIntraMbNeighbourUsability(mbx, mby, out var chromaTop, out var chromaLeft, out var chromaTopLeft);
         Span<byte> chromaPredU = stackalloc byte[64];
         Span<byte> chromaPredV = stackalloc byte[64];
-        ComputeChromaPrediction(chosenChromaMode, mbx, mby, _firstMbRowInSlice * 8, _recU.AsSpan(), uvW, chromaPredU);
-        ComputeChromaPrediction(chosenChromaMode, mbx, mby, _firstMbRowInSlice * 8, _recV.AsSpan(), uvW, chromaPredV);
+        ComputeChromaPrediction(chosenChromaMode, mbx, mby, chromaTop, chromaLeft, chromaTopLeft, _recU.AsSpan(), uvW, chromaPredU);
+        ComputeChromaPrediction(chosenChromaMode, mbx, mby, chromaTop, chromaLeft, chromaTopLeft, _recV.AsSpan(), uvW, chromaPredV);
 
         Span<short> chromaDcU = stackalloc short[4];
         Span<short> chromaDcV = stackalloc short[4];
@@ -3984,7 +4156,7 @@ internal sealed class H264BaselineSliceEncoder
     /// </summary>
     private int EstimateMbI4x4SatdFromSource(ReadOnlySpan<byte> srcY, int strideY, int mbx, int mby)
     {
-        GetIntraNeighbourMbAvailability(mbx, mby, out var leftMbAvailable, out var aboveMbAvailable);
+        GetIntraNeighbourMbAvailability(mbx, mby, out var leftMbAvailable, out var aboveMbAvailable, out var aboveLeftMbAvailable);
 
         Span<byte> srcBlk = stackalloc byte[16];
         Span<byte> topRow = stackalloc byte[9];
@@ -4034,7 +4206,7 @@ internal sealed class H264BaselineSliceEncoder
             var numValid = 0;
             for (var cand = 0; cand <= 8; cand++)
             {
-                if (!IsIntra4x4ModeAllowed(cand, br, bc, leftMbAvailable, aboveMbAvailable))
+                if (!IsIntra4x4ModeAllowed(cand, br, bc, leftMbAvailable, aboveMbAvailable, aboveLeftMbAvailable))
                     continue;
                 _kernels.Predict4x4(cand, topRow, leftCol, topAvail, leftAvail, preds.Slice(numValid * 16, 16));
                 numValid++;
@@ -4072,8 +4244,14 @@ internal sealed class H264BaselineSliceEncoder
         // Slice boundary (H.264 6.4.4): blocks whose top row lives in the prior slice are unavailable.
         // _firstMbRowInSlice * 16 is the y-coordinate of the slice's first luma row. For br==0 of an
         // MB at row _firstMbRowInSlice, gy hits that line exactly and topAvail must be false.
-        topAvail = gy > _firstMbRowInSlice * 16;
-        leftAvail = gx > 0;
+        // constrained_intra_pred_flag (§8.3.1.2): the top row of a br==0 block and the left column of
+        // a bc==0 block come from the above / left macroblock, which is additionally unavailable when
+        // it is inter-coded and the flag is set; interior blocks read the current (intra) macroblock.
+        var mbIndex = mby * _mbW + mbx;
+        topAvail = gy > _firstMbRowInSlice * 16
+            && (br > 0 || IsIntraPredNeighbourUsable(mbIndex - _mbW));
+        leftAvail = gx > 0
+            && (bc > 0 || IsIntraPredNeighbourUsable(mbIndex - 1));
         if (topAvail)
         {
             for (var c = 0; c < 4; c++)
@@ -4081,7 +4259,14 @@ internal sealed class H264BaselineSliceEncoder
                 topRow[1 + c] = _recY[(gy - 1) * _width + gx + c];
             }
 
-            topRow[0] = leftAvail
+            // p[−1,−1]: for block (0,0) it lives in the above-left macroblock, which under
+            // constrained_intra_pred can be inter (unavailable) while above and left are intra;
+            // substitute p[0,−1] there — the corner-reading modes 4/5/6 are excluded from the
+            // candidate set by IsIntra4x4ModeAllowed in that case, so the value never reaches a
+            // signalled prediction.
+            var cornerUsable = leftAvail
+                && (br > 0 || bc > 0 || IsIntraPredNeighbourUsable(mbIndex - _mbW - 1));
+            topRow[0] = cornerUsable
                 ? _recY[(gy - 1) * _width + gx - 1]
                 : topRow[1];
         }
@@ -4136,8 +4321,11 @@ internal sealed class H264BaselineSliceEncoder
         {
             // Top-right falls in the column to the right of the current MB.
             // Slice boundary (H.264 6.4.4): if (mby == _firstMbRowInSlice) the prior MB row is in
-            // the prior slice and reports as unavailable.
-            return br == 0 && mby > _firstMbRowInSlice && mbx + 1 < _mbW;
+            // the prior slice and reports as unavailable. constrained_intra_pred additionally makes
+            // an inter above-right macroblock unavailable (§8.3.1.2); §8.3.1.2.1 then substitutes
+            // p[3,−1], exactly like the structural not-yet-reconstructed case below.
+            return br == 0 && mby > _firstMbRowInSlice && mbx + 1 < _mbW
+                && IsIntraPredNeighbourUsable((mby - 1) * _mbW + mbx + 1);
         }
 
         if (br == 0)
@@ -4194,10 +4382,47 @@ internal sealed class H264BaselineSliceEncoder
     /// macroblock of a slice's first macroblock row is therefore unavailable even mid-picture, which is
     /// what keeps a multi-slice bitstream decodable.
     /// </summary>
-    private void GetIntraNeighbourMbAvailability(int mbx, int mby, out bool leftMbAvailable, out bool aboveMbAvailable)
+    private void GetIntraNeighbourMbAvailability(
+        int mbx, int mby, out bool leftMbAvailable, out bool aboveMbAvailable, out bool aboveLeftMbAvailable)
     {
-        leftMbAvailable = IsLeftMbAvailable(mbx);
-        aboveMbAvailable = IsAboveMbAvailable(mby, _firstMbRowInSlice);
+        var mbIndex = mby * _mbW + mbx;
+        leftMbAvailable = IsLeftMbAvailable(mbx) && IsIntraPredNeighbourUsable(mbIndex - 1);
+        aboveMbAvailable = IsAboveMbAvailable(mby, _firstMbRowInSlice) && IsIntraPredNeighbourUsable(mbIndex - _mbW);
+        // The above-left macroblock supplies only p[−1,−1] of block (0,0) (§8.3.1.2). Without
+        // constrained_intra_pred it exists whenever both direct neighbours do; with the flag it can
+        // be inter (unavailable) while left and above are intra, so it is derived independently.
+        aboveLeftMbAvailable = IsLeftMbAvailable(mbx) && IsAboveMbAvailable(mby, _firstMbRowInSlice)
+            && IsIntraPredNeighbourUsable(mbIndex - _mbW - 1);
+    }
+
+    /// <summary>
+    /// Whether a neighbouring macroblock that exists (in the picture and in this slice) may supply
+    /// samples to intra prediction. With <c>constrained_intra_pred_flag</c> equal to 0 every
+    /// existing neighbour may; with the flag equal to 1 a neighbour coded in an Inter macroblock
+    /// prediction mode is treated as not available for intra prediction (§8.3.1.2, §8.3.2, §8.3.4),
+    /// so intra macroblocks never inherit inter-predicted content — the isolation gradual intra
+    /// refresh depends on. Only call with the index of a macroblock already coded in this frame.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool IsIntraPredNeighbourUsable(int neighbourMbIdx) =>
+        !_constrainedIntraPred || !_mbIsInter[neighbourMbIdx];
+
+    /// <summary>
+    /// Macroblock-level neighbour availability for the whole-MB intra prediction processes —
+    /// Intra_16×16 luma (§8.3.2) and chroma (§8.3.4) — combining §6.4.4 (outside picture / other
+    /// slice ⇒ unavailable) with the <c>constrained_intra_pred_flag</c> rule of
+    /// <see cref="IsIntraPredNeighbourUsable"/>. <paramref name="topLeft"/> is the above-left
+    /// neighbour, needed by the Plane modes' p[−1,−1] sample: unlike the unconstrained case it is
+    /// not implied by top+left, because the above-left macroblock may be inter while both direct
+    /// neighbours are intra.
+    /// </summary>
+    private void GetIntraMbNeighbourUsability(int mbx, int mby, out bool top, out bool left, out bool topLeft)
+    {
+        var mbIndex = mby * _mbW + mbx;
+        top = IsAboveMbAvailable(mby, _firstMbRowInSlice) && IsIntraPredNeighbourUsable(mbIndex - _mbW);
+        left = IsLeftMbAvailable(mbx) && IsIntraPredNeighbourUsable(mbIndex - 1);
+        topLeft = IsAboveMbAvailable(mby, _firstMbRowInSlice) && IsLeftMbAvailable(mbx)
+            && IsIntraPredNeighbourUsable(mbIndex - _mbW - 1);
     }
 
     /// <summary>
@@ -4245,7 +4470,7 @@ internal sealed class H264BaselineSliceEncoder
     /// mode the encoder picks, never whether a decoder can follow it.
     /// </para>
     /// </remarks>
-    internal static bool IsIntra4x4ModeAllowed(int mode, int row, int col, bool leftMbAvailable, bool aboveMbAvailable)
+    internal static bool IsIntra4x4ModeAllowed(int mode, int row, int col, bool leftMbAvailable, bool aboveMbAvailable, bool aboveLeftMbAvailable = true)
     {
         var needs = Intra4x4ModeSampleNeeds[mode];
         var leftSamplesAvailable = col > 0 || leftMbAvailable;
@@ -4257,6 +4482,16 @@ internal sealed class H264BaselineSliceEncoder
         }
 
         if ((needs & NeedsAboveSamples) != 0 && !aboveSamplesAvailable)
+        {
+            return false;
+        }
+
+        // Modes 4/5/6 additionally read the corner sample p[−1,−1] (§8.3.1.2), which for block
+        // (0,0) lives in the above-left macroblock. Without constrained_intra_pred that macroblock
+        // exists whenever both direct neighbours do, so the default true changes nothing; with the
+        // flag it can be inter (unavailable) while left and above are intra, and the corner-reading
+        // modes must then be excluded.
+        if (needs == (NeedsLeftSamples | NeedsAboveSamples) && row == 0 && col == 0 && !aboveLeftMbAvailable)
         {
             return false;
         }
@@ -4295,7 +4530,7 @@ internal sealed class H264BaselineSliceEncoder
     /// mode actually signalled disagree, which would desynchronise the decoder, so callers treat it as
     /// fatal.
     /// </summary>
-    private static bool AreIntra4x4ModesDecodable(ReadOnlySpan<sbyte> modeCtx, bool leftMbAvailable, bool aboveMbAvailable)
+    private static bool AreIntra4x4ModesDecodable(ReadOnlySpan<sbyte> modeCtx, bool leftMbAvailable, bool aboveMbAvailable, bool aboveLeftMbAvailable = true)
     {
         for (var row = 0; row < 4; row++)
         {
@@ -4314,6 +4549,12 @@ internal sealed class H264BaselineSliceEncoder
                 }
 
                 if ((needs & NeedsAboveSamples) != 0 && row == 0 && !aboveMbAvailable)
+                {
+                    return false;
+                }
+
+                // Corner-reading modes at block (0,0) — see IsIntra4x4ModeAllowed.
+                if (needs == (NeedsLeftSamples | NeedsAboveSamples) && row == 0 && col == 0 && !aboveLeftMbAvailable)
                 {
                     return false;
                 }
@@ -4442,10 +4683,15 @@ internal sealed class H264BaselineSliceEncoder
     /// </summary>
     private void FillIntra4x4ModeContext(int mbIndex, Span<sbyte> modeCtx)
     {
-        var leftMbAvailable = mbIndex % _mbW > 0;
-        var aboveMbAvailable = mbIndex / _mbW > _firstMbRowInSlice;
+        // §8.3.1.1 dcPredModePredictedFlag: with constrained_intra_pred_flag equal to 1 an
+        // inter-coded neighbour is treated as *unavailable* for the most-probable-mode derivation
+        // (forcing DC), not as a present neighbour contributing DC — the two differ whenever the
+        // other neighbour's mode is Vertical (0) or Horizontal (1), since Min(2, mode) < 2 while
+        // Min(2, 2) is 2. The flag-off path keeps the historical present-contributes-DC seeding.
         var leftIdx = mbIndex - 1;
         var aboveIdx = mbIndex - _mbW;
+        var leftMbAvailable = mbIndex % _mbW > 0 && IsIntraPredNeighbourUsable(leftIdx);
+        var aboveMbAvailable = mbIndex / _mbW > _firstMbRowInSlice && IsIntraPredNeighbourUsable(aboveIdx);
 
         FillIntra4x4ModeContext(
             modeCtx,
