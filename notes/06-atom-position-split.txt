@@ -63,3 +63,31 @@ Implication: the atlas 8%-hit story was a conflation. Real targets, in order of 
 # transform-domain SATD; the hex 16x16 path scores from pixels with SAD-LB + bounded SATD
 # (exactly the measured atlasOff configuration). Post-removal: byte-identical stream,
 # 2207 tests green, default-s4 13.49 ms / default-s1 26.03 ms.
+
+# Negative result: SAD-ordered fractional refinement (tried, reverted)
+# Two-pass RefineFrac (gather qpel SADs, apply bounded SATD in ascending-SAD order) is
+# provably bitstream-identical (verified byte-identical) but saved NOTHING:
+#   fracSatdAtomComputes 12,356,473 -> 12,355,555 (-0.007%), wall unchanged.
+# The seed's integer-search score already provides a tight stopAfter before any frac
+# candidate is scored, so evaluation order is irrelevant; the surviving atoms are
+# bounded-SATD partials that bail the same way in any order. Reverted.
+
+# Evaluated, NOT landed: SubPartitionRangeCap (approximate "fewer candidates" knob)
+# Probe modes `rangecap` / `rangecap-div`; dump+ffmpeg PSNR at QP 24/28/32, 64 frames 1080p s=4.
+# Timing (interleaved):
+#   scroll content:   default 13.81   rc8 11.03 (-20%)   rc4 9.61 (-30%)  ms/frame
+#   divergent content: div 91.78(!)   rc8div 59.03 (-36%) rc4div 45.79 (-50%)
+# Quality, scroll (coherent motion -- cap never binds):
+#   QP24  Y-PSNR 40.605/40.594/40.595  bits 73.7/73.6/73.4 kbit/f  -> neutral (+-0.01 dB)
+#   QP28  38.686/38.676/38.692        47.9/47.8/47.9              -> neutral
+#   QP32  38.519/38.532/38.529        33.3/33.4/33.5              -> neutral
+# Quality, divergent (top/bottom halves scroll opposite at 6 px/f + counter-moving squares):
+#   QP24  40.680/40.508/40.402  bits 126.7/143.8/145.6  -> rc8 -0.17 dB AND +13.5% bits
+#   QP28  39.688/39.686/39.539        82.8/ 81.7/ 87.8  -> rc8 neutral, rc4 -0.15 dB +6%
+#   QP32  38.584/38.499/38.441        68.8/ 73.3/ 78.3  -> rc8 -0.09 dB +6.5%
+# Verdict: keep default 16. rc8 is a legitimate user-facing speed knob (-20%) that is free on
+# coherent motion but costs up to -0.2 dB AND +14% bits where per-quadrant motion diverges --
+# which is precisely the content the sub-partition search exists for.
+# SIDE-FINDING: divergent content runs 92 ms/frame at default settings, 6.7x the scroll
+# benchmark. Worst-case ME cost, not average, is the real-time risk; the per-slice
+# sub-partition budget (Min(4, cap) fallback) does not contain it.
