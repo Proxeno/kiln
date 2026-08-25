@@ -1756,9 +1756,19 @@ internal sealed class H264BaselineSliceEncoder
         // collapsing real motion into skip (which has SAD an order of magnitude larger).
         // Median / skip MV can be out of range for chroma bilinear on this MB while neighbour MVs
         // were valid for their positions — skip phase 1 when padded ref access would overrun.
+        var collectPhase1Timing = H264PInterDiagnostics.CollectPhase1Timing;
+        var phase1StartTicks = collectPhase1Timing ? Stopwatch.GetTimestamp() : 0;
+        var phase1LapTicks = phase1StartTicks;
+        var phase1PredLumaTicks = 0L;
+        var phase1PredChromaTicks = 0L;
+        var phase1SadTicks = 0L;
+        var phase1SseTicks = 0L;
+        var phase1Outcome = H264PInterDiagnostics.Phase1Outcome.MvUnsafe;
+        var phase1PredBuilt = false;
         if (H264InterReconstructor.IsMvSafeForInter16x16AtMb(
                 _width, _height, mbX, mbY, mvSkipPred.X, mvSkipPred.Y, HaloLuma, HaloChroma))
         {
+            phase1PredBuilt = true;
             H264InterReconstructor.ReconstructLuma(
                 _paddedRefY, _paddedStrideY, HaloLuma,
                 mbX, mbY,
@@ -1766,6 +1776,12 @@ internal sealed class H264BaselineSliceEncoder
                 16, 16,
                 predY, 16,
                 _kernels);
+            if (collectPhase1Timing)
+            {
+                var now = Stopwatch.GetTimestamp();
+                phase1PredLumaTicks = now - phase1LapTicks;
+                phase1LapTicks = now;
+            }
             H264InterReconstructor.ReconstructChroma(
                 _paddedRefU, _paddedStrideUv, HaloChroma,
                 chromaMbX, chromaMbY,
@@ -1780,10 +1796,23 @@ internal sealed class H264BaselineSliceEncoder
                 8, 8,
                 predV, 8,
                 _kernels);
+            if (collectPhase1Timing)
+            {
+                var now = Stopwatch.GetTimestamp();
+                phase1PredChromaTicks = now - phase1LapTicks;
+                phase1LapTicks = now;
+            }
 
             sadSkip = _kernels.Sad16x16(srcY.Slice(mbY * strideY + mbX), strideY, predY, 16)
                     + _kernels.Sad8x8(srcU.Slice(chromaMbY * strideUv + chromaMbX), strideUv, predU, 8)
                     + _kernels.Sad8x8(srcV.Slice(chromaMbY * strideUv + chromaMbX), strideUv, predV, 8);
+            if (collectPhase1Timing)
+            {
+                var now = Stopwatch.GetTimestamp();
+                phase1SadTicks = now - phase1LapTicks;
+                phase1LapTicks = now;
+            }
+            phase1Outcome = H264PInterDiagnostics.Phase1Outcome.SadReject;
             // Total SAD (luma+chroma MB): tight enough that obvious translation is not mistaken for
             // P_Skip (diagonal motion regression), but high enough that QP/deblock noise on flat chroma
             // does not force Phase-2-only paths on identical-frame P-slices.
@@ -1812,6 +1841,11 @@ internal sealed class H264BaselineSliceEncoder
                 // made those skips reachable.
                 var skipSseThreshold = Math.Min(8192, Math.Max(768, 8192 * LambdaSatdForQp(qpThisMb) / LambdaSatdForQp(28)));
                 var skipSse = ComputeInterPredictionSse(srcY, strideY, srcU, srcV, strideUv, mbX, mbY, predY, predU, predV);
+                if (collectPhase1Timing)
+                {
+                    phase1SseTicks = Stopwatch.GetTimestamp() - phase1LapTicks;
+                }
+                phase1Outcome = H264PInterDiagnostics.Phase1Outcome.SseReject;
                 if (skipSse <= skipSseThreshold)
                 {
                 H264PInterDiagnostics.TraceMbDecision(
@@ -1829,11 +1863,27 @@ internal sealed class H264BaselineSliceEncoder
                 // _nonZeros / _chromaNonZeros are zero (Array.Clear at slice start covers this).
                 pendingSkipRun++;
                 H264PInterDiagnostics.NotifyPhase1Skip();
+                if (collectPhase1Timing)
+                {
+                    H264PInterDiagnostics.NotifyPhase1Timing(
+                        Stopwatch.GetTimestamp() - phase1StartTicks,
+                        phase1PredLumaTicks, phase1PredChromaTicks, phase1SadTicks, phase1SseTicks,
+                        H264PInterDiagnostics.Phase1Outcome.Accept,
+                        fractionalLumaMv: ((mvSkipPred.X | mvSkipPred.Y) & 3) != 0);
+                }
                 return true;
                 }
             }
         }
 
+        if (collectPhase1Timing)
+        {
+            H264PInterDiagnostics.NotifyPhase1Timing(
+                Stopwatch.GetTimestamp() - phase1StartTicks,
+                phase1PredLumaTicks, phase1PredChromaTicks, phase1SadTicks, phase1SseTicks,
+                phase1Outcome,
+                fractionalLumaMv: phase1PredBuilt && ((mvSkipPred.X | mvSkipPred.Y) & 3) != 0);
+        }
         H264PInterDiagnostics.NotifyPhase2Entered();
 
         // Phase 2 — full inter path: run sub-partition ME from the median predictor.
@@ -2093,6 +2143,13 @@ internal sealed class H264BaselineSliceEncoder
         // switch. Runs before the inter residual loop so the loser path is never reconstructed.
         if (_enableIntraInPFallback && !H264PInterDiagnostics.ShouldDisablePhase2b())
         {
+            if (collectPhase1Timing)
+            {
+                H264PInterDiagnostics.NotifyPhase2InterPredRebuild(
+                    phase1PredBuilt && winRefIdx == 0 &&
+                    partResult.Partition == H264MotionEstimator.McPartition.Mb16x16 &&
+                    partResult.Mv0.X == mvSkipPred.X && partResult.Mv0.Y == mvSkipPred.Y);
+            }
             ReconstructInterPredPerPartition(
                 partResult, winRefIdx, mbX, mbY, chromaMbX, chromaMbY, predY, predU, predV, _kernels);
             interPredReconstructed = true;
@@ -2200,6 +2257,13 @@ internal sealed class H264BaselineSliceEncoder
         var phase2PredStartTicks = collectPhase2Timing ? Stopwatch.GetTimestamp() : 0;
         if (!interPredReconstructed)
         {
+            if (collectPhase1Timing)
+            {
+                H264PInterDiagnostics.NotifyPhase2InterPredRebuild(
+                    phase1PredBuilt && winRefIdx == 0 &&
+                    partResult.Partition == H264MotionEstimator.McPartition.Mb16x16 &&
+                    partResult.Mv0.X == mvSkipPred.X && partResult.Mv0.Y == mvSkipPred.Y);
+            }
             // Reconstruct luma/chroma per-partition, filling the 16×16 predY and 8×8 predU/predV buffers.
             // The residual loop below reads these without knowing the partition shape.
             ReconstructInterPredPerPartition(

@@ -138,6 +138,7 @@ internal static class H264PerfProbe
             case "phases":
             case "mb":
             case "satd":
+            case "p1":
             {
                 var armName = args.Length > 1 ? args[1] : "default";
                 var slices = args.Length > 2 ? int.Parse(args[2]) : 4;
@@ -290,6 +291,10 @@ internal static class H264PerfProbe
                 H264MotionSatdDagDiagnostics.Reset();
                 H264MotionSatdDagDiagnostics.Enabled = true;
                 break;
+            case "p1":
+                H264PInterDiagnostics.ResetPhase1Timing();
+                H264PInterDiagnostics.CollectPhase1Timing = true;
+                break;
             default:
                 throw new ArgumentException(mode);
         }
@@ -323,6 +328,10 @@ internal static class H264PerfProbe
             case "satd":
                 H264MotionSatdDagDiagnostics.Enabled = false;
                 Console.WriteLine(H264MotionSatdDagDiagnostics.BuildReport(reset: true));
+                break;
+            case "p1":
+                H264PInterDiagnostics.CollectPhase1Timing = false;
+                Console.WriteLine(H264PInterDiagnostics.BuildPhase1TimingReport(reset: true));
                 break;
         }
 
