@@ -44,8 +44,42 @@ public sealed class H264AdaptiveRateController
         var recovery = recoveryPolicy ?? new H264RecoveryPolicy(config, recoveryLogger ?? NullLogger<H264RecoveryPolicy>.Instance);
         _rateController = new LowLatencyRateController(
             config, rateControllerLogger ?? NullLogger<LowLatencyRateController>.Instance, recovery);
-        _adaptationPolicy = new AdaptationPolicy(config, resolutionLadder, fpsLadder, adaptationLogger);
+        _adaptationPolicy = new AdaptationPolicy(
+            config,
+            resolutionLadder ?? ResolutionLadderFromConfig(config),
+            fpsLadder ?? FpsLadderFromConfig(config),
+            adaptationLogger);
     }
+
+    /// <summary>
+    /// Build the resolution ladder from <see cref="RateControlConfig.SupportedWidths"/> /
+    /// <see cref="RateControlConfig.SupportedHeights"/> (paired index-wise, descending). These
+    /// config arrays previously fed nothing — the policy always got the hard-coded default ladder,
+    /// so configuring them silently did nothing. Empty/mismatched arrays fall back to the default.
+    /// </summary>
+    private static ResolutionLadder ResolutionLadderFromConfig(RateControlConfig config)
+    {
+        var widths = config.SupportedWidths;
+        var heights = config.SupportedHeights;
+        var rungs = Math.Min(widths?.Length ?? 0, heights?.Length ?? 0);
+        if (rungs == 0)
+        {
+            return new ResolutionLadder();
+        }
+
+        var ladder = new ResolutionLadder.Resolution[rungs];
+        for (var i = 0; i < rungs; i++)
+        {
+            ladder[i] = new ResolutionLadder.Resolution(widths![i], heights![i], $"{heights[i]}p");
+        }
+
+        return new ResolutionLadder(ladder);
+    }
+
+    /// <summary>Build the fps ladder from <see cref="RateControlConfig.SupportedFps"/> (same rationale
+    /// as <see cref="ResolutionLadderFromConfig"/>). Empty falls back to the default ladder.</summary>
+    private static FpsLadder FpsLadderFromConfig(RateControlConfig config) =>
+        config.SupportedFps is { Length: > 0 } fps ? new FpsLadder(fps) : new FpsLadder();
 
     /// <summary>The recovery policy driving IDR/intra-refresh decisions (already invoked once per
     /// <see cref="GetDecision"/> by the rate controller — do not call it again).</summary>
@@ -79,6 +113,16 @@ public sealed class H264AdaptiveRateController
 
         return finalDecision;
     }
+
+    /// <summary>
+    /// Forward the actually-applied output state to the rate controller (see
+    /// <see cref="LowLatencyRateController.SyncAppliedState"/>). The session calls this after every
+    /// encoded frame; a decision is only a recommendation until the caller applies it (resolution
+    /// changes in particular require the caller to supply rescaled frames), so the controller must
+    /// be told what really happened or its ladder walking compounds from fiction.
+    /// </summary>
+    public void SyncAppliedState(int width, int height, int fps, EncoderSpeedMode speedMode) =>
+        _rateController.SyncAppliedState(width, height, fps, speedMode);
 
     /// <summary>Reset adaptation + recovery state (e.g. on stream reset or scene change).</summary>
     public void Reset()

@@ -62,6 +62,28 @@ public sealed class LowLatencyRateController
     public H264RecoveryPolicy RecoveryPolicy => _recoveryPolicy;
 
     /// <summary>
+    /// Report the output state a composing layer actually applied to the encoder — geometry, frame
+    /// rate, and speed mode — so the next <see cref="Decide"/> starts from reality rather than from
+    /// this controller's assumption. Without this, the controller's internal state keeps the
+    /// constructor defaults (1920×1080 @ 60, <see cref="EncoderSpeedMode.Balanced"/>) forever: a
+    /// resolution/fps adaptation layered on top (e.g. <c>AdaptationPolicy</c>) then probes its
+    /// ladders from a fixed rung and its decisions never walk, and <see cref="Decide"/>'s
+    /// <c>MaxFrameBytes</c> is budgeted against the wrong frame rate.
+    /// <see cref="H264StreamingSession"/> calls this once per encoded frame with what it applied.
+    /// </summary>
+    /// <param name="width">Output width actually being encoded (pixels).</param>
+    /// <param name="height">Output height actually being encoded (pixels).</param>
+    /// <param name="fps">Frame rate the caller is pacing at (clamped to ≥ 1).</param>
+    /// <param name="speedMode">Speed mode actually applied to the encoder.</param>
+    public void SyncAppliedState(int width, int height, int fps, EncoderSpeedMode speedMode)
+    {
+        _state.Width = width;
+        _state.Height = height;
+        _state.TargetFps = Math.Max(1, fps);
+        _state.SpeedMode = speedMode;
+    }
+
+    /// <summary>
     /// Decides on the next encoder configuration based on network and pipeline feedback.
     /// Implements Phase 2 rate control logic: bitrate adaptation, QP adjustment,
     /// and encode backpressure handling.
@@ -132,16 +154,29 @@ public sealed class LowLatencyRateController
             _state.StableFrameCounter++;
         }
 
-        // 3. Adjust QP based on bitrate relative to initial
+        // 3. Adjust QP based on bitrate relative to initial: ~+6 QP per halving of the target (the
+        // H.264 rule of thumb that +6 QP costs roughly half the bitrate), plus graded steps for the
+        // remaining partial ratio. Integer arithmetic throughout so decisions are deterministic on
+        // every platform. The historical fixed +1/+3 offsets stopped tracking after one halving, so
+        // a target collapsed to the configured floor still asked the encoder for near-initial
+        // quality and the per-frame bit budget was unachievable. No offset is applied above the
+        // initial rate: BaseQp is the quality ceiling.
         int adaptedQp = _config.BaseQp;
-
-        if (_state.TargetBitrateBps < _config.InitialTargetBitrateBps * 0.5)
+        var initialBps = (long)_config.InitialTargetBitrateBps;
+        var targetBps = Math.Max(1L, _state.TargetBitrateBps);
+        while (initialBps >= 2 * targetBps && adaptedQp - _config.BaseQp < 48)
         {
-            adaptedQp += 3;
+            adaptedQp += 6;
+            targetBps *= 2;
         }
-        else if (_state.TargetBitrateBps < _config.InitialTargetBitrateBps * 0.7)
+
+        if (2 * initialBps >= 3 * targetBps)
         {
-            adaptedQp += 1;
+            adaptedQp += 3; // remaining ratio ≥ 1.5×
+        }
+        else if (5 * initialBps >= 6 * targetBps)
+        {
+            adaptedQp += 1; // remaining ratio ≥ 1.2×
         }
 
         // If network is very bad, additional increase

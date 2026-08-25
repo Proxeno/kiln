@@ -25,14 +25,43 @@ internal sealed class H264FrameSharedState
     public const int MaxDpbSize = 2;
 
     /// <summary>
-    /// Effective cap on how many reference frames the encoder will actually use and signal, in
-    /// [1, <see cref="MaxDpbSize"/>]. Set once at construction from options.
-    /// 1 forces a single-reference stream (ref_idx_l0 always 0, num_ref_idx_l0_active = 1,
-    /// max_num_ref_frames = 1) — what real-time WebRTC peers and hardware (VideoToolbox) decoders
+    /// Effective cap on how many reference frames the encoder will actually use, in
+    /// [1, <see cref="MaxDpbSize"/>]. Initialised at construction from options; mutable between
+    /// frames via <see cref="SetMaxReferenceFrames"/> for mid-stream speed adaptation.
+    /// 1 forces a single-reference stream (ref_idx_l0 always 0, num_ref_idx_l0_active = 1) —
+    /// what real-time WebRTC peers and hardware (VideoToolbox) decoders
     /// expect; multi-reference P-frames are decoded fine by browser software decoders but are dropped
     /// by some strict hardware decoders, which manifests as "stop motion" (only IDRs survive).
+    /// The SPS <c>max_num_ref_frames</c> is signalled once from the construction-time value and is
+    /// an upper bound the live cap may sit below (see <see cref="SetMaxReferenceFrames"/>).
     /// </summary>
-    public readonly int MaxReferenceFrames;
+    public int MaxReferenceFrames { get; private set; }
+
+    /// <summary>
+    /// Change the live reference-frame cap between frames (never during a slice encode — the
+    /// parallel slice section reads it and <see cref="DpbCount"/> concurrently).
+    /// <para>
+    /// Legality: the SPS-signalled <c>max_num_ref_frames</c> is an upper bound on the decoder's
+    /// reference list, not a per-slice requirement — each P slice signals its own active count via
+    /// <c>num_ref_idx_active_override_flag</c> (§7.3.3), and this encoder derives that count from
+    /// <see cref="DpbCount"/>. Lowering the cap therefore takes effect immediately: this method
+    /// clamps <see cref="DpbCount"/>, so the next slice header signals fewer active references and
+    /// motion search stops reading the retired slot. Raising the cap (never above what the SPS
+    /// signalled — the caller must enforce that) takes effect after one frame: the retired DPB slot
+    /// went stale while capped, and the next reference rotation refills slot 1 from slot 0 before
+    /// <see cref="DpbCount"/> grows, so no stale plane is ever searched. This mirrors exactly what a
+    /// conformant decoder holds: with <c>max_num_ref_frames = 2</c> its sliding window (§8.2.5.3)
+    /// retains the two most recent decoded pictures regardless of how many the encoder references.
+    /// </para>
+    /// </summary>
+    public void SetMaxReferenceFrames(int maxReferenceFrames)
+    {
+        MaxReferenceFrames = Math.Clamp(maxReferenceFrames, 1, MaxDpbSize);
+        if (DpbCount > MaxReferenceFrames)
+        {
+            DpbCount = MaxReferenceFrames;
+        }
+    }
 
     public readonly byte[] RecY;
     public readonly byte[] RecU;

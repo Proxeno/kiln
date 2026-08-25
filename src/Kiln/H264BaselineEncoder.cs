@@ -235,8 +235,10 @@ public sealed class H264BaselineEncoderOptions
     /// option defaults, keeping default-options streams byte-identical to earlier releases. The
     /// non-default rungs are measured positions on the speed/quality curve — see the
     /// <see cref="EncoderSpeedMode"/> member docs and the README performance section for numbers.
+    /// Internal so the live-reconfiguration path (<see cref="H264BaselineEncoder.ApplySpeedMode"/>,
+    /// <see cref="H264StreamingSession"/>) maps a mode onto exactly the same knob values.
     /// </summary>
-    private static (int MaxReferenceFrames, bool UseMotionSatd, int SubPartitionRangeCap, int MotionSearchEffortCapPerMb) SpeedModePreset(EncoderSpeedMode mode) => mode switch
+    internal static (int MaxReferenceFrames, bool UseMotionSatd, int SubPartitionRangeCap, int MotionSearchEffortCapPerMb) SpeedModePreset(EncoderSpeedMode mode) => mode switch
     {
         // Historical defaults: everything on, no caps.
         EncoderSpeedMode.HighQuality => (2, true, 16, 0),
@@ -251,6 +253,25 @@ public sealed class H264BaselineEncoderOptions
         EncoderSpeedMode.VeryFast => (1, false, 8, 128),
         _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown EncoderSpeedMode."),
     };
+
+    /// <summary>Whether the caller ever assigned <see cref="MaxReferenceFrames"/> (explicit wins over the mode).</summary>
+    internal bool MaxReferenceFramesIsExplicit => _maxReferenceFramesIsSet;
+
+    /// <summary>Whether the caller ever assigned <see cref="UseMotionSatd"/>.</summary>
+    internal bool UseMotionSatdIsExplicit => _useMotionSatdIsSet;
+
+    /// <summary>Whether the caller ever assigned <see cref="SubPartitionRangeCap"/>.</summary>
+    internal bool SubPartitionRangeCapIsExplicit => _subPartitionRangeCapIsSet;
+
+    /// <summary>Whether the caller ever assigned <see cref="MotionSearchEffortCapPerMb"/>.</summary>
+    internal bool MotionSearchEffortCapPerMbIsExplicit => _motionSearchEffortCapPerMbIsSet;
+
+    /// <summary>
+    /// Field-exact copy (including the explicit-assignment flags backing the speed-knob composition
+    /// rule), so <see cref="H264StreamingSession"/> can derive a private options instance without
+    /// mutating the caller's object.
+    /// </summary>
+    internal H264BaselineEncoderOptions Clone() => (H264BaselineEncoderOptions)MemberwiseClone();
 }
 
 /// <summary>Baseline H.264 encoder (I and P slices, intra macroblocks only in P). Emits Annex B byte stream.</summary>
@@ -301,6 +322,19 @@ public sealed class H264BaselineEncoder : IDisposable
     private int _idrPicId;
     private bool _disposed;
 
+    /// <summary>
+    /// <c>max_num_ref_frames</c> as signalled in the SPS at construction — the immutable upper bound
+    /// for the live reference cap (<see cref="ApplySpeedKnobs"/> clamps to it). The SPS is written
+    /// once; a decoder allocates its DPB from this value, so the live cap may sit below it but never
+    /// above (§7.4.2.1, §8.2.5.3).
+    /// </summary>
+    private readonly int _signalledMaxRefFrames;
+
+    /// <summary>Live search-knob state (initially the constructor options; see <see cref="ApplySpeedKnobs"/>).</summary>
+    private bool _useMotionSatd;
+    private int _subPartitionRangeCap;
+    private int _motionSearchEffortCapPerMb;
+
     public H264BaselineEncoder(
         int width,
         int height,
@@ -345,14 +379,13 @@ public sealed class H264BaselineEncoder : IDisposable
         _frameShared = sharedState;
         var kernels = _options.PreferHardwareIntrinsics ? H264KernelSet.CreateBest() : new ScalarKernelSet();
         var encoderCount = Math.Max(1, Math.Min(MaxSliceEncoders, _mbH));
-        // Equal per-slice share of the frame ME effort budget (see
-        // H264BaselineEncoderOptions.MotionSearchEffortCapPerMb). Equal — not proportional to a
-        // slice's MB count — because the effort-balanced partition gives high-motion bands fewer
-        // rows; the balancer aims at equal per-slice effort, so the budget shares match that aim.
-        var budgetSliceCount = Math.Min(Math.Max(1, GetEffectiveSliceCount()), encoderCount);
-        var effortSliceBudget = _options.MotionSearchEffortCapPerMb > 0
-            ? Math.Max(1L, (long)_options.MotionSearchEffortCapPerMb * (_mbW * _mbH) / budgetSliceCount)
-            : 0L;
+        // Live speed-knob state starts as the constructor options and may be reassigned between
+        // frames (ApplySpeedKnobs); the SPS reference signalling below stays construction-time.
+        _signalledMaxRefFrames = Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize);
+        _useMotionSatd = _options.UseMotionSatd;
+        _subPartitionRangeCap = Math.Max(1, _options.SubPartitionRangeCap);
+        _motionSearchEffortCapPerMb = Math.Max(0, _options.MotionSearchEffortCapPerMb);
+        var effortSliceBudget = ComputeEffortSliceBudget(_motionSearchEffortCapPerMb);
         _sliceEncoders = new H264BaselineSliceEncoder[encoderCount];
         _slicePartitionRows = new int[encoderCount + 1];
         _rowEffortWindow = new long[_mbH];
@@ -510,6 +543,14 @@ public sealed class H264BaselineEncoder : IDisposable
     /// When set, coded slice luma QP for this picture (via slice <c>slice_qp_delta</c>). When null,
     /// uses constructor <see cref="H264BaselineEncoderOptions.QuantizationParameter"/>.
     /// </param>
+    /// <param name="targetBitsPerFrame">
+    /// When set to a positive value, the picture-wide bit budget for this frame's per-MB rate
+    /// control, overriding constructor <see cref="H264BaselineEncoderOptions.TargetBitsPerFrame"/>
+    /// (multi-slice frames still split it proportionally). When null or ≤ 0, the constructor value
+    /// applies unchanged — including constant QP when it was 0. To drive a live bitrate target,
+    /// construct with <c>TargetBitsPerFrame = 0</c> and pass the budget here every frame; a
+    /// mid-stream return to constant QP from a positive constructor value is not expressible.
+    /// </param>
     public int EncodeFrame(
         ReadOnlySpan<byte> y,
         ReadOnlySpan<byte> u,
@@ -518,7 +559,8 @@ public sealed class H264BaselineEncoder : IDisposable
         int strideUv,
         Span<byte> annexB,
         bool forceKeyframe = false,
-        int? sliceLumaQp = null)
+        int? sliceLumaQp = null,
+        int? targetBitsPerFrame = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -566,11 +608,12 @@ public sealed class H264BaselineEncoder : IDisposable
         }
 
         var sliceArg = sliceLumaQp.HasValue ? sliceLumaQp.Value : -1;
+        var targetBitsArg = targetBitsPerFrame.GetValueOrDefault(-1);
         var nalType = (byte)(isIdr ? 5 : 1);
         var sliceCount = GetEffectiveSliceCount();
         if (sliceCount > 1)
         {
-            pos = EncodeFrameMultiSlice(y, strideY, u, v, strideUv, isIdr, isP, sliceArg, sliceCount, nalType, annexB, pos);
+            pos = EncodeFrameMultiSlice(y, strideY, u, v, strideUv, isIdr, isP, sliceArg, targetBitsArg, sliceCount, nalType, annexB, pos);
         }
         else
         {
@@ -579,7 +622,8 @@ public sealed class H264BaselineEncoder : IDisposable
             // (via isFirstSliceInFrame=true) and the slice-end deblock+pad inside EncodeSliceRbsp.
             var rbsp = _sliceEncoders[0].EncodeSliceRbsp(
                 y, strideY, u, v, strideUv, isIdr, isP, _h264FrameNum, _idrPicId, sliceArg,
-                codedFrameIndex: _codedFrameIndex);
+                codedFrameIndex: _codedFrameIndex,
+                pictureTargetBitsOverride: targetBitsArg);
             pos += WriteNal(annexB[pos..], 3, nalType, rbsp);
         }
 
@@ -604,6 +648,83 @@ public sealed class H264BaselineEncoder : IDisposable
     }
 
     /// <summary>
+    /// Equal per-slice share of the frame ME effort budget (see
+    /// <see cref="H264BaselineEncoderOptions.MotionSearchEffortCapPerMb"/>). Equal — not proportional
+    /// to a slice's MB count — because the effort-balanced partition gives high-motion bands fewer
+    /// rows; the balancer aims at equal per-slice effort, so the budget shares match that aim.
+    /// </summary>
+    private long ComputeEffortSliceBudget(int capPerMb)
+    {
+        var encoderCount = Math.Max(1, Math.Min(MaxSliceEncoders, _mbH));
+        var budgetSliceCount = Math.Min(Math.Max(1, GetEffectiveSliceCount()), encoderCount);
+        return capPerMb > 0
+            ? Math.Max(1L, (long)capPerMb * (_mbW * _mbH) / budgetSliceCount)
+            : 0L;
+    }
+
+    /// <summary>
+    /// The number of reference frames the encoder currently searches and signals per slice. Starts
+    /// at the constructor options' <see cref="H264BaselineEncoderOptions.MaxReferenceFrames"/>;
+    /// changed between frames by <see cref="ApplySpeedKnobs"/>, never above
+    /// <see cref="SignalledMaxReferenceFrames"/>.
+    /// </summary>
+    public int ActiveReferenceFrames => _frameShared.MaxReferenceFrames;
+
+    /// <summary>
+    /// <c>max_num_ref_frames</c> as signalled in the SPS — fixed at construction from the options,
+    /// and the ceiling <see cref="ApplySpeedKnobs"/> clamps the live reference cap to. A decoder
+    /// sizes its DPB from this value (§7.4.2.1), so raising the live cap above it mid-stream would
+    /// desynchronise reference handling; construct with the largest reference count the stream may
+    /// ever need (the default options signal 2).
+    /// </summary>
+    public int SignalledMaxReferenceFrames => _signalledMaxRefFrames;
+
+    /// <summary>
+    /// Reassign the four speed-ladder knobs to a <see cref="EncoderSpeedMode"/> preset between
+    /// frames — identical knob values to constructing with that mode, applied to a live encoder.
+    /// See <see cref="ApplySpeedKnobs"/> for what changes when, and for the reference-count rules.
+    /// </summary>
+    public void ApplySpeedMode(EncoderSpeedMode mode)
+    {
+        var (maxRefs, satd, rangeCap, effortCap) = H264BaselineEncoderOptions.SpeedModePreset(mode);
+        ApplySpeedKnobs(maxRefs, satd, rangeCap, effortCap);
+    }
+
+    /// <summary>
+    /// Reassign the four speed-ladder knobs on a live encoder. Call only between
+    /// <see cref="EncodeFrame"/> calls (same threading contract as <see cref="EncodeFrame"/> itself:
+    /// external synchronisation, never during the parallel slice section).
+    /// <para>
+    /// Three of the knobs — <paramref name="useMotionSatd"/>, <paramref name="subPartitionRangeCap"/>,
+    /// <paramref name="motionSearchEffortCapPerMb"/> — are search-only: they change which prediction
+    /// the encoder chooses, never how a choice is coded, so they take effect on the next frame with
+    /// no bitstream-structural consequence. <paramref name="maxReferenceFrames"/> is bounded by the
+    /// SPS: the value is clamped to <see cref="SignalledMaxReferenceFrames"/> (the SPS is written
+    /// once and a decoder sizes its DPB from it, §7.4.2.1). Within that bound, lowering takes effect
+    /// on the next frame (the slice header's <c>num_ref_idx_active_override</c> shrinks the active
+    /// list, which the SPS maximum permits at any picture); raising takes effect one frame later,
+    /// after the internal DPB slot the cap had retired is refilled from fresh reconstructions — the
+    /// decoder's sliding window (§8.2.5.3) has retained both pictures throughout, so no
+    /// resynchronisation and no IDR is needed. Bitstreams remain deterministic: knob changes are
+    /// ordinary inputs, and identical frame + knob sequences produce identical bytes.
+    /// </para>
+    /// </summary>
+    public void ApplySpeedKnobs(int maxReferenceFrames, bool useMotionSatd, int subPartitionRangeCap, int motionSearchEffortCapPerMb)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var requestedRefs = Math.Clamp(maxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize);
+        _frameShared.SetMaxReferenceFrames(Math.Min(requestedRefs, _signalledMaxRefFrames));
+        _useMotionSatd = useMotionSatd;
+        _subPartitionRangeCap = Math.Max(1, subPartitionRangeCap);
+        _motionSearchEffortCapPerMb = Math.Max(0, motionSearchEffortCapPerMb);
+        var effortSliceBudget = ComputeEffortSliceBudget(_motionSearchEffortCapPerMb);
+        foreach (var slice in _sliceEncoders)
+        {
+            slice.ReconfigureSpeedKnobs(_useMotionSatd, _subPartitionRangeCap, effortSliceBudget);
+        }
+    }
+
+    /// <summary>
     /// Encode a frame as N slices in parallel. Slice-aware neighbour guards in
     /// <see cref="H264BaselineSliceEncoder"/> (Phase 1) make each slice's MB writes disjoint, so
     /// <see cref="Parallel.For"/> can fan slices across cores. The orchestrator drives the
@@ -614,7 +735,7 @@ public sealed class H264BaselineEncoder : IDisposable
     private unsafe int EncodeFrameMultiSlice(
         ReadOnlySpan<byte> y, int strideY,
         ReadOnlySpan<byte> u, ReadOnlySpan<byte> v, int strideUv,
-        bool isIdr, bool isP, int sliceArg,
+        bool isIdr, bool isP, int sliceArg, int targetBitsArg,
         int sliceCount, byte nalType,
         Span<byte> annexB, int pos)
     {
@@ -686,7 +807,8 @@ public sealed class H264BaselineEncoder : IDisposable
                     // Orchestrator already drove BeginFrame; tell the slice encoder to skip its
                     // own ResetForFrame and the IDR ref-validity clear (both would race here).
                     isFirstSliceInFrame: false,
-                    codedFrameIndex: _codedFrameIndex);
+                    codedFrameIndex: _codedFrameIndex,
+                    pictureTargetBitsOverride: targetBitsArg);
             });
         }
 
@@ -778,7 +900,7 @@ public sealed class H264BaselineEncoder : IDisposable
         // (UseMotionSatd=false) they over-weight high-motion rows ~4x (measured on the probe
         // content) and the resulting partition is a small net loss, so SAD-mode encodes keep the
         // historical equal-height split.
-        var balanceDisabled = !_options.UseMotionSatd || H264PInterDiagnostics.DisableSlicePartitionBalance;
+        var balanceDisabled = !_useMotionSatd || H264PInterDiagnostics.DisableSlicePartitionBalance;
         if (_partitionSliceCount != sliceCount || balanceDisabled)
         {
             // First frame at this slice count: equal-height start, matching the historical layout.

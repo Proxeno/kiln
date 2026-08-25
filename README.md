@@ -88,12 +88,14 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
 - **SIMD with a safety net.** NEON/AdvSimd, AVX2 and SSSE3 kernels selected at runtime, each covered
   by parity tests against a scalar reference; CI runs the full suite on Linux, Windows and macOS so
   both architectures stay green.
-- **Streaming companions.** `Kiln.RateControl` (a low-latency rate controller with network feedback)
-  and `Kiln.Recovery` (IDR budgeting / keyframe recovery policy) are public companion namespaces for
-  server use.
-- **Verified.** 2,226 tests — spec-roundtrip decoding, SIMD/scalar parity, golden-frame regression,
-  PSNR fidelity floors, adversarial neighbour-availability sweeps, and independent-decoder smoke
-  tests over every produced stream.
+- **A wired adaptation loop.** `H264StreamingSession` connects `Kiln.RateControl` (low-latency
+  rate controller with network feedback) and `Kiln.Recovery` (IDR budgeting / keyframe recovery)
+  to the encoder: feed it network feedback per frame and get adaptive QP, bitrate, IDRs, and live
+  speed-mode changes out — deterministically, with no glue code on your side.
+- **Verified.** 2,249 tests — spec-roundtrip decoding, SIMD/scalar parity, golden-frame regression,
+  PSNR fidelity floors, adversarial neighbour-availability sweeps, byte-exact
+  reconstruction-vs-ffmpeg conformance oracles, and independent-decoder smoke tests over every
+  produced stream.
 
 ## Options reference
 
@@ -103,8 +105,8 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
 | `SpeedMode` | `HighQuality` | Measured speed/quality preset ladder (`HighQuality`/`Balanced`/`Fast`/`VeryFast`) over `MaxReferenceFrames`, `UseMotionSatd`, `SubPartitionRangeCap` and `MotionSearchEffortCapPerMb`. Any of those four you assign explicitly wins over the mode; other options are never touched. See [Performance](#performance) for what each rung buys and costs. |
 | `KeyframeIntervalFrames` | 60 | IDR every N coded frames (frame 0 is always IDR). `EncodeFrame(forceKeyframe: true)` overrides. |
 | `SliceCount` | 1 | Slices per frame; >1 encodes slices in parallel and bounds loss regions. |
-| `MaxReferenceFrames` | 2 | 1 = single-ref (WebRTC / hardware-decoder safe), 2 = multi-reference P. |
-| `TargetBitsPerFrame` | 0 (off) | Per-MB QP adaptation toward a per-frame bit budget. |
+| `MaxReferenceFrames` | 2 | 1 = single-ref (WebRTC / hardware-decoder safe), 2 = multi-reference P. Sets the SPS ceiling; below it the operating count follows live `ApplySpeedMode`/`ApplySpeedKnobs` calls, mid-GOP, no IDR needed. |
+| `TargetBitsPerFrame` | 0 (off) | Per-MB QP adaptation toward a per-frame bit budget. Overridable per picture via `EncodeFrame(targetBitsPerFrame:)` — how the streaming session drives a live bitrate target. |
 | `FastSearch` | true | Hex/diamond integer ME + qpel refinement; false = exhaustive integer search. |
 | `UseMotionSatd` | true | SATD scoring for integer-pel ME candidates (SAD for fractional refinement). |
 | `EnableIntraInPFallback` | true | Allows I16x16/I4x4 macroblocks inside P-frames when inter prediction fails. |
@@ -247,16 +249,38 @@ small for the frame throws, naming the lowest sufficient level. The chosen level
 > and encode instead of throwing. `EncodeFrame`'s output span now has a documented recommended size,
 > `H264BaselineEncoder.RecommendedOutputBufferSize`.
 
-On the real-time story, be precise about what is wired and what is not. The encoder side is real:
-`SpeedMode` presets and the deterministic motion-search effort cap give measured, bounded per-frame
-cost, and `Kiln.RateControl`'s `LowLatencyRateController` turns network feedback into per-frame
-`EncoderAdaptationDecision`s (bitrate, QP, fps, resolution, and a recommended `SpeedMode`, which
-now has a defined encoder mapping). What does **not** exist yet is the automatic loop: nothing in the
-library applies a controller decision to a running encoder. Your server reads the decision and acts
-on it — construct encoder options with the recommended `SpeedMode`, resize, drop frames — itself.
-Likewise the `Adaptation` (resolution/fps ladders) and `Queue` (latest-frame dropping) namespaces
-ship inside the library, fully tested but not yet wired into the encoder — **experimental**, and
-their APIs may change or move without notice. See [docs/architecture.md](docs/architecture.md).
+> **0.x conformance fix:** two deblocking bugs made the encoder's reconstruction drift from every
+> conformant decoder's — the luma filter ignored the §8.7.2.2 QP average across macroblock edges,
+> and boundary-strength derivation inverted §8.7.2.1's precedence of coded coefficients over MV
+> differences. Streams using per-MB QP (`TargetBitsPerFrame`, `AdaptiveQuantStrength`) and
+> constant-QP streams at QPs where Table 8-17 distinguishes bS 1 from 2 (e.g. 31, 32, 35, 36)
+> produce different — now correct — bytes. Default-option streams and QP 23/28/33/34 constant-QP
+> streams are unaffected. Verified byte-exact against both ffmpeg and VideoToolbox.
+
+On the real-time story, be precise about what is wired and what is not. The adaptation loop is
+wired: `H264StreamingSession` owns an encoder plus the rate controller, and per frame turns
+`EncoderNetworkFeedback` (loss, RTT, queue depth, PLI/FIR) into applied settings — slice QP, a
+per-picture bit budget, recovery IDRs, and live `SpeedMode` changes, including the reference-count
+component, which swaps mid-GOP without an IDR because the SPS-signalled DPB size is an upper
+bound the operating count may sit below:
+
+```csharp
+using var session = new H264StreamingSession(1280, 720);
+var buffer = new byte[session.RecommendedOutputBufferSize];
+// Each frame: pass the latest transport snapshot, get adaptive encoding out.
+var result = session.EncodeFrame(y, u, v, strideY, strideUv, buffer, feedback);
+// result.WasIdr, result.AppliedSliceQp, result.Decision.TargetBitrateBps, …
+```
+
+The session is deterministic (identical frames + feedback → identical bytes; wall-clock load
+figures participate only if you pass them in), and it is honest about its limits: resolution
+decisions are surfaced as recommendations until you can supply rescaled frames and call
+`ChangeResolution` (Kiln has no scaler; the session recreates the encoder and the next frame is an
+IDR with the new SPS), `TargetFps` is a pacing contract for your capture loop (the SPS carries no
+timing info), and intra refresh remains **unimplemented** — a recovery request that lands in the
+IDR cooldown is reported on the result, not silently faked. The full taxonomy of what may change
+mid-stream at which boundary is in [docs/architecture.md](docs/architecture.md). The `Queue`
+namespace (latest-frame dropping) still ships unwired — **experimental**, APIs may change.
 
 ## Installing
 
