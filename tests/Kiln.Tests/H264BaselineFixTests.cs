@@ -194,7 +194,7 @@ public sealed class H264BaselineFixTests
         var mvB = new H264MotionEstimator.Mv((short)bx, (short)by);
         var median = new H264MotionEstimator.Mv(20, -12);
 
-        H264BaselineSliceEncoder.DerivePSkipMvSingleRef(mvA, aRefIdx: 0, mvB, bRefIdx: 0, median, aAbsent: false, bAbsent: false)
+        H264BaselineSliceEncoder.DerivePSkipMv(mvA, aRefIdx: 0, mvB, bRefIdx: 0, median, aAbsent: false, bAbsent: false)
             .Should().Be(default(H264MotionEstimator.Mv),
                 "H.264 §8.4.1.1 derives P_Skip MV (0,0) when either A or B has refIdx 0 and MV (0,0)");
     }
@@ -206,22 +206,41 @@ public sealed class H264BaselineFixTests
         var mvB = new H264MotionEstimator.Mv(0, -4);
         var median = new H264MotionEstimator.Mv(8, -8);
 
-        H264BaselineSliceEncoder.DerivePSkipMvSingleRef(mvA, aRefIdx: 0, mvB, bRefIdx: 0, median, aAbsent: false, bAbsent: false)
+        H264BaselineSliceEncoder.DerivePSkipMv(mvA, aRefIdx: 0, mvB, bRefIdx: 0, median, aAbsent: false, bAbsent: false)
             .Should().Be(median);
     }
 
     [Theory]
     [InlineData(1, 0)]
     [InlineData(0, 1)]
-    public void PSkip_step2_zero_mv_when_A_or_B_has_nonzero_refIdx(int aRefIdx, int bRefIdx)
+    public void PSkip_step2_uses_predictor_when_A_or_B_has_nonzero_refIdx(int aRefIdx, int bRefIdx)
     {
+        // §8.4.1.1 forces (0,0) only for an absent A/B or a refIdx-0 zero-MV A/B. A refIdx>0
+        // neighbour is neither, so P_Skip falls through to the §8.4.1.3 refIdx-0 predictor —
+        // matching the decoder. (Issue #6: the old code forced (0,0) here, silently desyncing the
+        // decoder's MV field wherever the two candidate blocks were pixel-identical.)
         var mvA = new H264MotionEstimator.Mv(4, 0);
         var mvB = new H264MotionEstimator.Mv(0, -4);
         var median = new H264MotionEstimator.Mv(8, -8);
 
-        H264BaselineSliceEncoder.DerivePSkipMvSingleRef(mvA, aRefIdx, mvB, bRefIdx, median, aAbsent: false, bAbsent: false)
-            .Should().Be(default(H264MotionEstimator.Mv),
-                "§8.4.1.1: P_Skip MV is (0,0) when A or B has a non-zero reference index");
+        H264BaselineSliceEncoder.DerivePSkipMv(mvA, aRefIdx, mvB, bRefIdx, median, aAbsent: false, bAbsent: false)
+            .Should().Be(median,
+                "§8.4.1.1: only absence or a refIdx-0 zero-MV neighbour yields the zero P_Skip MV");
+    }
+
+    [Theory]
+    [InlineData(1, 0)]
+    [InlineData(0, 1)]
+    public void PSkip_step2_zero_mv_refIdx0_condition_ignores_nonzero_refIdx_neighbour_mv(int aRefIdx, int bRefIdx)
+    {
+        // The refIdx-0 zero-MV condition of §8.4.1.1 must not fire for a zero MV carried by a
+        // refIdx>0 neighbour: the condition tests refIdxL0N == 0 and mvL0N == (0,0) together.
+        var mvA = aRefIdx > 0 ? default : new H264MotionEstimator.Mv(4, 0);
+        var mvB = bRefIdx > 0 ? default : new H264MotionEstimator.Mv(0, -4);
+        var median = new H264MotionEstimator.Mv(8, -8);
+
+        H264BaselineSliceEncoder.DerivePSkipMv(mvA, aRefIdx, mvB, bRefIdx, median, aAbsent: false, bAbsent: false)
+            .Should().Be(median);
     }
 
     [Theory]
@@ -233,7 +252,7 @@ public sealed class H264BaselineFixTests
         var mvB = new H264MotionEstimator.Mv(0, -4);
         var median = new H264MotionEstimator.Mv(8, -8);
 
-        H264BaselineSliceEncoder.DerivePSkipMvSingleRef(mvA, aRefIdx: 0, mvB, bRefIdx: 0, median, aAbsent, bAbsent)
+        H264BaselineSliceEncoder.DerivePSkipMv(mvA, aRefIdx: 0, mvB, bRefIdx: 0, median, aAbsent, bAbsent)
             .Should().Be(default(H264MotionEstimator.Mv),
                 "§8.4.1.1: P_Skip MV is (0,0) when A or B is absent (PART_NOT_AVAILABLE)");
     }
@@ -250,7 +269,7 @@ public sealed class H264BaselineFixTests
         var mvB = bRefIdx < 0 ? default : new H264MotionEstimator.Mv(0, -4);
         var median = new H264MotionEstimator.Mv(8, -8);
 
-        H264BaselineSliceEncoder.DerivePSkipMvSingleRef(mvA, aRefIdx, mvB, bRefIdx, median, aAbsent: false, bAbsent: false)
+        H264BaselineSliceEncoder.DerivePSkipMv(mvA, aRefIdx, mvB, bRefIdx, median, aAbsent: false, bAbsent: false)
             .Should().Be(median);
     }
 

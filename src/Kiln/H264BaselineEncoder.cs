@@ -130,8 +130,10 @@ public sealed class H264BaselineEncoderOptions
     /// Maximum sub-partition integer-pixel search radius around the 16×16 seed MV. Default 16 (full range,
     /// byte-identical to previous encoder). Set to 8 for latency-first streaming at the cost of slightly
     /// worse sub-partition decisions when the optimal MV is far from the 16×16 seed.
-    /// After <c>SubPartBudget</c> (32) high-complexity MBs in a frame the radius is further halved to 4
-    /// regardless of this setting (Option B frame budget).
+    /// After a quarter of a slice's macroblocks have run sub-partition search in the current frame,
+    /// the radius drops to 4 for the slice's remaining MBs regardless of this setting — a worst-case
+    /// complexity bound that only binds on sustained high-motion content. The budget is proportional
+    /// to the slice's MB count, so the per-frame total is independent of <see cref="SliceCount"/>.
     /// </summary>
     public int SubPartitionRangeCap { get; set; } = 16;
 }

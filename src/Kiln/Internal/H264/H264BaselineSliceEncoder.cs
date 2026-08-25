@@ -266,10 +266,23 @@ internal sealed class H264BaselineSliceEncoder
     private int _currentFrameNum;
     private int _currentCodedFrameIndex = -1;
 
-    // Count of MBs in the current frame that ran (or will run) sub-partition search.
-    // Once this exceeds SubPartBudget, the sub-partition range cap drops to 4 for remaining MBs.
+    // Count of MBs in the current slice that ran (or will run) sub-partition search.
+    // Once this exceeds _subPartBudget, the sub-partition range cap drops to 4 for remaining MBs.
     private int _subPartMbCount;
-    private const int SubPartBudget = 32;
+    // Per-slice sub-partition search budget, recomputed at each slice start as SliceMbCount /
+    // SubPartBudgetMbDivisor (see EncodeSliceRbsp). Slices partition the frame, so the per-frame
+    // total is the same fraction of the frame's MB count regardless of SliceCount — the budget no
+    // longer couples output quality to the slice configuration (the old fixed 32 per
+    // slice encoder multiplied the frame total by the slice count, and was additionally reset only
+    // by slice 0's encoder, leaving encoders 1..N-1 permanently over budget after the first frame).
+    private int _subPartBudget;
+    // Divisor 4 measured on 640x480 (sweep of budgets {32/slice-encoder, mb/8, mb/4, mb/2,
+    // unlimited} x contents x QP {23,28,35} x slices {1,4,8}): it recovers +2.2 dB of the +3.2 dB
+    // the legacy fixed budget cost on sustained-motion content at QP 23, is within noise of
+    // unlimited on typical content (where any proportional budget also costs the same time as
+    // unlimited), and still bounds pathological-content encode time to ~1.7x the legacy budget
+    // (unlimited: ~2.1x). Raising it further trades ~10% more worst-case time for ~+0.8 dB.
+    private const int SubPartBudgetMbDivisor = 4;
     private readonly int _subPartitionRangeCap;
 
     /// <summary>First MB row of the current slice — used to scope deblocking to the slice range.</summary>
@@ -464,6 +477,18 @@ internal sealed class H264BaselineSliceEncoder
         {
             ResetForFrame();
         }
+        // Per-slice sub-partition budget: a fixed fraction of this slice's MB count, so the
+        // per-frame total is invariant to how the frame is divided into slices. Reset here (not in
+        // ResetForFrame) because in multi-slice frames only slice 0's encoder runs the frame reset;
+        // the old frame-reset-only counter left encoders 1..N-1 permanently over budget.
+        _subPartMbCount = 0;
+        var subPartDivisor = H264PInterDiagnostics.SubPartBudgetDivisorOverride ?? SubPartBudgetMbDivisor;
+        _subPartBudget = subPartDivisor switch
+        {
+            0 => int.MaxValue,
+            < 0 => 32, // legacy fixed per-slice-encoder budget (measurement baseline)
+            _ => Math.Max(8, effectiveMbCount / subPartDivisor),
+        };
         _currentFrameNum = frameNum;
         _currentCodedFrameIndex = codedFrameIndex;
 
@@ -612,7 +637,6 @@ internal sealed class H264BaselineSliceEncoder
         Array.Clear(_shared.MbSubPartRefIdx);
         _recU.AsSpan().Clear();
         _recV.AsSpan().Clear();
-        _subPartMbCount = 0;
     }
 
     /// <summary>
@@ -1554,15 +1578,16 @@ internal sealed class H264BaselineSliceEncoder
                 _mbMvs[neighbourMbIdx],
         };
 
-    // §8.4.1.1: P_Skip MV is (0,0) when A or B is absent (PART_NOT_AVAILABLE), refers to a non-zero
-    // reference index, or is refIdx 0 with a zero MV; otherwise the median predictor. An *intra*
-    // neighbour is present (aAbsent/bAbsent false) and carries refIdx -1 — it is neither absent nor a
-    // ">0 ref" nor a "ref-0 zero-MV", so it falls through to the median, matching the decoder ("this
-    // partition uses no reference list" is a distinct state from "this partition is not available").
-    // Conflating the two
-    // (the old `aRefIdx != 0` test) wrongly forced (0,0) for an intra neighbour, so an MB the encoder
-    // marked P_Skip reconstructed under a different decoder predictor → tearing.
-    internal static H264MotionEstimator.Mv DerivePSkipMvSingleRef(
+    // §8.4.1.1: P_Skip MV is (0,0) only when A or B is absent (PART_NOT_AVAILABLE) or is refIdx 0
+    // with a zero MV; otherwise the §8.4.1.3 refIdx-0 predictor. Neither an *intra* neighbour
+    // (present, refIdx -1) nor a refIdx>0 neighbour is a zero condition — both fall through to the
+    // predictor, where §8.4.1.3.2's single-matching-refIdx rule and median handle them, matching the
+    // decoder. Two historical desyncs lived here: conflating intra (refIdx -1) with "unavailable"
+    // (the old `aRefIdx != 0` test), and forcing (0,0) for a refIdx>0 A/B neighbour.
+    // The latter diverged silently whenever the (0,0) and spec-predicted blocks happened to match
+    // pixel-wise (flat regions): the decoder's MV field carried the spec value into every later
+    // MVP/P_Skip derivation touching that MB, compounding into dB-scale drift on motion content.
+    internal static H264MotionEstimator.Mv DerivePSkipMv(
         H264MotionEstimator.Mv mvA,
         int aRefIdx,
         H264MotionEstimator.Mv mvB,
@@ -1572,8 +1597,6 @@ internal sealed class H264BaselineSliceEncoder
         bool bAbsent)
     {
         if (aAbsent || bAbsent)
-            return default;
-        if (aRefIdx > 0 || bRefIdx > 0)
             return default;
         if ((aRefIdx == 0 && mvA.X == 0 && mvA.Y == 0) || (bRefIdx == 0 && mvB.X == 0 && mvB.Y == 0))
             return default;
@@ -1628,7 +1651,7 @@ internal sealed class H264BaselineSliceEncoder
         var mvPredictor = H264MotionEstimator.PredictMvWithRefIdx(
             mvA, aRefIdx, mvB, bRefIdx, mvC, cRefIdx, mvD, dRefIdx, currentRefIdx: 0,
             aAbsent, bAbsent, cAbsent, dAbsent);
-        var mvSkipPred = DerivePSkipMvSingleRef(mvA, aRefIdx, mvB, bRefIdx, mvPredictor, aAbsent, bAbsent);
+        var mvSkipPred = DerivePSkipMv(mvA, aRefIdx, mvB, bRefIdx, mvPredictor, aAbsent, bAbsent);
 
         var chromaMbX = mbX / 2;
         var chromaMbY = mbY / 2;
@@ -1700,9 +1723,19 @@ internal sealed class H264BaselineSliceEncoder
                 // hides (observed split: genuine skips ~260, leading-edge skips ~18 000). A skip that
                 // fails it falls through to Phase 2, which codes residual (or an Intra_16×16 MB) and
                 // lifts that block back to QP-bounded quality instead of leaving a 30 dB hole.
-                const int SkipSseThreshold = 8192;
+                //
+                // The gate must track the quantiser: "acceptable skip error" is error the residual
+                // path could not remove anyway, and that floor scales with Qstep². 8192 was measured
+                // at QP 28, so scale by LambdaSatdForQp (∝ Qstep², §J.1-style mode-decision lambda)
+                // anchored there, capped at the measured 8192 so no QP becomes more lenient. Without
+                // the scaling, a spec-MV P_Skip at low QP can lock onto a mediocre reconstruction
+                // (e.g. a scroll's intra-coded leading edge) and propagate its error across the
+                // frame instead of re-coding it — measured at −1 dB on tile-period scroll at QP 20
+                // once the P_Skip MV fix (refIdx>0 neighbours no longer force a zero skip MV)
+                // made those skips reachable.
+                var skipSseThreshold = Math.Min(8192, Math.Max(768, 8192 * LambdaSatdForQp(qpThisMb) / LambdaSatdForQp(28)));
                 var skipSse = ComputeInterPredictionSse(srcY, strideY, srcU, srcV, strideUv, mbX, mbY, predY, predU, predV);
-                if (skipSse <= SkipSseThreshold)
+                if (skipSse <= skipSseThreshold)
                 {
                 H264PInterDiagnostics.TraceMbDecision(
                     _currentFrameNum, _currentCodedFrameIndex, mbx, mby,
@@ -1788,7 +1821,7 @@ internal sealed class H264BaselineSliceEncoder
         var allowSubPartitionSearch = variance >= 64;
         if (allowSubPartitionSearch)
             _subPartMbCount++;
-        var rangeCapThisMb = _subPartMbCount > SubPartBudget ? Math.Min(4, _subPartitionRangeCap) : _subPartitionRangeCap;
+        var rangeCapThisMb = _subPartMbCount > _subPartBudget ? Math.Min(4, _subPartitionRangeCap) : _subPartitionRangeCap;
         var lambdaThisMb = LambdaSatdForQp(qpThisMb);
 
         // ME against DPB slot 0 (most recent reference, refIdx=0).
@@ -1869,7 +1902,7 @@ internal sealed class H264BaselineSliceEncoder
             // disables P_Skip for every MB that predicts from it (§8.4.1.1 requires A/B refIdx 0)
             // and feeds its double-length MV back into the temporal seed field. On noise-tied
             // content the raw comparison made ref1 win ~half the time for no distortion gain,
-            // cascading skip failures rows deep below every slice-top row (issue #3). Encoder
+            // cascading skip failures rows deep below every slice-top row. Encoder
             // search policy only; either reference is normatively valid.
             if (partResult1.TotalSad + ref1TieMargin < partResult.TotalSad)
             {
