@@ -116,8 +116,17 @@ internal static class H264PInterDiagnostics
     public static bool CollectPhaseCounts { get; set; }
 
     /// <summary>
+    /// Measurement-only override for the per-slice sub-partition search budget divisor
+    /// (<c>H264BaselineSliceEncoder.SubPartBudgetMbDivisor</c>). <c>null</c> (production) uses the
+    /// built-in constant; <c>0</c> disables the budget; a negative value restores the legacy fixed
+    /// 32-MB-per-slice-encoder budget; a positive value divides the slice MB count. Used by the
+    /// budget sweep harness — never set in production code.
+    /// </summary>
+    public static int? SubPartBudgetDivisorOverride { get; set; }
+
+    /// <summary>
     /// Manual A/B kill switch for the temporal-seed probe that keeps a failed P_Skip from widening
-    /// the ME range when the co-located previous-frame MV already explains the motion (issue #3).
+    /// the ME range when the co-located previous-frame MV already explains the motion.
     /// Keep false in normal operation; benchmarks/tests set it to measure the pre-probe behaviour
     /// interleaved in the same process.
     /// </summary>
@@ -125,7 +134,7 @@ internal static class H264PInterDiagnostics
 
     /// <summary>
     /// Manual A/B kill switch for the rate-aware margin ref1 must clear to beat ref0 in the P-slice
-    /// reference competition (issue #3). Keep false in normal operation; benchmarks/tests set it to
+    /// reference competition. Keep false in normal operation; benchmarks/tests set it to
     /// measure the raw-SAD tie-break behaviour interleaved in the same process.
     /// </summary>
     public static bool DisableRef1TieMargin { get; set; }
@@ -233,7 +242,7 @@ internal static class H264PInterDiagnostics
     /// <summary>
     /// Integer-pel ME invocation counters (gated by <see cref="CollectPhaseCounts"/>): hex seed
     /// searches started, and how many escalated to the exhaustive-window fallback. These are the
-    /// direct measure of how much motion-search work slicing creates (see issue #3).
+    /// direct measure of how much motion-search work slicing creates.
     /// </summary>
     public static (long HexSearches, long ExhaustiveFallbacks) ReadMeSearchCounts() =>
         (

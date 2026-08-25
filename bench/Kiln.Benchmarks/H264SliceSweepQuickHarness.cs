@@ -7,7 +7,7 @@ using Kiln.Internal.H264;
 namespace Kiln.Benchmarks;
 
 /// <summary>
-/// Bounded stopwatch/quality harness for the issue #3 temporal-seed probe. Not a BenchmarkDotNet
+/// Bounded stopwatch/quality harness for the temporal-seed-probe A/B arms. Not a BenchmarkDotNet
 /// run: each mode finishes in well under a minute per configuration and prints as it goes, so
 /// interrupted runs still leave usable data.
 /// <list type="bullet">
@@ -204,11 +204,122 @@ internal static class H264SliceSweepQuickHarness
         H264PInterDiagnostics.DisableRef1TieMargin = disabled;
     }
 
+    /// <summary>
+    /// Sub-partition budget tuning: encodes the motion contents at several QPs / slice counts for each
+    /// sub-partition budget arm (legacy fixed 32, frame/8, frame/4, frame/2, unlimited), writing
+    /// streams for external PSNR, then times the heavy content with arms interleaved chunk-wise.
+    /// </summary>
+    public static void RunBudgetSweep(string outDir)
+    {
+        Directory.CreateDirectory(outDir);
+        int[] qps = [23, 28, 35];
+        int[] sliceCounts = [1, 4, 8];
+        int[] divisors = [-1, 8, 4, 2, 0];
+        const int W = 640;
+        const int H = 480;
+        const int FrameCount = 24;
+        var contents = new (string, byte[][])[]
+        {
+            ("moving", H264ResolutionSliceSweepBenchmarks.GenerateFrames(W, H)),
+            ("highmotion", GenerateHighMotion(W, H)),
+            ("scenecut", GenerateSceneCut(W, H)),
+        };
+        Console.WriteLine("content        qp slices div bytes");
+        foreach (var (name, frames) in contents)
+        {
+            WriteSource(outDir, name, W, H, frames, FrameCount);
+            foreach (var qp in qps)
+            {
+                foreach (var slices in sliceCounts)
+                {
+                    foreach (var div in divisors)
+                    {
+                        H264PInterDiagnostics.SubPartBudgetDivisorOverride = div;
+                        var bytes = EncodeToFile(outDir, $"{name}-d{(div < 0 ? "L" : div.ToString())}", W, H, frames, FrameCount, qp, slices, probeOn: true);
+                        Console.WriteLine($"{name,-14} {qp,2} {slices,6} {div,3} {bytes}");
+                    }
+                }
+            }
+        }
+
+        // Timing: highmotion (worst case) and moving (typical) at s=1 and s=4, all arms,
+        // rounds interleaved chunk-wise.
+        var ys = W * H;
+        var uv = ys / 4;
+        var annex = new byte[ys * 2 + 1_048_576];
+        Console.WriteLine("timing: content qp slices div ms/frame(median of 5 chunk means)");
+        foreach (var (tname, hm) in new (string, byte[][])[]
+                 {
+                     ("highmotion", GenerateHighMotion(W, H)),
+                     ("moving", H264ResolutionSliceSweepBenchmarks.GenerateFrames(W, H)),
+                 })
+        foreach (var qp in new[] { 23, 28 })
+        {
+            foreach (var slices in new[] { 1, 4 })
+            {
+                const int ChunkFrames = 12;
+                const int Rounds = 5;
+                var encoders = new H264BaselineEncoder[divisors.Length];
+                var frameIdx = new int[divisors.Length];
+                for (var a = 0; a < divisors.Length; a++)
+                {
+                    encoders[a] = new H264BaselineEncoder(W, H, new H264BaselineEncoderOptions
+                    {
+                        QuantizationParameter = qp,
+                        KeyframeIntervalFrames = int.MaxValue,
+                        LevelIdc = 40,
+                        SliceCount = slices,
+                    });
+                    // Prime each arm with its own setting so reference chains stay arm-consistent.
+                    H264PInterDiagnostics.SubPartBudgetDivisorOverride = divisors[a];
+                    for (var i = 0; i < 4; i++)
+                    {
+                        var f = hm[frameIdx[a]++ % hm.Length];
+                        encoders[a].EncodeFrame(f.AsSpan(0, ys), f.AsSpan(ys, uv), f.AsSpan(ys + uv, uv), W, W / 2, annex, forceKeyframe: i == 0);
+                    }
+                }
+
+                var ms = new double[divisors.Length][];
+                for (var a = 0; a < divisors.Length; a++)
+                {
+                    ms[a] = new double[Rounds];
+                }
+
+                var sw = new Stopwatch();
+                for (var round = 0; round < Rounds; round++)
+                {
+                    for (var a = 0; a < divisors.Length; a++)
+                    {
+                        H264PInterDiagnostics.SubPartBudgetDivisorOverride = divisors[a];
+                        sw.Restart();
+                        for (var i = 0; i < ChunkFrames; i++)
+                        {
+                            var f = hm[frameIdx[a]++ % hm.Length];
+                            encoders[a].EncodeFrame(f.AsSpan(0, ys), f.AsSpan(ys, uv), f.AsSpan(ys + uv, uv), W, W / 2, annex, forceKeyframe: false);
+                        }
+
+                        sw.Stop();
+                        ms[a][round] = sw.Elapsed.TotalMilliseconds / ChunkFrames;
+                    }
+                }
+
+                for (var a = 0; a < divisors.Length; a++)
+                {
+                    Array.Sort(ms[a]);
+                    Console.WriteLine($"timing: highmotion {qp,2} {slices,6} {divisors[a],3} {ms[a][Rounds / 2]:F2}");
+                    encoders[a].Dispose();
+                }
+            }
+        }
+
+        H264PInterDiagnostics.SubPartBudgetDivisorOverride = null;
+    }
+
     public static void RunQuality(string outDir)
     {
         Directory.CreateDirectory(outDir);
         int[] qps = [23, 28, 35];
-        int[] sliceCounts = [1, 4];
+        int[] sliceCounts = [1, 2, 4, 8];
         const int W = 640;
         const int H = 480;
         const int FrameCount = 24;
@@ -226,7 +337,7 @@ internal static class H264SliceSweepQuickHarness
             {
                 foreach (var slices in sliceCounts)
                 {
-                    foreach (var probeOn in new[] { true, false })
+                    foreach (var probeOn in new[] { true })
                     {
                         SetArm(disabled: !probeOn);
                         var bytes = EncodeToFile(outDir, name, W, H, frames, FrameCount, qp, slices, probeOn);
@@ -283,6 +394,8 @@ internal static class H264SliceSweepQuickHarness
     /// Fast diagonal global scroll (12 px/frame) of a textured lattice plus a 26 px/frame square —
     /// motion large enough that a tight ME range without a good seed would visibly miss.
     /// </summary>
+    internal static byte[][] HighMotionFrames(int w, int h) => GenerateHighMotion(w, h);
+
     private static byte[][] GenerateHighMotion(int w, int h)
     {
         const int Cycle = 8;

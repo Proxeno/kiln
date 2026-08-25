@@ -166,6 +166,18 @@ public class H264SingleFrameBenchmarks
             return;
         }
 
+        if (args.Length > 1 && args[0] == "--drift-probe")
+        {
+            H264DriftProbe.Run(args[1]);
+            return;
+        }
+
+        if (args.Length > 1 && args[0] == "--budget-sweep")
+        {
+            H264SliceSweepQuickHarness.RunBudgetSweep(args[1]);
+            return;
+        }
+
         foreach (var summary in BenchmarkSwitcher
                      .FromAssembly(typeof(H264SingleFrameBenchmarks).Assembly)
                      .Run(args, KilnBenchmarkHostConfig.Create()))
