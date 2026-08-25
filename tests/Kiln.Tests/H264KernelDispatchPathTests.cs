@@ -58,6 +58,7 @@ public sealed class H264KernelDispatchPathTests
         public int SadChromaPair(ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV, ReadOnlySpan<byte> predU, ReadOnlySpan<byte> predV) => _inner.SadChromaPair(srcU, srcV, predU, predV);
         public int Ssd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Ssd16x16(a, strideA, b, strideB);
         public int Ssd8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Ssd8x8(a, strideA, b, strideB);
+        public int VarianceMb16x16(ReadOnlySpan<byte> mbTopLeft, int stride) => _inner.VarianceMb16x16(mbTopLeft, stride);
         public int Satd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Satd16x16(a, strideA, b, strideB);
         public int Satd16x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Satd16x8(a, strideA, b, strideB);
         public int Satd8x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) => _inner.Satd8x16(a, strideA, b, strideB);

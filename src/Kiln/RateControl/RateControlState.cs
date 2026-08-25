@@ -29,4 +29,15 @@ public sealed class RateControlState
 
     /// <summary>Counter tracking how many frames exceeded the max frame size budget.</summary>
     public int FrameSizeOvershoots { get; set; } = 0;
+
+    /// <summary>
+    /// Tracked baseline RTT in milliseconds for the congestion multiplier test
+    /// (<see cref="RateControlConfig.CongestionRttMultiplier"/>). 0 until the first positive RTT
+    /// sample arrives; from then on it snaps down to the fastest sample seen and drifts up by
+    /// 1/256 of the gap per decision, so a genuinely changed route becomes the new baseline over a
+    /// few seconds while a transient spike barely moves it. Updated once per
+    /// <see cref="LowLatencyRateController.Decide"/> from caller-supplied feedback only — no
+    /// wall-clock input, so identical feedback sequences produce identical decisions.
+    /// </summary>
+    public double BaselineRttMs { get; set; } = 0.0;
 }

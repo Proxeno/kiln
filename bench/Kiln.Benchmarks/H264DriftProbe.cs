@@ -46,7 +46,6 @@ internal static class H264DriftProbe
             var refIdxPerFrame = new byte[Frames][];
             var partPerFrame = new H264MotionEstimator.McPartition[Frames][];
             var skipPerFrame = new bool[Frames][];
-            var subRefPerFrame = new byte[Frames][];
             var mvPerFrame = new H264MotionEstimator.Mv[Frames][];
             var subMvPerFrame = new H264MotionEstimator.Mv[Frames][];
             var streamPath = Path.Combine(outDir, $"probe_s{slices}.264");
@@ -62,7 +61,6 @@ internal static class H264DriftProbe
                     refIdxPerFrame[i] = (byte[])shared.MbRefIdx.Clone();
                     partPerFrame[i] = (H264MotionEstimator.McPartition[])shared.MbPartitions.Clone();
                     skipPerFrame[i] = (bool[])shared.MbIsSkip.Clone();
-                    subRefPerFrame[i] = (byte[])shared.MbSubPartRefIdx.Clone();
                     mvPerFrame[i] = (H264MotionEstimator.Mv[])shared.MbMvs.Clone();
                     subMvPerFrame[i] = (H264MotionEstimator.Mv[])shared.MbSubPartMvs.Clone();
                 }
@@ -123,11 +121,10 @@ internal static class H264DriftProbe
                 {
                     var mb = mby * mbW + mbx;
                     var mv = mvPerFrame[2][mb];
-                    var sr = subRefPerFrame[2];
                     var sm = subMvPerFrame[2];
                     Console.WriteLine(
                         $"    mb({mbx},{mby}) part={partPerFrame[2][mb]} skip={(skipPerFrame[2][mb] ? 1 : 0)} refIdx={refIdxPerFrame[2][mb]} " +
-                        $"mv=({mv.X},{mv.Y}) subRef=[{sr[mb * 4]},{sr[mb * 4 + 1]},{sr[mb * 4 + 2]},{sr[mb * 4 + 3]}] " +
+                        $"mv=({mv.X},{mv.Y}) " +
                         $"subMv=[({sm[mb * 4].X},{sm[mb * 4].Y})({sm[mb * 4 + 1].X},{sm[mb * 4 + 1].Y})({sm[mb * 4 + 2].X},{sm[mb * 4 + 2].Y})({sm[mb * 4 + 3].X},{sm[mb * 4 + 3].Y})]");
                 }
             }

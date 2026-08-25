@@ -32,12 +32,26 @@ public sealed record EncoderPipelineStats(
     /// <summary>Was the last frame an IDR (I-frame / instantaneous decoder refresh)?</summary>
     bool LastFrameWasIdr,
 
-    /// <summary>Estimated motion complexity of the current content (0.0-1.0, 0=static, 1=maximum motion).</summary>
+    /// <summary>
+    /// Estimated motion complexity of the content (0.0-1.0, 0=static, 1=maximum motion).
+    /// <see cref="Kiln.H264StreamingSession"/> fills this from the encoder's measured value for the
+    /// last encoded frame — mean integer-pel motion-vector magnitude over inter MBs (see
+    /// <see cref="Kiln.H264BaselineEncoder.LastFrameMotionComplexity"/>).
+    /// </summary>
     double MotionComplexity,
 
-    /// <summary>Estimated texture complexity of the current content (0.0-1.0, 0=simple, 1=complex).</summary>
+    /// <summary>
+    /// Estimated texture complexity of the content (0.0-1.0, 0=simple, 1=complex).
+    /// <see cref="Kiln.H264StreamingSession"/> fills this from the encoder's measured value for the
+    /// last encoded frame — mean log₂ MB luma activity (see
+    /// <see cref="Kiln.H264BaselineEncoder.LastFrameTextureComplexity"/>).
+    /// </summary>
     double TextureComplexity,
 
-    /// <summary>Did a scene change occur in the current frame?</summary>
+    /// <summary>
+    /// Did the last encoded frame detect a scene change (P frame coding a majority of MBs intra —
+    /// see <see cref="Kiln.H264BaselineEncoder.LastFrameSceneChange"/>)? The recovery policy answers
+    /// with a cooldown-guarded IDR on the next frame.
+    /// </summary>
     bool SceneChangeDetected
 );

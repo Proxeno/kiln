@@ -59,10 +59,20 @@ public sealed class RateControlConfig
 
     /// <summary>
     /// RTT multiplier threshold for congestion detection.
-    /// If RTT > (baseline RTT * this value), congestion is signaled.
-    /// Default: 2.
+    /// The controller tracks a baseline RTT from the feedback it is fed (fastest sample seen, with
+    /// a slow per-decision upward drift so a route change eventually becomes the new baseline);
+    /// congestion is signaled when RTT exceeds both (baseline RTT * this value) and
+    /// <see cref="CongestionRttFloor"/>. Default: 2.
     /// </summary>
     public int CongestionRttMultiplier { get; init; } = 2;
+
+    /// <summary>
+    /// Absolute RTT below which the multiplier test never signals congestion, so low-RTT links
+    /// (baseline of a few ms) are not downshifted by ordinary jitter. Matches the fixed 50 ms
+    /// threshold this test used before baseline tracking existed: RTTs at or under the floor are
+    /// never an RTT spike, exactly as before. Default: 50 ms.
+    /// </summary>
+    public TimeSpan CongestionRttFloor { get; init; } = TimeSpan.FromMilliseconds(50);
 
     /// <summary>
     /// Maximum bytes allowed in RTP send queue before flow-control throttling.

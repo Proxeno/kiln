@@ -1,3 +1,9 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
+using System.Runtime.Intrinsics.X86;
+
 namespace Kiln.Internal.H264;
 
 /// <summary>
@@ -53,10 +59,14 @@ internal static class H264VarianceFastPath
     }
 
     /// <summary>
-    /// Mean sample variance of a 16×16 luma MB (src plane, top-left at span start, row-major with <paramref name="stride"/>).
-    /// Same scaling as the 4×4 helper: population variance (Σ(x−μ)²)/N in integer luma² units.
+    /// Mean sample variance of a 16×16 luma MB (src plane, top-left at span start, row-major with
+    /// <paramref name="stride"/>). Same scaling as the 4×4 helper: population variance (Σ(x−μ)²)/N
+    /// in integer luma² units. Scalar reference; the SIMD variants below accumulate the same exact
+    /// integer Σx and Σx² (Σx ≤ 256·255 = 65 280, Σx² ≤ 256·255² &lt; 2²⁵), so every ISA returns the
+    /// bit-identical result and kernel choice can never change an encoding decision (adaptive-QP
+    /// offsets and inter search-range selection both threshold-compare this value).
     /// </summary>
-    public static int VarianceMb16x16(ReadOnlySpan<byte> mbTopLeft, int stride)
+    public static int VarianceMb16x16Scalar(ReadOnlySpan<byte> mbTopLeft, int stride)
     {
         long sum = 0;
         long sumsq = 0;
@@ -70,6 +80,79 @@ internal static class H264VarianceFastPath
                 sumsq += (long)v * v;
             }
         }
-        return (int)((256 * sumsq - sum * sum) / (256 * 256));
+        return VarianceFromSums(sum, sumsq);
     }
+
+    /// <summary>
+    /// NEON 16×16 MB variance: UADDLP row sums into a u16 accumulator (per-lane maximum
+    /// 16 · 510 = 8 160, and the full Σx = 65 280 still fits the u16 ADDV result), zero-extend then
+    /// UMLAL/UMLAL2 square-accumulate into u32 lanes (total ≤ 256 · 255² &lt; 2³¹).
+    /// </summary>
+    internal static int VarianceMb16x16AdvSimd(ReadOnlySpan<byte> mbTopLeft, int stride)
+    {
+        ref var r = ref MemoryMarshal.GetReference(mbTopLeft);
+        var sumAcc = Vector128<ushort>.Zero;
+        var sqAcc = Vector128<uint>.Zero;
+        for (var y = 0; y < 16; y++)
+        {
+            var v = Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref r, y * stride));
+            sumAcc = AdvSimd.Add(sumAcc, AdvSimd.AddPairwiseWidening(v));
+            var lo = AdvSimd.ZeroExtendWideningLower(v.GetLower());
+            var hi = AdvSimd.ZeroExtendWideningUpper(v);
+            sqAcc = AdvSimd.MultiplyWideningLowerAndAdd(sqAcc, lo.GetLower(), lo.GetLower());
+            sqAcc = AdvSimd.MultiplyWideningUpperAndAdd(sqAcc, lo, lo);
+            sqAcc = AdvSimd.MultiplyWideningLowerAndAdd(sqAcc, hi.GetLower(), hi.GetLower());
+            sqAcc = AdvSimd.MultiplyWideningUpperAndAdd(sqAcc, hi, hi);
+        }
+
+        long sum;
+        long sumsq;
+        if (AdvSimd.Arm64.IsSupported)
+        {
+            sum = AdvSimd.Arm64.AddAcross(sumAcc).ToScalar();
+            sumsq = AdvSimd.Arm64.AddAcross(sqAcc).ToScalar();
+        }
+        else
+        {
+            sum = 0;
+            for (var i = 0; i < 8; i++)
+            {
+                sum += sumAcc.GetElement(i);
+            }
+
+            sumsq = (long)sqAcc.GetElement(0) + sqAcc.GetElement(1) + sqAcc.GetElement(2) + sqAcc.GetElement(3);
+        }
+
+        return VarianceFromSums(sum, sumsq);
+    }
+
+    /// <summary>
+    /// SSE2-tier 16×16 MB variance: PSADBW-against-zero row sums into u64 lanes, zero-extend to i16
+    /// then PMADDWD square-accumulate into i32 lanes (per-lane ≤ 32 · 2 · 255² &lt; 2³¹).
+    /// </summary>
+    internal static int VarianceMb16x16Ssse3(ReadOnlySpan<byte> mbTopLeft, int stride)
+    {
+        ref var r = ref MemoryMarshal.GetReference(mbTopLeft);
+        var zero = Vector128<byte>.Zero;
+        var sumAcc = Vector128<ulong>.Zero;
+        var sqAcc = Vector128<int>.Zero;
+        for (var y = 0; y < 16; y++)
+        {
+            var v = Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref r, y * stride));
+            sumAcc = Sse2.Add(sumAcc, Sse2.SumAbsoluteDifferences(v, zero).AsUInt64());
+            var lo = Sse2.UnpackLow(v, zero).AsInt16();
+            var hi = Sse2.UnpackHigh(v, zero).AsInt16();
+            sqAcc = Sse2.Add(sqAcc, Sse2.MultiplyAddAdjacent(lo, lo));
+            sqAcc = Sse2.Add(sqAcc, Sse2.MultiplyAddAdjacent(hi, hi));
+        }
+
+        var sum = (long)(sumAcc.GetElement(0) + sumAcc.GetElement(1));
+        var sumsq = (long)sqAcc.GetElement(0) + sqAcc.GetElement(1) + sqAcc.GetElement(2) + sqAcc.GetElement(3);
+        return VarianceFromSums(sum, sumsq);
+    }
+
+    /// <summary>Shared exact final step: (256·Σx² − (Σx)²)/256² in 64-bit integer arithmetic.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int VarianceFromSums(long sum, long sumsq) =>
+        (int)((256 * sumsq - sum * sum) / (256 * 256));
 }

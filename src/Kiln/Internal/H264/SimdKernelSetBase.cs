@@ -17,6 +17,8 @@ internal abstract class SimdKernelSetBase : IH264KernelSet
     public abstract int Ssd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
     public abstract int Ssd8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
 
+    public abstract int VarianceMb16x16(ReadOnlySpan<byte> mbTopLeft, int stride);
+
     public int Satd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
         H264MotionSatd.Satd16x16Simd(a, strideA, b, strideB);
 
