@@ -283,18 +283,19 @@ internal sealed class H264BaselineSliceEncoder
     // unlimited), and still bounds pathological-content encode time to ~1.7x the legacy budget
     // (unlimited: ~2.1x). Raising it further trades ~10% more worst-case time for ~+0.8 dB.
     private const int SubPartBudgetMbDivisor = 4;
-    private readonly int _subPartitionRangeCap;
+    private int _subPartitionRangeCap;
 
     // Deterministic per-slice motion-search effort budget (see
     // H264BaselineEncoderOptions.MotionSearchEffortCapPerMb): an equal share of the frame budget,
-    // fixed at construction (capPerMb x frame MB count / slice count — equal, not proportional to
+    // set at construction and adjustable between frames via ReconfigureSpeedKnobs
+    // (capPerMb x frame MB count / slice count — equal, not proportional to
     // the slice's MB count, because the effort-balanced partition deliberately gives high-motion
     // bands fewer rows; a proportional budget would bind on exactly the slice the balancer already
     // equalised). Consumption is read from the thread-local
     // H264MotionEstimator.ThreadSearchEffort as a delta from the slice start — each slice encodes
     // sequentially on a single worker thread, so the delta contains exactly this slice's work and
     // the resulting decisions are independent of thread scheduling.
-    private readonly long _meEffortBudget;
+    private long _meEffortBudget;
     private long _meEffortAtSliceStart;
 
     /// <summary>First MB row of the current slice — used to scope deblocking to the slice range.</summary>
@@ -316,7 +317,7 @@ internal sealed class H264BaselineSliceEncoder
     /// <summary>When true: slice disables in-loop filtering (IDC=1); encoder skips deblock apply.</summary>
     private readonly bool _lightweightDeblocking;
     private readonly bool _fastSearch;
-    private readonly bool _useMotionSatd;
+    private bool _useMotionSatd;
     private readonly bool _enableIntraInPFallback;
     private readonly int? _experimentalZeroMvSkipSadThreshold;
     private readonly bool _useTrellis;
@@ -458,6 +459,13 @@ internal sealed class H264BaselineSliceEncoder
     /// Slice luma QP for this coded picture (&lt; 0 omits adjustment: derive from ctor base <see cref="_qp"/>).
     /// Must stay compatible with emitted PPS <c>pic_init_qp_minus26</c>: delta is signaled via slice <c>slice_qp_delta</c>.
     /// </param>
+    /// <param name="pictureTargetBitsOverride">
+    /// When &gt; 0, the picture-wide bit budget for this coded picture, overriding the constructor's
+    /// <c>targetBitsPerFrame</c> (multi-slice frames still receive their proportional share). When
+    /// ≤ 0, the constructor budget applies unchanged — including constant-QP when it was 0. A
+    /// mid-stream switch from a positive constructor budget back to constant QP is not expressible
+    /// per frame; construct with 0 and drive budgets purely through this override instead.
+    /// </param>
     public ReadOnlySpan<byte> EncodeSliceRbsp(
         ReadOnlySpan<byte> y,
         int strideY,
@@ -473,7 +481,8 @@ internal sealed class H264BaselineSliceEncoder
         int mbCountInSlice = -1,
         bool filterAcrossSlicesDisabled = false,
         bool isFirstSliceInFrame = true,
-        int codedFrameIndex = -1)
+        int codedFrameIndex = -1,
+        int pictureTargetBitsOverride = -1)
     {
         var collectFramePhases = H264PInterDiagnostics.CollectFramePhases;
         var sliceStartTicks = collectFramePhases ? Stopwatch.GetTimestamp() : 0;
@@ -549,9 +558,13 @@ internal sealed class H264BaselineSliceEncoder
 
         // Rate control: single-slice uses full-picture budget + global MB index. Multi-slice + TargetBitsPerFrame
         // uses this slice's proportional budget and slice-local MB indices so cumTarget matches _cumSpentThisFrame.
-        if (effectiveMbCount < _mbCount && _rateControl.PictureTargetBits > 0)
+        // A positive pictureTargetBitsOverride replaces the picture budget for this coded picture only
+        // (H264RateControl.StartFrame was always designed to take a per-picture override; this is the
+        // first caller to pass one).
+        var pictureTargetBits = pictureTargetBitsOverride > 0 ? pictureTargetBitsOverride : _rateControl.PictureTargetBits;
+        if (effectiveMbCount < _mbCount && pictureTargetBits > 0)
         {
-            var sliceBudget = (int)((long)_rateControl.PictureTargetBits * effectiveMbCount / _mbCount);
+            var sliceBudget = (int)((long)pictureTargetBits * effectiveMbCount / _mbCount);
             _rateControl.StartFrame(
                 targetBitsThisFrame: 0,
                 constantSliceLumaQp: sliceQpApplied,
@@ -560,7 +573,9 @@ internal sealed class H264BaselineSliceEncoder
         }
         else
         {
-            _rateControl.StartFrame(targetBitsThisFrame: 0, constantSliceLumaQp: sliceQpApplied);
+            _rateControl.StartFrame(
+                targetBitsThisFrame: pictureTargetBitsOverride > 0 ? pictureTargetBitsOverride : 0,
+                constantSliceLumaQp: sliceQpApplied);
         }
 
         _lastMbQp = sliceQpApplied;
@@ -726,6 +741,27 @@ internal sealed class H264BaselineSliceEncoder
         }
 
         ResetForFrame();
+    }
+
+    /// <summary>
+    /// Reassign the search-only speed knobs between frames (mid-stream speed adaptation). All three
+    /// affect only which prediction the encoder <em>chooses</em>, never how a choice is coded, so a
+    /// change on any frame boundary produces a bitstream a conformant decoder reads exactly like one
+    /// encoded with these values from the start. Must never be called while
+    /// <see cref="EncodeSliceRbsp"/> is running (the parallel slice section reads these fields);
+    /// the orchestrator calls it single-threaded between frames.
+    /// </summary>
+    /// <param name="useMotionSatd">SATD (true) or SAD (false) scoring for integer-pel ME candidates.</param>
+    /// <param name="subPartitionRangeCap">Sub-partition integer search radius cap, clamped to ≥ 1.</param>
+    /// <param name="motionSearchEffortSliceBudget">
+    /// This slice's share of the frame ME effort budget in candidate-evaluation units;
+    /// ≤ 0 means unbounded (same convention as the constructor parameter).
+    /// </param>
+    internal void ReconfigureSpeedKnobs(bool useMotionSatd, int subPartitionRangeCap, long motionSearchEffortSliceBudget)
+    {
+        _useMotionSatd = useMotionSatd;
+        _subPartitionRangeCap = Math.Max(1, subPartitionRangeCap);
+        _meEffortBudget = motionSearchEffortSliceBudget > 0 ? motionSearchEffortSliceBudget : long.MaxValue;
     }
 
     /// <summary>
