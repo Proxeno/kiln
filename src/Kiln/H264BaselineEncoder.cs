@@ -488,6 +488,9 @@ public sealed class H264BaselineEncoder : IDisposable
     /// <summary>Test support: per-MB luma QP after the most recent <see cref="EncodeFrame"/>.</summary>
     internal ReadOnlySpan<int> TestHookLastEncodedQpY => _frameShared.QpY;
 
+    /// <summary>Test support: the shared frame state (per-MB caches, DPB) for white-box assertions.</summary>
+    internal H264FrameSharedState TestHookFrameShared => _frameShared;
+
     /// <summary>True if the most recent <see cref="EncodeFrame"/> emitted an IDR access unit.</summary>
     public bool LastFrameWasIdr { get; private set; }
 

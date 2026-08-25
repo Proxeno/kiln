@@ -145,18 +145,16 @@ internal static class H264DeblockingFilter
                     continue;
                 }
 
-                var qpYVal = qpY[mbIndex];
-
                 if (hasVertical)
                 {
-                    FilterMbVerticalLuma(y, strideY, mbWidth, mx, my, bsVertical, qpYVal, alphaOffsetDiv2, betaOffsetDiv2, useSimd);
+                    FilterMbVerticalLuma(y, strideY, mbWidth, mx, my, bsVertical, qpY, mbIndex, alphaOffsetDiv2, betaOffsetDiv2, useSimd);
                     FilterMbVerticalChroma(u, strideUv, mbWidth, mx, my, bsVertical, qpUv, mbIndex, alphaOffsetDiv2, betaOffsetDiv2);
                     FilterMbVerticalChroma(v, strideUv, mbWidth, mx, my, bsVertical, qpUv, mbIndex, alphaOffsetDiv2, betaOffsetDiv2);
                 }
 
                 if (hasHorizontal)
                 {
-                    FilterMbHorizontalLuma(y, strideY, mbWidth, mx, my, bsHorizontal, qpYVal, alphaOffsetDiv2, betaOffsetDiv2, useSimd);
+                    FilterMbHorizontalLuma(y, strideY, mbWidth, mx, my, bsHorizontal, qpY, mbIndex, alphaOffsetDiv2, betaOffsetDiv2, useSimd);
                     FilterMbHorizontalChroma(u, strideUv, mbWidth, mx, my, bsHorizontal, qpUv, mbIndex, alphaOffsetDiv2, betaOffsetDiv2);
                     FilterMbHorizontalChroma(v, strideUv, mbWidth, mx, my, bsHorizontal, qpUv, mbIndex, alphaOffsetDiv2, betaOffsetDiv2);
                 }
@@ -328,6 +326,36 @@ internal static class H264DeblockingFilter
         q0 = (byte)((2 * q1 + q0 + p1 + 2) >> 2);
     }
 
+    /// <summary>
+    /// H.264 8.7.2.2 — luma qP for one vertical edge: the MB-boundary edge (edge 0 with a left
+    /// neighbour) averages the two MBs' QPY (<c>qPav = (QPp + QPq + 1) &gt;&gt; 1</c>); internal
+    /// edges use the MB's own QPY. With constant-QP streams the average degenerates to the MB QP,
+    /// which is why the historical current-MB-only shortcut only diverged once per-MB rate control
+    /// (<c>TargetBitsPerFrame</c>) made neighbouring QPs differ.
+    /// </summary>
+    private static int LumaQpForVerticalEdge(ReadOnlySpan<int> qpY, int mbIndex, int edgeIndex, int mx)
+    {
+        var qpCurrent = qpY[mbIndex];
+        if (edgeIndex == 0 && mx > 0)
+        {
+            return (qpY[mbIndex - 1] + qpCurrent + 1) >> 1;
+        }
+
+        return qpCurrent;
+    }
+
+    /// <summary>H.264 8.7.2.2 — luma qP for one horizontal edge (see <see cref="LumaQpForVerticalEdge"/>).</summary>
+    private static int LumaQpForHorizontalEdge(ReadOnlySpan<int> qpY, int mbWidth, int mbIndex, int edgeIndex, int my)
+    {
+        var qpCurrent = qpY[mbIndex];
+        if (edgeIndex == 0 && my > 0)
+        {
+            return (qpY[mbIndex - mbWidth] + qpCurrent + 1) >> 1;
+        }
+
+        return qpCurrent;
+    }
+
     /// <summary>H.264 8.7.1 — vertical luma edges within one MB (left-to-right), picture-left edge skipped.</summary>
     private static void FilterMbVerticalLuma(
         Span<byte> y,
@@ -336,22 +364,24 @@ internal static class H264DeblockingFilter
         int mx,
         int my,
         ReadOnlySpan<byte> bsVertical,
-        int qp,
+        ReadOnlySpan<int> qpY,
+        int mbIndex,
         int alphaOffsetDiv2,
         int betaOffsetDiv2,
         bool useSimd)
     {
-        var mbIndex = (my * mbWidth) + mx;
-        var indexA = IndexA(qp, alphaOffsetDiv2);
-        var alpha = AlphaTable[indexA];
-        var beta = BetaTable[IndexB(qp, betaOffsetDiv2)];
-
         for (var ev = 0; ev < 4; ev++)
         {
             if (ev == 0 && mx == 0)
             {
                 continue;
             }
+
+            // Per-edge qP (8.7.2.2): the MB-boundary edge averages with the left neighbour's QPY.
+            var qp = LumaQpForVerticalEdge(qpY, mbIndex, ev, mx);
+            var indexA = IndexA(qp, alphaOffsetDiv2);
+            var alpha = AlphaTable[indexA];
+            var beta = BetaTable[IndexB(qp, betaOffsetDiv2)];
 
             var bsBase = (mbIndex * 16) + (ev * 4);
             var px = (mx * 16) + (ev * 4);
@@ -417,22 +447,24 @@ internal static class H264DeblockingFilter
         int mx,
         int my,
         ReadOnlySpan<byte> bsHorizontal,
-        int qp,
+        ReadOnlySpan<int> qpY,
+        int mbIndex,
         int alphaOffsetDiv2,
         int betaOffsetDiv2,
         bool useSimd)
     {
-        var mbIndex = (my * mbWidth) + mx;
-        var indexA = IndexA(qp, alphaOffsetDiv2);
-        var alpha = AlphaTable[indexA];
-        var beta = BetaTable[IndexB(qp, betaOffsetDiv2)];
-
         for (var eh = 0; eh < 4; eh++)
         {
             if (eh == 0 && my == 0)
             {
                 continue;
             }
+
+            // Per-edge qP (8.7.2.2): the MB-boundary edge averages with the top neighbour's QPY.
+            var qp = LumaQpForHorizontalEdge(qpY, mbWidth, mbIndex, eh, my);
+            var indexA = IndexA(qp, alphaOffsetDiv2);
+            var alpha = AlphaTable[indexA];
+            var beta = BetaTable[IndexB(qp, betaOffsetDiv2)];
 
             var bsBase = (mbIndex * 16) + (eh * 4);
             var pyEdge = (my * 16) + (eh * 4);

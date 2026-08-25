@@ -76,13 +76,28 @@ internal static class H264InterBoundaryStrength
     }
 
     /// <summary>
-    /// H.264 8.7.2.1 (inter–inter, after intra/ref branches in the slice encoder): reference index mismatch →
-    /// <c>1</c>; else <c>|Δmvx| ≥ 4</c> or <c>|Δmvy| ≥ 4</c> qpel → <c>1</c>; else either side has non-zero
-    /// transform coefficients → <c>2</c>; else <c>0</c>. When <c>RefIdx</c> mismatches (<c>-1</c> intra vs
-    /// inter) this returns <c>1</c> so the slice encoder can overlay <c>3</c>/<c>4</c> on true intra edges.
+    /// H.264 8.7.2.1 (inter–inter, after the intra branches in the slice encoder), in the clause's
+    /// order of precedence: either adjacent 4×4 luma block has non-zero transform coefficient levels
+    /// → <c>2</c>; else reference index mismatch or <c>|Δmvx| ≥ 4</c> / <c>|Δmvy| ≥ 4</c> qpel →
+    /// <c>1</c>; else <c>0</c>. When <c>RefIdx</c> mismatches (<c>-1</c> intra vs inter) the ≥ 1
+    /// result lets the slice encoder overlay <c>3</c>/<c>4</c> on true intra edges.
+    /// <para>
+    /// The coefficient condition must be tested <em>before</em> the MV/ref condition: a historical
+    /// version returned 1 on MV difference first, which mis-derived every coefficient-carrying edge
+    /// between differently-moving blocks as bS=1. Table 8-17 masks the difference wherever
+    /// tC0[indexA, 0] == tC0[indexA, 1] — true at the QPs the byte-exact oracle tests happened to
+    /// use (23, 28, 33, 34) — but at e.g. QP 31/32/35/36 (or any per-MB-QP stream whose edge
+    /// averages land there) the encoder's reconstruction silently drifted from every conformant
+    /// decoder's, compounding through the DPB exactly like the v0.2.0 P_Skip bug.
+    /// </para>
     /// </summary>
     private static byte ComputeBs(InterEdgeNeighbour a, InterEdgeNeighbour b)
     {
+        if (a.NonZeroCoeffs || b.NonZeroCoeffs)
+        {
+            return 2;
+        }
+
         if (a.RefIdx != b.RefIdx)
         {
             return 1;
@@ -96,11 +111,6 @@ internal static class H264InterBoundaryStrength
         if (Math.Abs(a.MvYQpel - b.MvYQpel) >= 4)
         {
             return 1;
-        }
-
-        if (a.RefIdx >= 0 && b.RefIdx >= 0 && (a.NonZeroCoeffs || b.NonZeroCoeffs))
-        {
-            return 2;
         }
 
         return 0;

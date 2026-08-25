@@ -139,14 +139,19 @@ public sealed class H264InterBoundaryStrengthTests
     }
 
     /// <summary>
-    /// H.264 8.7.2.1: MV component difference <c>≥ 4</c> qpel is evaluated <em>before</em> non-zero coeffs;
-    /// residual blocks still yield <c>bs = 1</c>, not <c>2</c>, when <c>|Δmv| ≥ 4</c> across the edge.
+    /// H.264 8.7.2.1: the non-zero-coefficient condition (bS=2) is evaluated <em>before</em> the
+    /// MV/ref condition (bS=1) — an edge whose adjacent block carries coded residual is bS=2 even
+    /// when <c>|Δmv| ≥ 4</c> across the edge. A historical version of <c>ComputeBs</c> (and of this
+    /// test) had the precedence inverted; the difference is masked wherever Table 8-17 gives equal
+    /// tC0 for bS 1 and 2 (QP 23/28/33/34 among others) but silently desynchronised the encoder's
+    /// reconstruction from conformant decoders at e.g. QP 31/32/35/36 — verified against both
+    /// ffmpeg and VideoToolbox, which decode such edges with the bS=2 thresholds.
     /// </summary>
     [Fact]
-    public void Compute_large_mv_delta_takes_precedence_over_nonzero_coeffs()
+    public void Compute_nonzero_coeffs_take_precedence_over_large_mv_delta()
     {
         var thisMb = UniformBlocks(refIdx: 0, mvX: 0, mvY: 0);
-        // Same geometry as Δmv.x = 4 case: divergent MV on block 6 vs neighbours at MV 0, plus coded residual on 6.
+        // Divergent MV on block 6 vs neighbours at MV 0, plus coded residual on 6.
         thisMb[6] = new InterEdgeNeighbour(RefIdx: 0, MvXQpel: 4, MvYQpel: 0, NonZeroCoeffs: true);
 
         var bsH = new byte[16];
@@ -154,10 +159,10 @@ public sealed class H264InterBoundaryStrengthTests
         H264InterBoundaryStrength.Compute(thisMb, ReadOnlySpan<InterEdgeNeighbour>.Empty,
             ReadOnlySpan<InterEdgeNeighbour>.Empty, bsH, bsV);
 
-        bsH[1 * 4 + 2].Should().Be(1, "MV rule precedes coeffs: must be bs=1, not bs=2");
-        bsH[2 * 4 + 2].Should().Be(1);
-        bsV[2 * 4 + 1].Should().Be(1);
-        bsV[3 * 4 + 1].Should().Be(1);
+        bsH[1 * 4 + 2].Should().Be(2, "coefficient rule precedes the MV rule (8.7.2.1): must be bs=2, not bs=1");
+        bsH[2 * 4 + 2].Should().Be(2);
+        bsV[2 * 4 + 1].Should().Be(2);
+        bsV[3 * 4 + 1].Should().Be(2);
     }
 
     /// <summary>
