@@ -128,7 +128,11 @@ internal static class H264PSliceTraceDecoder
                 desc = $"{desc} cbp={cbp}";
                 var cbpLuma = cbp & 0x0F;
                 var cbpChroma = cbp >> 4;
-                if (cbp != 0) ReadSe(br); // mb_qp_delta
+                if (cbp != 0)
+                {
+                    var qpd = ReadSe(br); // mb_qp_delta
+                    log?.Add($"MB{mb}: qp_delta={qpd}");
+                }
                 ReadInterLuma(br, mb, mbWidth, cbpLuma, lumaNz, forceNcZero);
                 ReadChroma(br, mb, mbWidth, cbpChroma, lumaNz, chromaNz, forceNcZero);
             }
@@ -148,7 +152,11 @@ internal static class H264PSliceTraceDecoder
                     var cbp = ReadIntraCbp(br);
                     var cbpLuma = cbp & 0x0F;
                     var cbpChroma = cbp >> 4;
-                    if (cbp != 0) ReadSe(br);
+                    if (cbp != 0)
+                    {
+                        var qpd = ReadSe(br); // mb_qp_delta
+                        log?.Add($"MB{mb}: qp_delta={qpd}");
+                    }
                     ReadIntra4x4Luma(br, mb, mbWidth, cbpLuma, lumaNz, forceNcZero);
                     ReadChroma(br, mb, mbWidth, cbpChroma, lumaNz, chromaNz, forceNcZero);
                     desc = "I_4x4";
@@ -161,7 +169,10 @@ internal static class H264PSliceTraceDecoder
                     var cbpChroma = (raw / 4) % 3;
                     var cbpLumaAc = raw / 12;
                     ReadUe(br); // intra_chroma_pred_mode
-                    ReadSe(br); // mb_qp_delta (always present for I_16x16)
+                    {
+                        var qpd = ReadSe(br); // mb_qp_delta (always present for I_16x16)
+                        log?.Add($"MB{mb}: qp_delta={qpd}");
+                    }
                     ReadI16x16Luma(br, mb, mbWidth, cbpLumaAc, lumaNz, forceNcZero, log);
                     ReadChroma(br, mb, mbWidth, cbpChroma, lumaNz, chromaNz, forceNcZero);
                     desc = $"I_16x16(pm={predMode},la={cbpLumaAc},cr={cbpChroma})";
