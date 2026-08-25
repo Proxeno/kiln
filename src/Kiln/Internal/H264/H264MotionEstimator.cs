@@ -74,8 +74,7 @@ internal static class H264MotionEstimator
         int pictureWidth = 0,
         int pictureHeight = 0,
         int fractionalPelRefinementRounds = 2,
-        int lambda = 0,
-        H264ReferenceTransformAtlas? referenceTransformAtlas = null)
+        int lambda = 0)
     {
         return SearchBlock(
             current, currentStride, reference, referenceStride, mbX, mbY, mvPredictor, searchRange,
@@ -83,8 +82,7 @@ internal static class H264MotionEstimator
             kernels,
             useMotionSatd,
             lambda,
-            pictureWidth, pictureHeight, fractionalPelRefinementRounds,
-            referenceTransformAtlas: referenceTransformAtlas);
+            pictureWidth, pictureHeight, fractionalPelRefinementRounds);
     }
 
     /// <summary>
@@ -107,7 +105,6 @@ internal static class H264MotionEstimator
         int pictureHeight = 0,
         int fastSeedSearchRange = 0,
         bool allowSubPartitionSearch = true,
-        H264ReferenceTransformAtlas? referenceTransformAtlas = null,
         int subPartitionRangeCap = 8,
         bool allowExhaustiveFallback = true)
     {
@@ -156,12 +153,10 @@ internal static class H264MotionEstimator
                 useMotionSatd,
                 lambda,
                 pictureWidth,
-                pictureHeight,
-                referenceTransformAtlas: referenceTransformAtlas)
+                pictureHeight)
             : SearchMb16x16(current, currentStride, reference, referenceStride, mbX, mbY, mvPredictor, searchRange,
                 useMotionSatd, kernels,
-                pictureWidth: pictureWidth, pictureHeight: pictureHeight, fractionalPelRefinementRounds: 2, lambda: lambda,
-                referenceTransformAtlas: referenceTransformAtlas);
+                pictureWidth: pictureWidth, pictureHeight: pictureHeight, fractionalPelRefinementRounds: 2, lambda: lambda);
 
         // Hex (fast) search descends from a single seed and can lodge in a local minimum, missing
         // large/abrupt motion entirely — fatal for fast camera pans where no spatial or temporal
@@ -176,8 +171,7 @@ internal static class H264MotionEstimator
             var full = SearchMb16x16(
                 current, currentStride, reference, referenceStride, mbX, mbY, mvPredictor, seedSearchRange,
                 useMotionSatd, kernels,
-                pictureWidth: pictureWidth, pictureHeight: pictureHeight, fractionalPelRefinementRounds: 2, lambda: lambda,
-                referenceTransformAtlas: referenceTransformAtlas);
+                pictureWidth: pictureWidth, pictureHeight: pictureHeight, fractionalPelRefinementRounds: 2, lambda: lambda);
             // Adopt the exhaustive result only on a SUBSTANTIAL win (< half the hex SAD). A big drop
             // means the hex lodged in a local minimum and the full search found the true (large,
             // ~uniform) motion — exactly the case we want, and its MV is also the right centre to seed
@@ -202,36 +196,33 @@ internal static class H264MotionEstimator
         // in SearchMbSubPartitionsUnified visits each candidate MV exactly once, and an atom key
         // (sourceIndex, refX, refY) is unique per (source block, candidate) pair. The reuse that does
         // exist is purely reference-side — the same reference 4x4 is transformed for many candidates —
-        // and that is already captured by the reference transform atlas / refTransformCache below.
+        // and that is already captured by the per-MB refTransformCache grid below.
         byte[]? rentedSatd4x4RefTransformValid = null;
         short[]? rentedSatd4x4RefTransformCacheValues = null;
         Span<short> satd4x4SourceCoefficients = stackalloc short[16 * H264MotionSatd.Transform4x4CoefficientCount];
         var satd4x4RefTransformCache = default(Satd4x4RefTransformGrid);
         if (useMotionSatd)
         {
-            if (referenceTransformAtlas is null)
+            var refTransformOriginX = mbX + (seed16x16.X >> 2) - subSearchRange;
+            var refTransformOriginY = mbY + (seed16x16.Y >> 2) - subSearchRange;
+            var refTransformWidth = (subSearchRange << 1) + 13;
+            var refTransformHeight = refTransformWidth;
+            var refTransformSlotCount = checked(refTransformWidth * refTransformHeight);
+            rentedSatd4x4RefTransformValid = ArrayPool<byte>.Shared.Rent(refTransformSlotCount);
+            rentedSatd4x4RefTransformCacheValues = ArrayPool<short>.Shared.Rent(
+                refTransformSlotCount * H264MotionSatd.Transform4x4CoefficientCount);
+            var refTransformValid = rentedSatd4x4RefTransformValid.AsSpan(0, refTransformSlotCount);
+            refTransformValid.Clear();
+            satd4x4RefTransformCache = new Satd4x4RefTransformGrid
             {
-                var refTransformOriginX = mbX + (seed16x16.X >> 2) - subSearchRange;
-                var refTransformOriginY = mbY + (seed16x16.Y >> 2) - subSearchRange;
-                var refTransformWidth = (subSearchRange << 1) + 13;
-                var refTransformHeight = refTransformWidth;
-                var refTransformSlotCount = checked(refTransformWidth * refTransformHeight);
-                rentedSatd4x4RefTransformValid = ArrayPool<byte>.Shared.Rent(refTransformSlotCount);
-                rentedSatd4x4RefTransformCacheValues = ArrayPool<short>.Shared.Rent(
-                    refTransformSlotCount * H264MotionSatd.Transform4x4CoefficientCount);
-                var refTransformValid = rentedSatd4x4RefTransformValid.AsSpan(0, refTransformSlotCount);
-                refTransformValid.Clear();
-                satd4x4RefTransformCache = new Satd4x4RefTransformGrid
-                {
-                    Valid = refTransformValid,
-                    Coefficients = rentedSatd4x4RefTransformCacheValues.AsSpan(
-                        0, refTransformSlotCount * H264MotionSatd.Transform4x4CoefficientCount),
-                    OriginX = refTransformOriginX,
-                    OriginY = refTransformOriginY,
-                    Width = refTransformWidth,
-                    Height = refTransformHeight,
-                };
-            }
+                Valid = refTransformValid,
+                Coefficients = rentedSatd4x4RefTransformCacheValues.AsSpan(
+                    0, refTransformSlotCount * H264MotionSatd.Transform4x4CoefficientCount),
+                OriginX = refTransformOriginX,
+                OriginY = refTransformOriginY,
+                Width = refTransformWidth,
+                Height = refTransformHeight,
+            };
 
             PrecomputeMb4x4Transforms(current, currentStride, satd4x4SourceCoefficients);
         }
@@ -245,7 +236,7 @@ internal static class H264MotionEstimator
                     mbX, mbY, seed16x16, subSearchRange,
                     kernels, lambda, pictureWidth, pictureHeight,
                     satd4x4SourceCoefficients,
-                    satd4x4RefTransformCache, referenceTransformAtlas,
+                    satd4x4RefTransformCache,
                     best.TotalSad,
                     out var uTop, out var uBot,
                     out var uLeft, out var uRight,
@@ -271,7 +262,6 @@ internal static class H264MotionEstimator
                     currentBlockX: 0, currentBlockY: 0,
                     sourceTransformCoefficients: satd4x4SourceCoefficients,
                     refTransformCache: satd4x4RefTransformCache,
-                    referenceTransformAtlas: referenceTransformAtlas,
                     scoreCeilingExclusive: best.TotalSad);
                 if (t.BestSad < best.TotalSad)
                 {
@@ -281,7 +271,6 @@ internal static class H264MotionEstimator
                         currentBlockX: 0, currentBlockY: 8,
                         sourceTransformCoefficients: satd4x4SourceCoefficients,
                         refTransformCache: satd4x4RefTransformCache,
-                        referenceTransformAtlas: referenceTransformAtlas,
                         scoreCeilingExclusive: bCeiling);
                     if (b.BestSad < bCeiling)
                         Try(McPartition.Mb16x8, checked(t.BestSad + b.BestSad), t.BestMv, b.BestMv, default, default);
@@ -292,7 +281,6 @@ internal static class H264MotionEstimator
                     currentBlockX: 0, currentBlockY: 0,
                     sourceTransformCoefficients: satd4x4SourceCoefficients,
                     refTransformCache: satd4x4RefTransformCache,
-                    referenceTransformAtlas: referenceTransformAtlas,
                     scoreCeilingExclusive: best.TotalSad);
                 if (l.BestSad < best.TotalSad)
                 {
@@ -302,7 +290,6 @@ internal static class H264MotionEstimator
                         currentBlockX: 8, currentBlockY: 0,
                         sourceTransformCoefficients: satd4x4SourceCoefficients,
                         refTransformCache: satd4x4RefTransformCache,
-                        referenceTransformAtlas: referenceTransformAtlas,
                         scoreCeilingExclusive: rCeiling);
                     if (r.BestSad < rCeiling)
                         Try(McPartition.Mb8x16, checked(l.BestSad + r.BestSad), l.BestMv, r.BestMv, default, default);
@@ -313,7 +300,6 @@ internal static class H264MotionEstimator
                     currentBlockX: 0, currentBlockY: 0,
                     sourceTransformCoefficients: satd4x4SourceCoefficients,
                     refTransformCache: satd4x4RefTransformCache,
-                    referenceTransformAtlas: referenceTransformAtlas,
                     scoreCeilingExclusive: best.TotalSad);
                 if (q00.BestSad < best.TotalSad)
                 {
@@ -323,7 +309,6 @@ internal static class H264MotionEstimator
                         currentBlockX: 8, currentBlockY: 0,
                         sourceTransformCoefficients: satd4x4SourceCoefficients,
                         refTransformCache: satd4x4RefTransformCache,
-                        referenceTransformAtlas: referenceTransformAtlas,
                         scoreCeilingExclusive: q10Ceiling);
                     if (q10.BestSad < q10Ceiling)
                     {
@@ -336,7 +321,6 @@ internal static class H264MotionEstimator
                                 currentBlockX: 0, currentBlockY: 8,
                                 sourceTransformCoefficients: satd4x4SourceCoefficients,
                                 refTransformCache: satd4x4RefTransformCache,
-                                referenceTransformAtlas: referenceTransformAtlas,
                                 scoreCeilingExclusive: q01Ceiling);
                             if (q01.BestSad < q01Ceiling)
                             {
@@ -349,7 +333,6 @@ internal static class H264MotionEstimator
                                         currentBlockX: 8, currentBlockY: 8,
                                         sourceTransformCoefficients: satd4x4SourceCoefficients,
                                         refTransformCache: satd4x4RefTransformCache,
-                                        referenceTransformAtlas: referenceTransformAtlas,
                                         scoreCeilingExclusive: q11Ceiling);
                                     if (q11.BestSad < q11Ceiling)
                                         Try(McPartition.Mb8x8, checked(q01Sum + q11.BestSad), q00.BestMv, q10.BestMv, q01.BestMv, q11.BestMv);
@@ -641,7 +624,6 @@ internal static class H264MotionEstimator
         int pictureWidth, int pictureHeight,
         Span<short> sourceTransformCoefficients,
         Satd4x4RefTransformGrid refTransformCache,
-        H264ReferenceTransformAtlas? referenceTransformAtlas,
         int globalCeiling,
         out SearchResult top, out SearchResult bot,
         out SearchResult left, out SearchResult right,
@@ -796,8 +778,11 @@ internal static class H264MotionEstimator
                     // for the right half would have high sadTL+sadBL yet a valid 8x16-right candidate.
                     // So we compute each quadrant's SAD atom once and derive per-shape lower bounds,
                     // skipping SATD only when NO shape can possibly improve on its current best.
+                    var sTl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 0, rx, ry);
+                    var sTr = -1;
+                    var sBl = -1;
+                    var sBr = -1;
                     {
-                        var sTl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 0, rx, ry);
                         var lb00 = ((sTl + 1) >> 1) + mvCost;
                         if (lb00 >= q00BestScore)
                         {
@@ -805,13 +790,13 @@ internal static class H264MotionEstimator
                             var canImprove = false;
                             if (trFits)
                             {
-                                var sTr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 1, rx, ry);
+                                sTr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 1, rx, ry);
                                 canImprove = ((sTr + 1) >> 1) + mvCost < q10BestScore ||
                                              ((sTl + sTr + 1) >> 1) + mvCost < topBestScore;
                                 if (!canImprove && blFits) // brFits ⊆ trFits && blFits
                                 {
-                                    var sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
-                                    var sBr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 3, rx, ry);
+                                    sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
+                                    sBr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 3, rx, ry);
                                     canImprove =
                                         ((sBl + 1) >> 1) + mvCost < q01BestScore ||
                                         ((sBr + 1) >> 1) + mvCost < q11BestScore ||
@@ -822,7 +807,7 @@ internal static class H264MotionEstimator
                             }
                             else if (blFits)
                             {
-                                var sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
+                                sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
                                 canImprove = ((sBl + 1) >> 1) + mvCost < q01BestScore ||
                                              ((sTl + sBl + 1) >> 1) + mvCost < leftBestScore;
                             }
@@ -831,54 +816,105 @@ internal static class H264MotionEstimator
                         }
                     }
 
-                    // Compute SATD 4x4 atoms; skip columns/rows that fall outside the picture
+                    // Quadrant-level gate: skip a quadrant's four SATD atoms when every shape using
+                    // that quadrant has a SAD lower bound STRICTLY above its current best score.
+                    // Strict '>' pruning is bitstream-identical by construction: SAD/2 never exceeds
+                    // SATD, so lb > best implies candScore > bestScore, which IsBetterScoreCandidate
+                    // rejects regardless of its SAD / MV-magnitude tie-breaks. (The candidate-level
+                    // pre-filter above keeps its historical '>=' semantics untouched.)
+                    var needTl = true;
+                    var needTr = trFits;
+                    var needBl = blFits;
+                    var needBr = brFits;
+                    if (!H264PInterDiagnostics.DisableUnifiedQuadrantGate)
+                    {
+                        if (trFits && sTr < 0)
+                            sTr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 1, rx, ry);
+                        if (blFits && sBl < 0)
+                            sBl = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 2, rx, ry);
+                        if (brFits && sBr < 0)
+                            sBr = Sad8x8Atom(kernels, currentMb, currentMbStride, reference, referenceStride, 3, rx, ry);
+
+                        var possQ00 = !q00Done && chromaTL && ((sTl + 1) >> 1) + mvCost <= q00BestScore;
+                        var possQ10 = !q10Done && trFits && chromaTR && ((sTr + 1) >> 1) + mvCost <= q10BestScore;
+                        var possQ01 = !q01Done && blFits && chromaBL && ((sBl + 1) >> 1) + mvCost <= q01BestScore;
+                        var possQ11 = !q11Done && brFits && chromaBR && ((sBr + 1) >> 1) + mvCost <= q11BestScore;
+                        var possTop = !topDone && trFits && chromaTL && chromaTR &&
+                            ((sTl + sTr + 1) >> 1) + mvCost <= topBestScore;
+                        var possBot = !botDone && brFits && chromaBL && chromaBR &&
+                            ((sBl + sBr + 1) >> 1) + mvCost <= botBestScore;
+                        var possLeft = !leftDone && blFits && chromaTL && chromaBL &&
+                            ((sTl + sBl + 1) >> 1) + mvCost <= leftBestScore;
+                        var possRight = !rightDone && brFits && chromaTR && chromaBR &&
+                            ((sTr + sBr + 1) >> 1) + mvCost <= rightBestScore;
+
+                        needTl = possQ00 || possTop || possLeft;
+                        needTr = possQ10 || possTop || possRight;
+                        needBl = possQ01 || possBot || possLeft;
+                        needBr = possQ11 || possBot || possRight;
+                        if (!needTl && !needTr && !needBl && !needBr)
+                            continue;
+                    }
+
+                    // Compute SATD 4x4 atoms; skip columns/rows that fall outside the picture and
+                    // quadrants the gate proved irrelevant.
                     var bxLim = xFit16 ? 4 : 2;
                     var byLim = yFit16 ? 4 : 2;
+                    var atomCount = 0;
                     for (var by = 0; by < byLim; by++)
                     {
                         var sy = by * 4;
                         var ry4 = ry + sy;
+                        var topHalf = by < 2;
                         for (var bx = 0; bx < bxLim; bx++)
                         {
+                            var need = bx < 2
+                                ? (topHalf ? needTl : needBl)
+                                : (topHalf ? needTr : needBr);
+                            if (!need)
+                                continue;
                             var sx = bx * 4;
                             atoms[by * 4 + bx] = Satd4x4Direct(
                                 currentMb, currentMbStride, sx, sy,
                                 reference, referenceStride, rx + sx, ry4,
                                 sourceTransformCoefficients,
-                                refTransformCache, referenceTransformAtlas,
+                                refTransformCache,
                                 collectDiag, 0 /* B16x16 atom shape */);
+                            atomCount++;
                         }
                     }
 
                     t_searchEffort += byLim * bxLim;
+                    if (collectDiag)
+                        H264MotionSatdDagDiagnostics.NotifyUnifiedIntegerAtomComputes(atomCount);
 
-                    // Quadrant sums → shape scores
-                    var sumTl = atoms[0] + atoms[1] + atoms[4] + atoms[5];
-                    var sumTr = trFits ? atoms[2] + atoms[3] + atoms[6] + atoms[7] : int.MaxValue;
-                    var sumBl = blFits ? atoms[8] + atoms[9] + atoms[12] + atoms[13] : int.MaxValue;
-                    var sumBr = brFits ? atoms[10] + atoms[11] + atoms[14] + atoms[15] : int.MaxValue;
+                    // Quadrant sums → shape scores (valid only for quadrants the gate computed)
+                    var sumTl = needTl ? atoms[0] + atoms[1] + atoms[4] + atoms[5] : int.MaxValue;
+                    var sumTr = needTr ? atoms[2] + atoms[3] + atoms[6] + atoms[7] : int.MaxValue;
+                    var sumBl = needBl ? atoms[8] + atoms[9] + atoms[12] + atoms[13] : int.MaxValue;
+                    var sumBr = needBr ? atoms[10] + atoms[11] + atoms[14] + atoms[15] : int.MaxValue;
 
                     // 8x8 quadrants
-                    if (!q00Done && chromaTL && IsBetterScoreCandidate(sumTl + mvCost, sumTl, mv, q00BestScore, q00BestSad, q00BestMv))
+                    if (!q00Done && needTl && chromaTL && IsBetterScoreCandidate(sumTl + mvCost, sumTl, mv, q00BestScore, q00BestSad, q00BestMv))
                     { q00BestSad = sumTl; q00BestScore = sumTl + mvCost; q00BestMv = mv; }
 
-                    if (!q10Done && trFits && chromaTR && IsBetterScoreCandidate(sumTr + mvCost, sumTr, mv, q10BestScore, q10BestSad, q10BestMv))
+                    if (!q10Done && needTr && chromaTR && IsBetterScoreCandidate(sumTr + mvCost, sumTr, mv, q10BestScore, q10BestSad, q10BestMv))
                     { q10BestSad = sumTr; q10BestScore = sumTr + mvCost; q10BestMv = mv; }
 
-                    if (!q01Done && blFits && chromaBL && IsBetterScoreCandidate(sumBl + mvCost, sumBl, mv, q01BestScore, q01BestSad, q01BestMv))
+                    if (!q01Done && needBl && chromaBL && IsBetterScoreCandidate(sumBl + mvCost, sumBl, mv, q01BestScore, q01BestSad, q01BestMv))
                     { q01BestSad = sumBl; q01BestScore = sumBl + mvCost; q01BestMv = mv; }
 
-                    if (!q11Done && brFits && chromaBR && IsBetterScoreCandidate(sumBr + mvCost, sumBr, mv, q11BestScore, q11BestSad, q11BestMv))
+                    if (!q11Done && needBr && chromaBR && IsBetterScoreCandidate(sumBr + mvCost, sumBr, mv, q11BestScore, q11BestSad, q11BestMv))
                     { q11BestSad = sumBr; q11BestScore = sumBr + mvCost; q11BestMv = mv; }
 
                     // 16x8 shapes
-                    if (!topDone && trFits && chromaTL && chromaTR)
+                    if (!topDone && needTl && needTr && chromaTL && chromaTR)
                     {
                         var sadTop = sumTl + sumTr;
                         if (IsBetterScoreCandidate(sadTop + mvCost, sadTop, mv, topBestScore, topBestSad, topBestMv))
                         { topBestSad = sadTop; topBestScore = sadTop + mvCost; topBestMv = mv; }
                     }
-                    if (!botDone && brFits && chromaBL && chromaBR)
+                    if (!botDone && needBl && needBr && chromaBL && chromaBR)
                     {
                         var sadBot = sumBl + sumBr;
                         if (IsBetterScoreCandidate(sadBot + mvCost, sadBot, mv, botBestScore, botBestSad, botBestMv))
@@ -886,13 +922,13 @@ internal static class H264MotionEstimator
                     }
 
                     // 8x16 shapes
-                    if (!leftDone && blFits && chromaTL && chromaBL)
+                    if (!leftDone && needTl && needBl && chromaTL && chromaBL)
                     {
                         var sadLeft = sumTl + sumBl;
                         if (IsBetterScoreCandidate(sadLeft + mvCost, sadLeft, mv, leftBestScore, leftBestSad, leftBestMv))
                         { leftBestSad = sadLeft; leftBestScore = sadLeft + mvCost; leftBestMv = mv; }
                     }
-                    if (!rightDone && brFits && chromaTR && chromaBR)
+                    if (!rightDone && needTr && needBr && chromaTR && chromaBR)
                     {
                         var sadRight = sumTr + sumBr;
                         if (IsBetterScoreCandidate(sadRight + mvCost, sadRight, mv, rightBestScore, rightBestSad, rightBestMv))
@@ -975,16 +1011,14 @@ internal static class H264MotionEstimator
         int lambda = 0,
         int pictureWidth = 0,
         int pictureHeight = 0,
-        int fractionalPelRefinementRounds = 2,
-        H264ReferenceTransformAtlas? referenceTransformAtlas = null)
+        int fractionalPelRefinementRounds = 2)
     {
         var noRefTransformCache = default(Satd4x4RefTransformGrid);
         return SearchBlock(
             current, currentStride, reference, referenceStride, mbX, mbY, mvPredictor, searchRange,
             bw, bh, blockShape, kernels, useMotionSatd, lambda, pictureWidth, pictureHeight,
             fractionalPelRefinementRounds, current, currentStride, 0, 0,
-            sourceTransformCoefficients: default, refTransformCache: noRefTransformCache,
-            referenceTransformAtlas: referenceTransformAtlas);
+            sourceTransformCoefficients: default, refTransformCache: noRefTransformCache);
     }
 
     private static SearchResult SearchBlock(
@@ -1007,7 +1041,6 @@ internal static class H264MotionEstimator
         int currentBlockY,
         Span<short> sourceTransformCoefficients = default,
         Satd4x4RefTransformGrid refTransformCache = default,
-        H264ReferenceTransformAtlas? referenceTransformAtlas = null,
         int scoreCeilingExclusive = int.MaxValue)
     {
         var picW = referenceStride;
@@ -1118,12 +1151,12 @@ internal static class H264MotionEstimator
 
                     int s;
                     if (useMotionSatd &&
-                        CanUseTransformDomainSatd4x4(sourceTransformCoefficients, refTransformCache, referenceTransformAtlas))
+                        CanUseTransformDomainSatd4x4(sourceTransformCoefficients, refTransformCache))
                     {
                         t_searchEffort += (bw * bh) >> 4;
                         s = SatdBlockTransformDomain(blockShape, currentMb, currentMbStride, reference, referenceStride,
                             currentBlockX, currentBlockY, candidate.ReferenceX, candidate.ReferenceY,
-                            sourceTransformCoefficients, refTransformCache, referenceTransformAtlas,
+                            sourceTransformCoefficients, refTransformCache,
                             candidate.SatdStopAfter, candidate.StopOnEqual);
                     }
                     else
@@ -1186,8 +1219,7 @@ internal static class H264MotionEstimator
         int lambda = 0,
         int pictureWidth = 0,
         int pictureHeight = 0,
-        int fractionalPelRefinementRounds = 2,
-        H264ReferenceTransformAtlas? referenceTransformAtlas = null)
+        int fractionalPelRefinementRounds = 2)
     {
         H264PInterDiagnostics.NotifyMeHexSearch();
         var picW = referenceStride;
@@ -1206,12 +1238,6 @@ internal static class H264MotionEstimator
         Span<int> cacheSad = stackalloc int[256];
         Span<int> cacheScore = stackalloc int[256];
         Span<Mv> cacheMv = stackalloc Mv[256];
-        Span<short> sourceTransformCoefficients =
-            useMotionSatd && referenceTransformAtlas is not null
-                ? stackalloc short[16 * H264MotionSatd.Transform4x4CoefficientCount]
-                : default;
-        if (!sourceTransformCoefficients.IsEmpty)
-            PrecomputeMb4x4Transforms(current, currentStride, sourceTransformCoefficients);
 
         var curDx = 0;
         var curDy = 0;
@@ -1221,8 +1247,6 @@ internal static class H264MotionEstimator
             curDx, curDy, lambda, kernels, blockShape, useMotionSatd,
             checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
             scoreStopAfter: int.MaxValue,
-            sourceTransformCoefficients: sourceTransformCoefficients,
-            referenceTransformAtlas: referenceTransformAtlas,
             cacheKey: cacheKey,
             cacheSad: cacheSad,
             cacheScore: cacheScore,
@@ -1261,8 +1285,6 @@ internal static class H264MotionEstimator
                     ndx, ndy, lambda, kernels, blockShape, useMotionSatd,
                     checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
                     scoreStopAfter: bestScore,
-                    sourceTransformCoefficients: sourceTransformCoefficients,
-                    referenceTransformAtlas: referenceTransformAtlas,
                     cacheKey: cacheKey,
                     cacheSad: cacheSad,
                     cacheScore: cacheScore,
@@ -1309,8 +1331,6 @@ internal static class H264MotionEstimator
                     ndx, ndy, lambda, kernels, blockShape, useMotionSatd,
                     checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
                     scoreStopAfter: bestScore,
-                    sourceTransformCoefficients: sourceTransformCoefficients,
-                    referenceTransformAtlas: referenceTransformAtlas,
                     cacheKey: cacheKey,
                     cacheSad: cacheSad,
                     cacheScore: cacheScore,
@@ -1367,8 +1387,6 @@ internal static class H264MotionEstimator
         int mbUnpaddedX,
         int mbUnpaddedY,
         int scoreStopAfter,
-        ReadOnlySpan<short> sourceTransformCoefficients,
-        H264ReferenceTransformAtlas? referenceTransformAtlas,
         out int s,
         out int score,
         out Mv mv)
@@ -1399,9 +1417,10 @@ internal static class H264MotionEstimator
             return;
         }
         var mvCost = MotionVectorCost(lambda, mv.X - mvpX, mv.Y - mvpY);
-        if (useMotionSatd && !sourceTransformCoefficients.IsEmpty && referenceTransformAtlas is not null)
+        var refWin = OffsetWindow(reference, referenceStride, rx, ry);
+        if (useMotionSatd && scoreStopAfter != int.MaxValue)
         {
-            var satdStopAfter = scoreStopAfter == int.MaxValue ? int.MaxValue : scoreStopAfter - mvCost;
+            var satdStopAfter = scoreStopAfter - mvCost;
             if (satdStopAfter < 0)
             {
                 s = int.MaxValue;
@@ -1409,60 +1428,23 @@ internal static class H264MotionEstimator
                 return;
             }
 
-            if (satdStopAfter != int.MaxValue)
+            var sadLowerBoundSource = SadBlock(kernels, blockShape, current, currentStride, refWin, referenceStride);
+            if (SatdSadLowerBoundRejects(sadLowerBoundSource, satdStopAfter, stopOnEqual: false, (int)blockShape))
             {
-                var refWin = OffsetWindow(reference, referenceStride, rx, ry);
-                var sadLowerBoundSource = SadBlock(kernels, blockShape, current, currentStride, refWin, referenceStride);
-                if (SatdSadLowerBoundRejects(sadLowerBoundSource, satdStopAfter, stopOnEqual: false, (int)blockShape))
-                {
-                    s = int.MaxValue;
-                    score = int.MaxValue;
-                    return;
-                }
+                s = int.MaxValue;
+                score = int.MaxValue;
+                return;
             }
 
             // Same effort unit as ScoreBlock: a WxH SATD is ~area/16 4x4 atoms. Without this the
             // hex seed search (which always takes this branch in the default config) is invisible
             // to ThreadSearchEffort, blinding the slice balancer and the ME effort budget to it.
             t_searchEffort += (bw * bh) >> 4;
-            s = SatdBlockFromReferenceAtlas(
-                blockShape,
-                sourceTransformCoefficients,
-                reference,
-                referenceStride,
-                rx,
-                ry,
-                referenceTransformAtlas,
-                satdStopAfter);
+            s = SatdBlockBounded(blockShape, current, currentStride, refWin, referenceStride, satdStopAfter);
         }
         else
         {
-            var refWin = OffsetWindow(reference, referenceStride, rx, ry);
-            if (useMotionSatd && scoreStopAfter != int.MaxValue)
-            {
-                var satdStopAfter = scoreStopAfter - mvCost;
-                if (satdStopAfter < 0)
-                {
-                    s = int.MaxValue;
-                    score = int.MaxValue;
-                    return;
-                }
-
-                var sadLowerBoundSource = SadBlock(kernels, blockShape, current, currentStride, refWin, referenceStride);
-                if (SatdSadLowerBoundRejects(sadLowerBoundSource, satdStopAfter, stopOnEqual: false, (int)blockShape))
-                {
-                    s = int.MaxValue;
-                    score = int.MaxValue;
-                    return;
-                }
-
-                t_searchEffort += (bw * bh) >> 4;
-                s = SatdBlockBounded(blockShape, current, currentStride, refWin, referenceStride, satdStopAfter);
-            }
-            else
-            {
-                s = ScoreBlock(kernels, blockShape, useMotionSatd, current, currentStride, refWin, referenceStride);
-            }
+            s = ScoreBlock(kernels, blockShape, useMotionSatd, current, currentStride, refWin, referenceStride);
         }
         score = s + mvCost;
     }
@@ -1487,8 +1469,6 @@ internal static class H264MotionEstimator
         int mbUnpaddedX,
         int mbUnpaddedY,
         int scoreStopAfter,
-        ReadOnlySpan<short> sourceTransformCoefficients,
-        H264ReferenceTransformAtlas? referenceTransformAtlas,
         Span<int> cacheKey,
         Span<int> cacheSad,
         Span<int> cacheScore,
@@ -1524,7 +1504,6 @@ internal static class H264MotionEstimator
                     dx, dy, lambda, kernels, blockShape, useMotionSatd,
                     checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
                     scoreStopAfter,
-                    sourceTransformCoefficients, referenceTransformAtlas,
                     out s, out score, out mv);
 
                 if (score <= scoreStopAfter || s == int.MaxValue || scoreStopAfter == int.MaxValue)
@@ -1548,7 +1527,6 @@ internal static class H264MotionEstimator
             dx, dy, lambda, kernels, blockShape, useMotionSatd,
             checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
             scoreStopAfter,
-            sourceTransformCoefficients, referenceTransformAtlas,
             out s, out score, out mv);
     }
 
@@ -1649,7 +1627,6 @@ internal static class H264MotionEstimator
         int referenceBlockY,
         ReadOnlySpan<short> sourceTransformCoefficients,
         Satd4x4RefTransformGrid refTransformCache,
-        H264ReferenceTransformAtlas? referenceTransformAtlas,
         int stopAfter = int.MaxValue,
         bool stopOnEqual = false)
     {
@@ -1668,7 +1645,7 @@ internal static class H264MotionEstimator
                 sum += Satd4x4Direct(
                     currentMb, currentMbStride, currentBlockX + bx * 4, currentBlockY + by * 4,
                     reference, referenceStride, referenceBlockX + bx * 4, referenceBlockY + by * 4,
-                    sourceTransformCoefficients, refTransformCache, referenceTransformAtlas,
+                    sourceTransformCoefficients, refTransformCache,
                     collectDagDiagnostics, shapeIndex);
                 if (sum > stopAfter || (stopOnEqual && sum == stopAfter))
                 {
@@ -1684,7 +1661,7 @@ internal static class H264MotionEstimator
 
     /// <summary>
     /// One SATD 4x4 atom. Computed in the transform domain (source coefficients precomputed once per MB,
-    /// reference coefficients served by the atlas / per-MB reference transform cache) when available, else
+    /// reference coefficients served by the per-MB reference transform cache) when available, else
     /// straight from pixels. There is intentionally no per-atom result cache: an atom key is
     /// (sourceIndex, refX, refY), which is unique for every (source block, candidate MV) pair a single MB
     /// search visits, so such a cache can never hit — see the note in <see cref="SearchMbSubPartitions"/>.
@@ -1700,14 +1677,13 @@ internal static class H264MotionEstimator
         int refY,
         ReadOnlySpan<short> sourceTransformCoefficients,
         Satd4x4RefTransformGrid refTransformCache,
-        H264ReferenceTransformAtlas? referenceTransformAtlas,
         bool collectDagDiagnostics,
         int shapeIndex)
     {
         if (collectDagDiagnostics)
             H264MotionSatdDagDiagnostics.NotifyAtomCacheDisabledCompute(shapeIndex);
 
-        if (!CanUseTransformDomainSatd4x4(sourceTransformCoefficients, refTransformCache, referenceTransformAtlas))
+        if (!CanUseTransformDomainSatd4x4(sourceTransformCoefficients, refTransformCache))
         {
             return H264MotionSatd.Satd4x4Strided(
                 currentMb, currentMbStride, sourceX, sourceY,
@@ -1718,7 +1694,7 @@ internal static class H264MotionEstimator
         return Satd4x4FromTransformCache(
             sourceTransformCoefficients, sourceIndex,
             reference, referenceStride, refX, refY,
-            refTransformCache, referenceTransformAtlas,
+            refTransformCache,
             collectDagDiagnostics);
     }
 
@@ -1747,75 +1723,8 @@ internal static class H264MotionEstimator
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool CanUseTransformDomainSatd4x4(
         ReadOnlySpan<short> sourceTransformCoefficients,
-        Satd4x4RefTransformGrid refTransformCache,
-        H264ReferenceTransformAtlas? referenceTransformAtlas) =>
-        !sourceTransformCoefficients.IsEmpty &&
-        (referenceTransformAtlas is not null || !refTransformCache.IsEmpty);
-
-    private static int SatdBlockFromReferenceAtlas(
-        MeBlockShape blockShape,
-        ReadOnlySpan<short> sourceTransformCoefficients,
-        ReadOnlySpan<byte> reference,
-        int referenceStride,
-        int referenceBlockX,
-        int referenceBlockY,
-        H264ReferenceTransformAtlas referenceTransformAtlas,
-        int stopAfter = int.MaxValue)
-    {
-        var collectDagDiagnostics = H264MotionSatdDagDiagnostics.IsEnabled;
-        var shapeIndex = (int)blockShape;
-        if (collectDagDiagnostics)
-            H264MotionSatdDagDiagnostics.NotifyPartitionComposition(shapeIndex);
-
-        var blocksX = blockShape is MeBlockShape.B16x16 or MeBlockShape.B16x8 ? 4 : 2;
-        var blocksY = blockShape is MeBlockShape.B16x16 or MeBlockShape.B8x16 ? 4 : 2;
-        var sum = 0;
-        for (var by = 0; by < blocksY; by++)
-        {
-            for (var bx = 0; bx < blocksX; bx++)
-            {
-                var sourceIndex = (by << 2) + bx;
-                var refX = referenceBlockX + bx * 4;
-                var refY = referenceBlockY + by * 4;
-                sum += Satd4x4FromReferenceAtlas(
-                    sourceTransformCoefficients, sourceIndex,
-                    reference, referenceStride, refX, refY,
-                    referenceTransformAtlas,
-                    collectDagDiagnostics, shapeIndex);
-                if (sum > stopAfter)
-                {
-                    if (collectDagDiagnostics)
-                        H264MotionSatdDagDiagnostics.NotifyPartitionEarlyExit(shapeIndex);
-                    return sum;
-                }
-            }
-        }
-
-        return sum;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int Satd4x4FromReferenceAtlas(
-        ReadOnlySpan<short> sourceTransformCoefficients,
-        int sourceIndex,
-        ReadOnlySpan<byte> reference,
-        int referenceStride,
-        int refX,
-        int refY,
-        H264ReferenceTransformAtlas referenceTransformAtlas,
-        bool collectDagDiagnostics,
-        int shapeIndex)
-    {
-        if (collectDagDiagnostics)
-            H264MotionSatdDagDiagnostics.NotifyAtomCacheDisabledCompute(shapeIndex);
-
-        var sourceCoefficients = sourceTransformCoefficients.Slice(
-            sourceIndex * H264MotionSatd.Transform4x4CoefficientCount,
-            H264MotionSatd.Transform4x4CoefficientCount);
-        var refCoefficients = referenceTransformAtlas.GetOrCompute(
-            reference, referenceStride, refX, refY, collectDagDiagnostics);
-        return H264MotionSatd.Satd4x4FromTransformed(sourceCoefficients, refCoefficients);
-    }
+        Satd4x4RefTransformGrid refTransformCache) =>
+        !sourceTransformCoefficients.IsEmpty && !refTransformCache.IsEmpty;
 
     private static int Satd4x4FromTransformCache(
         ReadOnlySpan<short> sourceTransformCoefficients,
@@ -1825,19 +1734,11 @@ internal static class H264MotionEstimator
         int refX,
         int refY,
         Satd4x4RefTransformGrid refTransformCache,
-        H264ReferenceTransformAtlas? referenceTransformAtlas,
         bool collectDagDiagnostics)
     {
         var sourceCoefficients = sourceTransformCoefficients.Slice(
             sourceIndex * H264MotionSatd.Transform4x4CoefficientCount,
             H264MotionSatd.Transform4x4CoefficientCount);
-        if (referenceTransformAtlas is not null && referenceTransformAtlas.Contains4x4(refX, refY))
-        {
-            var atlasRefCoefficients = referenceTransformAtlas.GetOrCompute(
-                reference, referenceStride, refX, refY, collectDagDiagnostics);
-            return H264MotionSatd.Satd4x4FromTransformed(sourceCoefficients, atlasRefCoefficients);
-        }
-
         if (refTransformCache.IsEmpty)
         {
             Span<short> uncachedRefCoefficients = stackalloc short[H264MotionSatd.Transform4x4CoefficientCount];
@@ -1906,6 +1807,7 @@ internal static class H264MotionEstimator
         }
 
         refinementRounds = Math.Clamp(refinementRounds, 1, 2);
+        var collectDiag = H264MotionSatdDagDiagnostics.IsEnabled;
 
         var stride = bw;
         var blockSize = bh * stride;
@@ -1948,6 +1850,8 @@ internal static class H264MotionEstimator
             {
                 var seedRefWin = OffsetWindow(reference, referenceStride, mbX + seedIx, mbY + seedIy);
                 bestSad = SadBlock(kernels, blockShape, current, currentStride, seedRefWin, referenceStride);
+                if (collectDiag)
+                    H264MotionSatdDagDiagnostics.NotifyFracSadBlock();
                 bestScore = seedSad;
             }
             else if (!QpelFits(mbX + seedIx, mbY + seedIy, bw, bh, picW, picH))
@@ -1965,6 +1869,11 @@ internal static class H264MotionEstimator
                 var block = qpelBatch.Slice(((seedFy << 2) + seedFx) * blockSize, blockSize);
                 bestSad = SadBlock(kernels, blockShape, current, currentStride, block, stride);
                 var seedSatd = SatdBlock(kernels, blockShape, current, currentStride, block, stride);
+                if (collectDiag)
+                {
+                    H264MotionSatdDagDiagnostics.NotifyFracSadBlock();
+                    H264MotionSatdDagDiagnostics.NotifyFracSatdAtomComputes((bw * bh) >> 4, integerPel: false);
+                }
                 var seedMvCost = lambda == 0 ? 0 : qpelMvCosts[(seedFy << 2) + seedFx];
                 bestScore = seedSatd + seedMvCost;
             }
@@ -1977,12 +1886,21 @@ internal static class H264MotionEstimator
 
         var bestMv = seedMv;
 
+        var prevRoundOriginX = int.MinValue;
+        var prevRoundOriginY = int.MinValue;
         for (var round = 0; round < refinementRounds; round++)
         {
             var ix = ((int)bestMv.X >> 2);
             var iy = ((int)bestMv.Y >> 2);
             var originX = mbX + ix;
             var originY = mbY + iy;
+            // Candidates are (fx, fy) in [0,3]^2 around the same integer pel, so a round whose
+            // origin matches the previous round's re-evaluates an identical candidate set; every
+            // pruning rule below is strict, so the repeat is deterministic dead work -- stop.
+            if (originX == prevRoundOriginX && originY == prevRoundOriginY)
+                break;
+            prevRoundOriginX = originX;
+            prevRoundOriginY = originY;
             if (!QpelFits(originX, originY, bw, bh, picW, picH))
                 continue;
 
@@ -2015,12 +1933,25 @@ internal static class H264MotionEstimator
                         var block = qpelBatch.Slice(((fy << 2) + fx) * blockSize, blockSize);
                         var satdStopAfter = bestScore == int.MaxValue ? int.MaxValue : bestScore - mvCost;
                         var candSad = SadBlock(kernels, blockShape, current, currentStride, block, stride);
+                        if (collectDiag)
+                            H264MotionSatdDagDiagnostics.NotifyFracSadBlock();
                         if (SatdSadLowerBoundRejects(candSad, satdStopAfter, stopOnEqual: false, (int)blockShape))
                             continue;
 
-                        var candSatd = satdStopAfter == int.MaxValue
-                            ? SatdBlock(kernels, blockShape, current, currentStride, block, stride)
-                            : SatdBlockBounded(blockShape, current, currentStride, block, stride, satdStopAfter);
+                        var candIntegerPel = fx == 0 && fy == 0;
+                        int candSatd;
+                        if (satdStopAfter == int.MaxValue)
+                        {
+                            candSatd = SatdBlock(kernels, blockShape, current, currentStride, block, stride);
+                            if (collectDiag)
+                                H264MotionSatdDagDiagnostics.NotifyFracSatdAtomComputes((bw * bh) >> 4, candIntegerPel);
+                        }
+                        else
+                        {
+                            candSatd = SatdBlockBounded(
+                                blockShape, current, currentStride, block, stride, satdStopAfter,
+                                fracDiag: collectDiag, fracIntegerPel: candIntegerPel);
+                        }
                         var candScore = candSatd + mvCost;
                         if (candScore > bestScore)
                             continue;
@@ -2039,6 +1970,8 @@ internal static class H264MotionEstimator
                             ref qpelBatchValidMask, ref qpelBatchOriginX, ref qpelBatchOriginY);
                         var block = qpelBatch.Slice(((fy << 2) + fx) * blockSize, blockSize);
                         var candSad = SadBlock(kernels, blockShape, current, currentStride, block, stride);
+                        if (collectDiag)
+                            H264MotionSatdDagDiagnostics.NotifyFracSadBlock();
                         if (IsBetterSad(candSad, mv, bestSad, bestMv))
                         {
                             bestScore = candSad;
@@ -2080,7 +2013,9 @@ internal static class H264MotionEstimator
         int currentStride,
         ReadOnlySpan<byte> reference,
         int referenceStride,
-        int stopAfter)
+        int stopAfter,
+        bool fracDiag = false,
+        bool fracIntegerPel = false)
     {
         var blocksX = blockShape is MeBlockShape.B16x16 or MeBlockShape.B16x8 ? 4 : 2;
         var blocksY = blockShape is MeBlockShape.B16x16 or MeBlockShape.B8x16 ? 4 : 2;
@@ -2095,6 +2030,8 @@ internal static class H264MotionEstimator
                 sum += H264MotionSatd.Satd4x4Strided(
                     current, currentStride, x, y,
                     reference, referenceStride, x, y);
+                if (fracDiag)
+                    H264MotionSatdDagDiagnostics.NotifyFracSatdAtomComputes(1, fracIntegerPel);
                 if (sum > stopAfter)
                     return sum;
             }
@@ -2133,6 +2070,8 @@ internal static class H264MotionEstimator
         if ((validMask & bit) != 0)
             return;
 
+        if (H264MotionSatdDagDiagnostics.IsEnabled)
+            H264MotionSatdDagDiagnostics.NotifyFracQpelInterpolation();
         kernels.InterpolateLuma(
             reference, referenceStride,
             originX, originY,

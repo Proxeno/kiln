@@ -157,19 +157,18 @@ internal static class H264PInterDiagnostics
     public static bool CollectFramePhases { get; set; }
 
     /// <summary>
-    /// Measurement-only A/B kill switch for the reference transform atlas
-    /// (<see cref="H264ReferenceTransformAtlas"/>): when true the slice encoder passes a null atlas
-    /// to motion estimation so every SATD ref transform is recomputed in place of the cache lookup.
-    /// Keep false in normal operation.
-    /// </summary>
-    public static bool DisableRefTransformAtlas { get; set; }
-
-    /// <summary>
     /// Measurement-only A/B kill switch for the effort-balanced slice partition: when true the
     /// multi-slice orchestrator keeps the historical equal-height row split every frame.
     /// Keep false in normal operation.
     /// </summary>
     public static bool DisableSlicePartitionBalance { get; set; }
+
+    /// <summary>
+    /// Measurement-only A/B kill switch for the unified sub-partition search's quadrant-level
+    /// SAD-lower-bound gate (skipping a quadrant's SATD atoms when no partition shape using that
+    /// quadrant can strictly improve). Bitstream-identical either way; keep false in normal operation.
+    /// </summary>
+    public static bool DisableUnifiedQuadrantGate { get; set; }
 
     private static long s_fpFrames;
     private static long s_fpBeginFrameTicks;

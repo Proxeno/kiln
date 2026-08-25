@@ -48,14 +48,6 @@ internal sealed class H264FrameSharedState
     public readonly byte[][] DpbPaddedV;
 
     /// <summary>
-    /// Per-DPB-slot Hadamard-coefficient atlases for SATD motion scoring. Entries are null when the
-    /// slot can never be scored with SATD: the atlas costs 36 bytes per padded reference sample
-    /// (~78 MB per slot at 1080p), so slots are only backed when <c>UseMotionSatd</c> is on, and
-    /// slot 1 additionally requires a multi-reference DPB (<see cref="MaxReferenceFrames"/> ≥ 2).
-    /// </summary>
-    public readonly H264ReferenceTransformAtlas?[] DpbLumaAtlas;
-
-    /// <summary>
     /// Number of valid reference frames in <see cref="DpbPaddedY"/>/<see cref="DpbPaddedU"/>/<see cref="DpbPaddedV"/>.
     /// 0 after IDR (no valid reference), 1 after the first P-frame, 2 after the second P-frame and beyond.
     /// Mutated only outside the parallel slice region.
@@ -101,14 +93,11 @@ internal sealed class H264FrameSharedState
     public readonly byte[] MbSubPartRefIdx;
 
     /// <param name="maxReferenceFrames">
-    /// Effective reference cap from options, clamped to [1, <see cref="MaxDpbSize"/>]. Controls
-    /// which DPB slots get SATD atlases; the padded reference planes themselves are always
-    /// allocated for every slot (they are cheap relative to the atlases).
+    /// Effective reference cap from options, clamped to [1, <see cref="MaxDpbSize"/>]. The padded
+    /// reference planes are always allocated for every slot regardless of this cap.
     /// </param>
     /// <param name="useMotionSatd">
-    /// Whether the encoder scores integer-pel ME candidates with SATD. When false no atlas is
-    /// allocated at all — the SAD path never reads them, and at 1080p the two slots would
-    /// otherwise pin ~157 MB of dead memory.
+    /// Whether the encoder scores integer-pel ME candidates with SATD.
     /// </param>
     public H264FrameSharedState(int width, int height, int maxReferenceFrames = MaxDpbSize, bool useMotionSatd = true)
     {
@@ -130,14 +119,11 @@ internal sealed class H264FrameSharedState
         DpbPaddedY = new byte[MaxDpbSize][];
         DpbPaddedU = new byte[MaxDpbSize][];
         DpbPaddedV = new byte[MaxDpbSize][];
-        DpbLumaAtlas = new H264ReferenceTransformAtlas[MaxDpbSize];
         for (var i = 0; i < MaxDpbSize; i++)
         {
             DpbPaddedY[i] = new byte[paddedYSize];
             DpbPaddedU[i] = new byte[paddedUvSize];
             DpbPaddedV[i] = new byte[paddedUvSize];
-            if (useMotionSatd && i < MaxReferenceFrames)
-                DpbLumaAtlas[i] = new H264ReferenceTransformAtlas(PaddedStrideY, height + 2 * HaloLuma);
         }
         DpbCount = 0;
 

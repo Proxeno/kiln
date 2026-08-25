@@ -723,8 +723,6 @@ internal sealed class H264BaselineSliceEncoder
         if (isIdr)
         {
             _shared.DpbCount = 0;
-            foreach (var atlas in _shared.DpbLumaAtlas)
-                atlas?.Reset();
         }
 
         ResetForFrame();
@@ -749,14 +747,6 @@ internal sealed class H264BaselineSliceEncoder
     /// prediction is available for the next P-frame. Called by the orchestrator after all slices
     /// of a multi-slice frame have been encoded and deblocked.
     /// </summary>
-    /// <summary>
-    /// Reference transform atlas for the given DPB slot, honouring the measurement-only
-    /// <see cref="H264PInterDiagnostics.DisableRefTransformAtlas"/> A/B kill switch (null atlas
-    /// makes SATD recompute every reference 4x4 transform instead of consulting the cache).
-    /// </summary>
-    private H264ReferenceTransformAtlas? RefAtlasForMotionSearch(int dpbSlot) =>
-        H264PInterDiagnostics.DisableRefTransformAtlas ? null : _shared.DpbLumaAtlas[dpbSlot];
-
     internal void PadReconstructedReference()
     {
         var uvW = _width / 2;
@@ -777,14 +767,12 @@ internal sealed class H264BaselineSliceEncoder
             Array.Copy(_shared.DpbPaddedY[0], _shared.DpbPaddedY[1], _shared.DpbPaddedY[0].Length);
             Array.Copy(_shared.DpbPaddedU[0], _shared.DpbPaddedU[1], _shared.DpbPaddedU[0].Length);
             Array.Copy(_shared.DpbPaddedV[0], _shared.DpbPaddedV[1], _shared.DpbPaddedV[0].Length);
-            _shared.DpbLumaAtlas[1]?.Reset();
         }
         if (_shared.DpbCount < effectiveMaxRefs)
             _shared.DpbCount++;
         H264ReferencePicturePadder.Pad(recY, width, width, _height, HaloLuma, _shared.DpbPaddedY[0], _paddedStrideY);
         H264ReferencePicturePadder.Pad(recU, uvW, uvW, uvH, HaloChroma, _shared.DpbPaddedU[0], _paddedStrideUv);
         H264ReferencePicturePadder.Pad(recV, uvW, uvW, uvH, HaloChroma, _shared.DpbPaddedV[0], _paddedStrideUv);
-        _shared.DpbLumaAtlas[0]?.Reset();
     }
 
     /// <summary>
@@ -1970,7 +1958,6 @@ internal sealed class H264BaselineSliceEncoder
             pictureWidth: _width,
             pictureHeight: _height,
             allowSubPartitionSearch: allowSubPartitionSearch,
-            referenceTransformAtlas: RefAtlasForMotionSearch(0),
             subPartitionRangeCap: rangeCapThisMb,
             allowExhaustiveFallback: allowExhaustiveFallback);
         var winRefIdx = 0;
@@ -2024,7 +2011,6 @@ internal sealed class H264BaselineSliceEncoder
                 pictureWidth: _width,
                 pictureHeight: _height,
                 allowSubPartitionSearch: allowSubPartitionSearch,
-                referenceTransformAtlas: RefAtlasForMotionSearch(1),
                 subPartitionRangeCap: rangeCapThisMb,
                 allowExhaustiveFallback: allowExhaustiveFallback);
 
@@ -2070,8 +2056,7 @@ internal sealed class H264BaselineSliceEncoder
                 pictureWidth: _width,
                 pictureHeight: _height,
                 fractionalPelRefinementRounds: 2,
-                lambda: lambdaThisMb,
-                referenceTransformAtlas: RefAtlasForMotionSearch(0));
+                lambda: lambdaThisMb);
             partResult = new H264MotionEstimator.PartitionResult(
                 H264MotionEstimator.McPartition.Mb16x16,
                 safe.BestMv,
