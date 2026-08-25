@@ -794,6 +794,7 @@ public sealed class H264BaselineEncoder : IDisposable
         {
             LastFrameMotionComplexity = Math.Clamp(sumIntPel / (double)inter / 16.0, 0.0, 1.0);
         }
+    }
 
     /// <summary>
     /// Begin a gradual intra refresh wave (see
