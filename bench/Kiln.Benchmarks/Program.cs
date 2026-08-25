@@ -166,6 +166,12 @@ public class H264SingleFrameBenchmarks
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--perf-probe")
+        {
+            H264PerfProbe.Run(args[1..]);
+            return;
+        }
+
         if (args.Length > 1 && args[0] == "--drift-probe")
         {
             H264DriftProbe.Run(args[1]);
