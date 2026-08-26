@@ -90,9 +90,12 @@ A real encoder, not a toy — the parts a low-latency streaming server actually 
   both architectures stay green.
 - **A wired adaptation loop.** `H264StreamingSession` connects `Kiln.RateControl` (low-latency
   rate controller with network feedback) and `Kiln.Recovery` (IDR budgeting / keyframe recovery)
-  to the encoder: feed it network feedback per frame and get adaptive QP, bitrate, IDRs, and live
-  speed-mode changes out — deterministically, with no glue code on your side.
-- **Verified.** 2,249 tests — spec-roundtrip decoding, SIMD/scalar parity, golden-frame regression,
+  to the encoder: feed it network feedback per frame — loss, RTT, queue depth, PLI/FIR, a
+  transport bandwidth estimate that hard-caps the target bitrate, jitter as a queueing early
+  warning, and client decode delay for complexity (not bitrate) relief — and get adaptive QP,
+  bitrate, IDRs, and live speed-mode changes out, deterministically, with no glue code on your
+  side.
+- **Verified.** 2,292 tests — spec-roundtrip decoding, SIMD/scalar parity, golden-frame regression,
   PSNR fidelity floors, adversarial neighbour-availability sweeps, byte-exact
   reconstruction-vs-ffmpeg conformance oracles, and independent-decoder smoke tests over every
   produced stream.
@@ -260,7 +263,10 @@ small for the frame throws, naming the lowest sufficient level. The chosen level
 
 On the real-time story, be precise about what is wired and what is not. The adaptation loop is
 wired: `H264StreamingSession` owns an encoder plus the rate controller, and per frame turns
-`EncoderNetworkFeedback` (loss, RTT, queue depth, PLI/FIR) into applied settings — slice QP, a
+`EncoderNetworkFeedback` — loss, RTT, queue depth, PLI/FIR, and, when the transport supplies
+them, a bandwidth estimate (a hard ceiling on the target bitrate), jitter (a queueing early
+warning that tempers upshifts), and client decode delay (complexity relief via the speed/fps/
+resolution cascade, never a bitrate cut) — into applied settings — slice QP, a
 per-picture bit budget, recovery IDRs, and live `SpeedMode` changes, including the reference-count
 component, which swaps mid-GOP without an IDR because the SPS-signalled DPB size is an upper
 bound the operating count may sit below:
