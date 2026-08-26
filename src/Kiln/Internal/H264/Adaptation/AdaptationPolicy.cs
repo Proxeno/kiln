@@ -19,6 +19,18 @@ public sealed class AdaptationPolicy
     private int _adaptationCooldownCounter;
     private string _lastAdaptationReason = "";
 
+    /// <summary>
+    /// Tracked baseline RTT in milliseconds for the severe-tier and recovery multiplier tests
+    /// (<see cref="RateControlConfig.SevereCongestionRttMultiplier"/> /
+    /// <see cref="RateControlConfig.RecoveryRttMultiplier"/>). Same
+    /// <see cref="NetworkSignalBaseline"/> math as
+    /// <see cref="RateControlState.BaselineRttMs"/>, updated once per
+    /// <see cref="DecideAdaptation"/> from caller-supplied feedback only, so an identical feedback
+    /// sequence yields the identical baseline in both components. Deliberately not cleared by
+    /// <see cref="Reset"/>: a stream reset does not change the network path.
+    /// </summary>
+    private double _baselineRttMs;
+
     public AdaptationPolicy(
         RateControlConfig config,
         ResolutionLadder? resolutionLadder = null,
@@ -47,6 +59,10 @@ public sealed class AdaptationPolicy
         var newSpeedMode = currentDecision.SpeedMode;
         var reason = "";
 
+        // Fold this frame's RTT into the baseline before anything can early-return, so a route
+        // change keeps drifting in during cooldown frames too.
+        NetworkSignalBaseline.Update(ref _baselineRttMs, feedback.RoundTripTime.TotalMilliseconds);
+
         if (_adaptationCooldownCounter > 0)
         {
             _adaptationCooldownCounter--;
@@ -55,7 +71,7 @@ public sealed class AdaptationPolicy
 
         var severe =
             feedback.PacketLossRatio > 0.10 ||
-            feedback.RoundTripTime.TotalMilliseconds > 100 ||
+            IsSevereRttSpike(feedback.RoundTripTime) ||
             feedback.PendingRtpBytes > 200_000 ||
             stats.AverageEncodeDuration.TotalMilliseconds > (1000.0 / currentDecision.TargetFps) * 0.90;
 
@@ -125,11 +141,39 @@ public sealed class AdaptationPolicy
         return new AdaptationDecision(newWidth, newHeight, newFps, newSpeedMode, reason);
     }
 
-    private static bool IsStableAndCanRecover(EncoderNetworkFeedback feedback, EncoderPipelineStats stats) =>
-        feedback.PacketLossRatio < 0.01 &&
-        feedback.RoundTripTime.TotalMilliseconds < 40 &&
-        feedback.PendingRtpBytes < 20_000 &&
-        stats.AverageEncodeDuration.TotalMilliseconds < (1000.0 / 60) * 0.5;
+    /// <summary>
+    /// Severe-tier RTT test against the tracked baseline: severe when RTT exceeds both
+    /// (baseline * <see cref="RateControlConfig.SevereCongestionRttMultiplier"/>) and
+    /// <see cref="RateControlConfig.SevereCongestionRttFloor"/> — the same treatment the ordinary
+    /// congestion test received when its fixed 50 ms threshold was replaced. The historical fixed
+    /// 100 ms test classified every link with a baseline RTT above it as permanently severe and
+    /// cascaded it to the bottom of every ladder. Until the first positive RTT sample there is no
+    /// baseline and the test never fires (the other severe signals still apply).
+    /// </summary>
+    private bool IsSevereRttSpike(TimeSpan roundTripTime)
+    {
+        var rttMs = roundTripTime.TotalMilliseconds;
+        return _baselineRttMs > 0
+            && rttMs > _baselineRttMs * _config.SevereCongestionRttMultiplier
+            && rttMs > _config.SevereCongestionRttFloor.TotalMilliseconds;
+    }
+
+    /// <summary>
+    /// Recovery gate for the walk-up. The RTT term accepts either the historical absolute 40 ms
+    /// gate or RTT within (baseline * <see cref="RateControlConfig.RecoveryRttMultiplier"/>) —
+    /// without the baseline-relative term, a link whose propagation RTT exceeds 40 ms could
+    /// cascade down on a loss episode and then never walk back up.
+    /// </summary>
+    private bool IsStableAndCanRecover(EncoderNetworkFeedback feedback, EncoderPipelineStats stats)
+    {
+        var rttMs = feedback.RoundTripTime.TotalMilliseconds;
+        var rttSettled = rttMs < 40 ||
+            (_baselineRttMs > 0 && rttMs < _baselineRttMs * _config.RecoveryRttMultiplier);
+        return feedback.PacketLossRatio < 0.01 &&
+            rttSettled &&
+            feedback.PendingRtpBytes < 20_000 &&
+            stats.AverageEncodeDuration.TotalMilliseconds < (1000.0 / 60) * 0.5;
+    }
 
     public string LastAdaptationReason => _lastAdaptationReason;
 

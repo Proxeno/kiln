@@ -282,14 +282,8 @@ public sealed class LowLatencyRateController
             return false;
         }
 
-        if (_state.BaselineRttMs <= 0 || rttMs < _state.BaselineRttMs)
-        {
-            _state.BaselineRttMs = rttMs;
-        }
-        else
-        {
-            _state.BaselineRttMs += (rttMs - _state.BaselineRttMs) / 256.0;
-        }
+        var baselineMs = _state.BaselineRttMs;
+        _state.BaselineRttMs = NetworkSignalBaseline.Update(ref baselineMs, rttMs);
 
         return rttMs > _state.BaselineRttMs * _config.CongestionRttMultiplier
             && rttMs > _config.CongestionRttFloor.TotalMilliseconds;
