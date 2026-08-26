@@ -85,18 +85,29 @@ public sealed class AdaptationPolicy
             feedback.PendingRtpBytes > 200_000 ||
             stats.AverageEncodeDuration.TotalMilliseconds > (1000.0 / currentDecision.TargetFps) * 0.90;
 
-        if (severe)
+        // A client that cannot decode in real time is a different problem from network
+        // congestion, but the right response is the same complexity cascade: cutting bitrate does
+        // not help a decoder that cannot keep up, whereas a faster speed mode (simpler
+        // bitstreams), fewer frames per second, or a lower resolution all reduce its per-second
+        // decode work. The bitrate path never sees this signal.
+        var clientBehind = IsClientBehind(feedback, currentDecision.TargetFps, _config.ClientDecodeDelayBudgetFactor);
+
+        if (severe || clientBehind)
         {
+            // Reason strings carry the trigger; severe congestion wins the label when both fire
+            // (it is the stronger claim — the network is failing, not just the client).
+            var cause = severe ? "severe_congestion" : "client_decode_delay";
+
             // Cascade down: speed mode first (cheapest), then fps, then resolution (most visible).
             if (currentDecision.SpeedMode < EncoderSpeedMode.VeryFast)
             {
                 newSpeedMode = (EncoderSpeedMode)((int)currentDecision.SpeedMode + 1);
-                reason = "speed_mode_increase_severe_congestion";
+                reason = "speed_mode_increase_" + cause;
             }
             else if (_fpsLadder.GetLowerFps(currentDecision.TargetFps) is int lowerFps)
             {
                 newFps = lowerFps;
-                reason = "fps_reduction_severe_congestion";
+                reason = "fps_reduction_" + cause;
             }
             else if (_resolutionLadder.GetLowerResolution(
                          new ResolutionLadder.Resolution(currentDecision.Width, currentDecision.Height, "current"))
@@ -104,19 +115,20 @@ public sealed class AdaptationPolicy
             {
                 newWidth = lowerRes.Width;
                 newHeight = lowerRes.Height;
-                reason = "resolution_reduction_severe_congestion";
+                reason = "resolution_reduction_" + cause;
             }
 
             if (reason.Length > 0)
             {
                 _logger.LogInformation(
-                    "Severe congestion → {reason}. loss={loss}, rtt={rtt}ms, queue={queue}, encode={encode}ms",
+                    "Cascading down → {reason}. loss={loss}, rtt={rtt}ms, queue={queue}, encode={encode}ms, decodeDelay={decode}ms",
                     reason, feedback.PacketLossRatio, feedback.RoundTripTime.TotalMilliseconds,
-                    feedback.PendingRtpBytes, stats.AverageEncodeDuration.TotalMilliseconds);
+                    feedback.PendingRtpBytes, stats.AverageEncodeDuration.TotalMilliseconds,
+                    feedback.ClientDecodeDelay?.TotalMilliseconds ?? 0);
                 _adaptationCooldownCounter = _config.AdaptationCooldownFrames;
             }
         }
-        else if (IsStableAndCanRecover(feedback, stats))
+        else if (IsStableAndCanRecover(feedback, stats, currentDecision.TargetFps))
         {
             // Walk back up: resolution first (biggest quality win), then fps, then speed mode.
             if (_resolutionLadder.GetHigherResolution(
@@ -178,7 +190,7 @@ public sealed class AdaptationPolicy
     /// already building, so raising resolution/fps into them would feed the very congestion the
     /// early warning predicts. Zero jitter (callers without a measurement) never defers.
     /// </summary>
-    private bool IsStableAndCanRecover(EncoderNetworkFeedback feedback, EncoderPipelineStats stats)
+    private bool IsStableAndCanRecover(EncoderNetworkFeedback feedback, EncoderPipelineStats stats, int targetFps)
     {
         var rttMs = feedback.RoundTripTime.TotalMilliseconds;
         var rttSettled = rttMs < 40 ||
@@ -191,8 +203,30 @@ public sealed class AdaptationPolicy
         return feedback.PacketLossRatio < 0.01 &&
             rttSettled &&
             !jitterSpike &&
+            // Walk-up needs the client comfortably inside its decode budget (half of what
+            // triggers the cascade — the same stricter-than-trigger pattern as the loss/RTT/queue
+            // terms above), so a marginal decoder is not fed more work the moment it catches up.
+            !IsClientBehind(feedback, targetFps, _config.ClientDecodeDelayBudgetFactor * 0.5) &&
             feedback.PendingRtpBytes < 20_000 &&
             stats.AverageEncodeDuration.TotalMilliseconds < (1000.0 / 60) * 0.5;
+    }
+
+    /// <summary>
+    /// Is the client's reported decode delay beyond <paramref name="budgetFactor"/> of the frame
+    /// interval at <paramref name="targetFps"/>? Null or non-positive delay (callers without a
+    /// measurement, the record default) is never behind. The test is relative to the current frame
+    /// interval, so an fps reduction that gives the decoder more time per frame clears it
+    /// naturally — built-in hysteresis against ping-ponging the cascade.
+    /// </summary>
+    private static bool IsClientBehind(EncoderNetworkFeedback feedback, int targetFps, double budgetFactor)
+    {
+        if (feedback.ClientDecodeDelay is not { } decodeDelay || decodeDelay <= TimeSpan.Zero)
+        {
+            return false;
+        }
+
+        var frameIntervalMs = 1000.0 / Math.Max(1, targetFps);
+        return decodeDelay.TotalMilliseconds > frameIntervalMs * budgetFactor;
     }
 
     public string LastAdaptationReason => _lastAdaptationReason;

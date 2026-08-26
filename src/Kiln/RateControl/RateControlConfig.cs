@@ -124,6 +124,17 @@ public sealed class RateControlConfig
     public TimeSpan JitterSpikeFloor { get; init; } = TimeSpan.FromMilliseconds(10);
 
     /// <summary>
+    /// Fraction of the frame interval (1000 / TargetFps ms) the client's reported decode delay
+    /// (<see cref="EncoderNetworkFeedback.ClientDecodeDelay"/>) may occupy before the client is
+    /// considered unable to keep up. Beyond it, <c>AdaptationPolicy</c> drives the complexity
+    /// cascade (speed mode → fps → resolution) without touching bitrate — a client falling behind
+    /// is a decode-capacity problem, not network congestion, and cutting bitrate does not help a
+    /// decoder that cannot keep up. The walk-up resumes once the delay is comfortably back under
+    /// budget. Default: 1.0 — a full frame interval, i.e. the decoder is no longer real-time.
+    /// </summary>
+    public double ClientDecodeDelayBudgetFactor { get; init; } = 1.0;
+
+    /// <summary>
     /// Maximum bytes allowed in RTP send queue before flow-control throttling.
     /// Default: 100 KB.
     /// </summary>

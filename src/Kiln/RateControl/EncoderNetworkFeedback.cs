@@ -45,6 +45,13 @@ public sealed record EncoderNetworkFeedback(
     /// <summary>Did the client request a full intra-refresh (FIR) on this observation period?</summary>
     bool FullIntraRequest,
 
-    /// <summary>Measured or estimated client-side decode/render delay (if available).</summary>
+    /// <summary>
+    /// Measured or estimated client-side decode/render delay. A client that cannot decode within
+    /// the frame interval is a decode-capacity problem, not network congestion, so the controller
+    /// answers with the complexity cascade (speed mode → fps → resolution; see
+    /// <see cref="RateControlConfig.ClientDecodeDelayBudgetFactor"/>) and never with a bitrate
+    /// cut — lowering bitrate does not help a decoder that cannot keep up. Null or non-positive
+    /// (the default) means "not measured" and has no effect.
+    /// </summary>
     TimeSpan? ClientDecodeDelay
 );
