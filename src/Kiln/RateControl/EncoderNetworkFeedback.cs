@@ -5,7 +5,15 @@ namespace Kiln.RateControl;
 /// All measurements are point-in-time snapshots and may vary from frame to frame.
 /// </summary>
 public sealed record EncoderNetworkFeedback(
-    /// <summary>Current estimated available bitrate from network (bps).</summary>
+    /// <summary>
+    /// Current estimated available bitrate from the transport's bandwidth estimator (bps) — GCC,
+    /// transport-cc, REMB or similar. The controller treats it as a hard ceiling on the target
+    /// bitrate: when the estimate falls below the current target, the target drops to it
+    /// immediately, while the loss/RTT heuristics keep driving reductions below it and recovery
+    /// after the estimate rises again still walks up through the stability window. Non-positive
+    /// (the default 0) means "no estimate supplied": the controller uses its loss/RTT heuristics
+    /// alone.
+    /// </summary>
     int EstimatedAvailableBitrateBps,
 
     /// <summary>Fraction of packets lost on the transport layer (0.0-1.0).</summary>

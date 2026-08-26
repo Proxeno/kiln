@@ -154,6 +154,30 @@ public sealed class LowLatencyRateController
             _state.StableFrameCounter++;
         }
 
+        // 2b. Caller-supplied bandwidth estimate (GCC / transport-cc / REMB) is a hard ceiling:
+        // when the transport says the path carries less than the current target, targeting above
+        // it only builds queues, so the target drops to the estimate immediately — no
+        // multiplicative walk down. The loss/RTT heuristics above keep driving reductions below
+        // the estimate (loss can mean the estimate is stale), and recovery after the estimate
+        // rises again still goes through the stability-window upshift — the ceiling never raises
+        // the target. Non-positive = no estimate supplied (the record default): exactly the
+        // heuristics-only behaviour. The configured bitrate floor still wins below it.
+        if (feedback.EstimatedAvailableBitrateBps > 0)
+        {
+            var ceilingBps = Math.Max(_config.MinTargetBitrateBps, feedback.EstimatedAvailableBitrateBps);
+            if (_state.TargetBitrateBps > ceilingBps)
+            {
+                _state.TargetBitrateBps = ceilingBps;
+                _state.StableFrameCounter = 0;
+
+                _logger.LogInformation(
+                    "Bandwidth estimate caps target bitrate: {target} bps (estimate {estimate} bps)",
+                    _state.TargetBitrateBps,
+                    feedback.EstimatedAvailableBitrateBps
+                );
+            }
+        }
+
         // 3. Adjust QP based on bitrate relative to initial: ~+6 QP per halving of the target (the
         // H.264 rule of thumb that +6 QP costs roughly half the bitrate), plus graded steps for the
         // remaining partial ratio. Integer arithmetic throughout so decisions are deterministic on
