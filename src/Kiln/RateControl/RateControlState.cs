@@ -40,4 +40,13 @@ public sealed class RateControlState
     /// wall-clock input, so identical feedback sequences produce identical decisions.
     /// </summary>
     public double BaselineRttMs { get; set; } = 0.0;
+
+    /// <summary>
+    /// Tracked baseline jitter in milliseconds for the queueing early warning
+    /// (<see cref="RateControlConfig.JitterSpikeMultiplier"/>). Same
+    /// <see cref="NetworkSignalBaseline"/> math and determinism contract as
+    /// <see cref="BaselineRttMs"/>: updated once per <see cref="LowLatencyRateController.Decide"/>
+    /// from caller-supplied feedback only, 0 until the first positive jitter sample.
+    /// </summary>
+    public double BaselineJitterMs { get; set; } = 0.0;
 }

@@ -201,7 +201,17 @@ and apply decisions with the same primitives the session uses
   baseline): spike when RTT exceeds both
   `baseline × CongestionRttMultiplier` and the absolute
   `CongestionRttFloor` (default 50 ms), so a high-propagation-RTT link is
-  not treated as permanently congested. **Ownership
+  not treated as permanently congested. Two further feedback inputs shape
+  the bitrate path: a caller-supplied transport bandwidth estimate
+  (`EncoderNetworkFeedback.EstimatedAvailableBitrateBps`, from GCC /
+  transport-cc / REMB; 0 = none supplied) is a hard ceiling — a collapsing
+  estimate caps the target immediately, the loss/RTT heuristics keep
+  cutting below it, and a recovering estimate only reopens the ordinary
+  stability-window upshift — and a jitter spike (jitter above both
+  `baseline × JitterSpikeMultiplier` and `JitterSpikeFloor`, the same
+  baseline-relative treatment) is a queueing early warning that holds the
+  upshift without ever cutting, since rising jitter without loss is
+  transient queueing, where backing off is the wrong response. **Ownership
   contract:** it owns exactly one `H264RecoveryPolicy` instance and invokes
   `DecideRecovery` exactly once per `Decide()` call, folding the result in.
   Composing code must not call the recovery policy a second time or
@@ -316,8 +326,20 @@ byte-exact reconstruction parity), and
   `RateControlConfig.SupportedWidths`/`Heights`/`Fps`; defaults
   1080p→900p→720p→540p→360p and 60→30→15) step one rung at a time;
   `AdaptationPolicy` cascades down speed-mode → fps → resolution under
-  sustained congestion and walks back up under sustained stability, with a
-  cooldown to prevent flapping. `H264AdaptiveRateController` composes
+  severe congestion and walks back up under sustained stability, with a
+  cooldown to prevent flapping. Both directions are baseline-relative on
+  RTT (the fixed 100 ms severe test and the fixed 40 ms recovery gate had
+  the same permanently-misclassifies-high-RTT-links defect as the old
+  50 ms congestion threshold): severe requires RTT above both
+  `baseline × SevereCongestionRttMultiplier` and `SevereCongestionRttFloor`,
+  and the walk-up accepts RTT within `baseline × RecoveryRttMultiplier`. A
+  client that reports it cannot decode within the frame interval
+  (`EncoderNetworkFeedback.ClientDecodeDelay` beyond
+  `ClientDecodeDelayBudgetFactor` of it; null = not measured) drives the
+  same cascade — complexity relief, never a bitrate cut, because lowering
+  bitrate does not help a decoder that cannot keep up — and a jitter spike
+  or a merely-marginal decoder defers the walk-up so recovery does not feed
+  a building queue. `H264AdaptiveRateController` composes
   `LowLatencyRateController` (bitrate/QP/recovery) with `AdaptationPolicy`
   into one `EncoderAdaptationDecision` per frame. **This layer is now
   consumed in production by `H264StreamingSession`** (it is the session's
