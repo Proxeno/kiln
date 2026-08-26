@@ -110,8 +110,9 @@ public sealed class LowLatencyRateController
             feedback,
             stats);
 
-        // 1. Detect congestion and encode backpressure
+        // 1. Detect congestion, the jitter early warning, and encode backpressure
         var congestion = IsCongestioned(feedback, stats);
+        var jitterSpike = IsJitterSpike(feedback.Jitter);
         var encodeBackpressure = stats.AverageEncodeDuration.TotalMilliseconds >
             (1000.0 / _state.TargetFps) * 0.75;
 
@@ -132,6 +133,20 @@ public sealed class LowLatencyRateController
                 feedback.RoundTripTime.TotalMilliseconds,
                 feedback.PendingRtpBytes,
                 feedback.NackCount
+            );
+        }
+        else if (jitterSpike)
+        {
+            // Rising jitter without loss is queueing building, not a bandwidth collapse: cutting
+            // would be exactly the wrong response to transient queueing (it clears on its own),
+            // but feeding more bits into a growing queue is wrong too. Hold the target and freeze
+            // the stability count — the upshift resumes where it left off once jitter settles,
+            // rather than restarting the whole window as a congestion downshift would.
+            _logger.LogInformation(
+                "Jitter spike ({jitter}ms vs baseline {baseline}ms). Holding bitrate at {bitrate} bps",
+                feedback.Jitter.TotalMilliseconds,
+                _state.BaselineJitterMs,
+                _state.TargetBitrateBps
             );
         }
         else if (_state.StableFrameCounter >= _config.StabilityWindowFrames)
@@ -311,6 +326,32 @@ public sealed class LowLatencyRateController
 
         return rttMs > _state.BaselineRttMs * _config.CongestionRttMultiplier
             && rttMs > _config.CongestionRttFloor.TotalMilliseconds;
+    }
+
+    /// <summary>
+    /// Queueing early-warning test against a tracked jitter baseline: spike when jitter exceeds
+    /// both (baseline * <see cref="RateControlConfig.JitterSpikeMultiplier"/>) and
+    /// <see cref="RateControlConfig.JitterSpikeFloor"/>. A spike only tempers increases (the
+    /// upshift holds) — it never cuts, because rising jitter without loss is transient queueing,
+    /// the case where backing off aggressively is exactly wrong. Baseline tracking mirrors
+    /// <see cref="IsRttSpike"/> (snap down, drift up — see <see cref="NetworkSignalBaseline"/>),
+    /// so links with naturally high jitter are not permanently held below their capacity.
+    /// Non-positive jitter (callers without a measurement, the record default) updates nothing and
+    /// never spikes.
+    /// </summary>
+    private bool IsJitterSpike(TimeSpan jitter)
+    {
+        var jitterMs = jitter.TotalMilliseconds;
+        if (jitterMs <= 0)
+        {
+            return false;
+        }
+
+        var baselineMs = _state.BaselineJitterMs;
+        _state.BaselineJitterMs = NetworkSignalBaseline.Update(ref baselineMs, jitterMs);
+
+        return jitterMs > _state.BaselineJitterMs * _config.JitterSpikeMultiplier
+            && jitterMs > _config.JitterSpikeFloor.TotalMilliseconds;
     }
 
     /// <summary>

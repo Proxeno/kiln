@@ -31,6 +31,15 @@ public sealed class AdaptationPolicy
     /// </summary>
     private double _baselineRttMs;
 
+    /// <summary>
+    /// Tracked baseline jitter in milliseconds, mirroring
+    /// <see cref="RateControlState.BaselineJitterMs"/> the same way <see cref="_baselineRttMs"/>
+    /// mirrors the RTT baseline. A jitter spike (queueing early warning) only tempers the
+    /// walk-up — it never joins the severe tier, because rising jitter without loss is transient
+    /// queueing, the case where cascading down is exactly wrong.
+    /// </summary>
+    private double _baselineJitterMs;
+
     public AdaptationPolicy(
         RateControlConfig config,
         ResolutionLadder? resolutionLadder = null,
@@ -59,9 +68,10 @@ public sealed class AdaptationPolicy
         var newSpeedMode = currentDecision.SpeedMode;
         var reason = "";
 
-        // Fold this frame's RTT into the baseline before anything can early-return, so a route
-        // change keeps drifting in during cooldown frames too.
+        // Fold this frame's RTT and jitter into the baselines before anything can early-return, so
+        // a route change keeps drifting in during cooldown frames too.
         NetworkSignalBaseline.Update(ref _baselineRttMs, feedback.RoundTripTime.TotalMilliseconds);
+        NetworkSignalBaseline.Update(ref _baselineJitterMs, feedback.Jitter.TotalMilliseconds);
 
         if (_adaptationCooldownCounter > 0)
         {
@@ -162,15 +172,25 @@ public sealed class AdaptationPolicy
     /// Recovery gate for the walk-up. The RTT term accepts either the historical absolute 40 ms
     /// gate or RTT within (baseline * <see cref="RateControlConfig.RecoveryRttMultiplier"/>) —
     /// without the baseline-relative term, a link whose propagation RTT exceeds 40 ms could
-    /// cascade down on a loss episode and then never walk back up.
+    /// cascade down on a loss episode and then never walk back up. A jitter spike (jitter above
+    /// both baseline * <see cref="RateControlConfig.JitterSpikeMultiplier"/> and
+    /// <see cref="RateControlConfig.JitterSpikeFloor"/>) defers the walk-up too: queues are
+    /// already building, so raising resolution/fps into them would feed the very congestion the
+    /// early warning predicts. Zero jitter (callers without a measurement) never defers.
     /// </summary>
     private bool IsStableAndCanRecover(EncoderNetworkFeedback feedback, EncoderPipelineStats stats)
     {
         var rttMs = feedback.RoundTripTime.TotalMilliseconds;
         var rttSettled = rttMs < 40 ||
             (_baselineRttMs > 0 && rttMs < _baselineRttMs * _config.RecoveryRttMultiplier);
+        var jitterMs = feedback.Jitter.TotalMilliseconds;
+        var jitterSpike = jitterMs > 0 &&
+            _baselineJitterMs > 0 &&
+            jitterMs > _baselineJitterMs * _config.JitterSpikeMultiplier &&
+            jitterMs > _config.JitterSpikeFloor.TotalMilliseconds;
         return feedback.PacketLossRatio < 0.01 &&
             rttSettled &&
+            !jitterSpike &&
             feedback.PendingRtpBytes < 20_000 &&
             stats.AverageEncodeDuration.TotalMilliseconds < (1000.0 / 60) * 0.5;
     }

@@ -105,6 +105,25 @@ public sealed class RateControlConfig
     public double RecoveryRttMultiplier { get; init; } = 1.25;
 
     /// <summary>
+    /// Jitter multiplier for the queueing early warning. Rising delay variation without loss
+    /// means queues are building — the case where backing off aggressively is exactly wrong — so
+    /// a jitter spike only tempers <em>increases</em>: the bitrate upshift holds and the
+    /// resolution/fps/speed walk-up waits until jitter settles; it never triggers a cut. Spike =
+    /// jitter above both (tracked baseline jitter * this value) and
+    /// <see cref="JitterSpikeFloor"/>, the same baseline-relative treatment as
+    /// <see cref="CongestionRttMultiplier"/> so links with naturally high jitter are not
+    /// permanently held. Default: 2.
+    /// </summary>
+    public int JitterSpikeMultiplier { get; init; } = 2;
+
+    /// <summary>
+    /// Absolute jitter below which the spike test never fires, so ordinary wobble on a
+    /// low-jitter link (baseline of a millisecond or two) is not treated as queueing. Default:
+    /// 10 ms — roughly half a frame interval at 60 fps.
+    /// </summary>
+    public TimeSpan JitterSpikeFloor { get; init; } = TimeSpan.FromMilliseconds(10);
+
+    /// <summary>
     /// Maximum bytes allowed in RTP send queue before flow-control throttling.
     /// Default: 100 KB.
     /// </summary>

@@ -22,7 +22,15 @@ public sealed record EncoderNetworkFeedback(
     /// <summary>Round-trip time to client (typically milliseconds).</summary>
     TimeSpan RoundTripTime,
 
-    /// <summary>Network jitter or variation in RTT (typically milliseconds).</summary>
+    /// <summary>
+    /// Network jitter — delay variation from the transport (RFC 3550 interarrival jitter, or RTT
+    /// variation). Rising jitter without loss is queueing building rather than a bandwidth
+    /// collapse, so the controller uses it as an early warning that tempers increases: a jitter
+    /// spike (above both the tracked baseline * <see cref="RateControlConfig.JitterSpikeMultiplier"/>
+    /// and <see cref="RateControlConfig.JitterSpikeFloor"/>) holds the bitrate upshift and defers
+    /// the resolution/fps/speed walk-up until it settles; it never triggers a cut. Zero or
+    /// negative (the default) means "not measured" and has no effect.
+    /// </summary>
     TimeSpan Jitter,
 
     /// <summary>Number of bytes pending transmission in RTP/send queue.</summary>
