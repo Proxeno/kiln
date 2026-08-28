@@ -421,7 +421,9 @@ public sealed class H264BaselineEncoder : IDisposable
             maxReferenceFrames: Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize),
             useMotionSatd: _options.UseMotionSatd);
         _frameShared = sharedState;
-        var kernels = _options.PreferHardwareIntrinsics ? H264KernelSet.CreateBest() : new ScalarKernelSet();
+        var kernels = _options.PreferHardwareIntrinsics
+            ? H264KernelSet.CreateBest()
+            : H264WeftPilot.Decorate(new ScalarKernelSet());
         _kernels = kernels;
         var encoderCount = Math.Max(1, Math.Min(MaxSliceEncoders, _mbH));
         // Live speed-knob state starts as the constructor options and may be reassigned between

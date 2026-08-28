@@ -45,6 +45,37 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Kiln.Tests" />
     <InternalsVisibleTo Include="Kiln.Benchmarks" />
+    <InternalsVisibleTo Include="KilnWeftPilotHarness" />
+  </ItemGroup>
+
+  <!--
+    EXPERIMENTAL, opt-in, off by default: the Weft batch-SAD pilot (branch weft-pilot/motion-sad).
+
+      dotnet build -c Release -p:KilnWeftPilot=true -p:WeftRepoRoot=/abs/path/to/weft/
+
+    Without -p:KilnWeftPilot=true nothing below applies: KILN_WEFT_PILOT is undefined, so
+    src/Kiln/Internal/H264/H264WeftPilot.Weft.cs compiles to nothing, no Weft ProjectReference is
+    added, and the build has no dependency on a Weft checkout existing at all. That is the point —
+    kiln's ordinary build story is untouched on every machine, with or without Weft present.
+
+    WeftRepoRoot defaults to a sibling checkout (../weft/) and is overridable, because this branch
+    is also built against Weft worktrees that sit at a different relative depth.
+  -->
+  <PropertyGroup Condition="'$(KilnWeftPilot)' == 'true'">
+    <WeftRepoRoot Condition="'$(WeftRepoRoot)' == ''">$(MSBuildThisFileDirectory)../../../weft/</WeftRepoRoot>
+    <DefineConstants>$(DefineConstants);KILN_WEFT_PILOT</DefineConstants>
+  </PropertyGroup>
+
+  <Target Name="KilnWeftPilotCheck" BeforeTargets="BeforeBuild" Condition="'$(KilnWeftPilot)' == 'true'">
+    <Error Condition="!Exists('$(WeftRepoRoot)src/Weft.Kernels/Weft.Kernels.csproj')"
+           Text="KilnWeftPilot=true but no Weft checkout at '$(WeftRepoRoot)'. Pass -p:WeftRepoRoot=/abs/path/to/weft/ (trailing slash)." />
+  </Target>
+
+  <ItemGroup Condition="'$(KilnWeftPilot)' == 'true'">
+    <ProjectReference Include="$(WeftRepoRoot)src/Weft.Kernels/Weft.Kernels.csproj" />
+    <ProjectReference Include="$(WeftRepoRoot)src/Weft.Backends.Cpu/Weft.Backends.Cpu.csproj" />
+    <ProjectReference Include="$(WeftRepoRoot)src/Weft.Optimizer/Weft.Optimizer.csproj" />
+    <ProjectReference Include="$(WeftRepoRoot)src/Weft.Ir/Weft.Ir.csproj" />
   </ItemGroup>
 
 </Project>

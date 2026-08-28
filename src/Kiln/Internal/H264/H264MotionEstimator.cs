@@ -49,6 +49,14 @@ internal static class H264MotionEstimator
     private const int FastSearchFullFallbackSad = 4096;
 
     /// <summary>
+    /// Largest <c>searchRange</c> the <see cref="IH264BatchSadSearch"/> seam is offered. 32 is the
+    /// ceiling <see cref="H264BaselineSliceEncoder"/>'s adaptive range clamps to, so this excludes
+    /// nothing the encoder actually asks for; it exists so a provider is never handed an unbounded
+    /// grid size by a caller that passed an arbitrary range.
+    /// </summary>
+    private const int MaxBatchSadSearchRange = 32;
+
+    /// <summary>
     /// Search a 16×16 block in <paramref name="reference"/> for the best match to <paramref name="current"/>,
     /// starting from <paramref name="mvPredictor"/>. Search bounds are <paramref name="searchRange"/> integer pels
     /// in each direction. Returns the best MV in quarter-pel units (full-pel × 4) and its SAD.
@@ -1086,6 +1094,38 @@ internal static class H264MotionEstimator
             topSadIndexes.Fill(-1);
         }
 
+        // Batch-SAD seam (experimental; see IH264BatchSadSearch). A kernel set that also implements
+        // IH264BatchSadSearch can score the whole (2·searchRange + 1)² integer-pel grid for a 16×16
+        // block in one call, and the ring loop below then reads its per-candidate SAD out of that
+        // grid instead of calling kernels.Sad16x16 once per candidate.
+        //
+        // Nothing else about the search changes, and that is the point: the Manhattan ring order,
+        // the Fits bounds test, the chroma-safety test, the λ·MvBitCost pruning, the tie-break in
+        // IsBetterScoreCandidate and the t_searchEffort accounting all run exactly as they do
+        // without a provider, so the selected MV is bit-identical either way. Only the *source* of
+        // the per-candidate SAD moves. Candidates the grid cannot answer for (a window that leaves
+        // the reference plane) are precisely the ones Fits already rejects before the grid is read.
+        //
+        // Restricted to the SAD-domain 16×16 exhaustive search: SATD scoring has its own
+        // transform-domain path and sub-partition shapes are a different kernel. The graph-residual
+        // diagnostic path needs the per-candidate reference window anyway, so it opts out too.
+        var batchSadGrid = default(ReadOnlySpan<int>);
+        if (!useMotionSatd &&
+            blockShape == MeBlockShape.B16x16 &&
+            !collectGraphResidual &&
+            searchRange <= MaxBatchSadSearchRange &&
+            kernels is IH264BatchSadSearch batchSadSearch &&
+            batchSadSearch.TryScoreSad16x16Grid(
+                current, currentStride,
+                reference, referenceStride, picH,
+                mbX + predIx, mbY + predIy,
+                searchRange,
+                out var scoredGrid) &&
+            scoredGrid.Length == rangeLen * rangeLen)
+        {
+            batchSadGrid = scoredGrid;
+        }
+
         var maxManhattanDistance = searchRange << 1;
         for (var candidateDistance = 0; candidateDistance <= maxManhattanDistance; candidateDistance++)
         {
@@ -1150,7 +1190,17 @@ internal static class H264MotionEstimator
                     }
 
                     int s;
-                    if (useMotionSatd &&
+                    if (!batchSadGrid.IsEmpty)
+                    {
+                        // Charged exactly what ScoreBlock's SAD branch charges for a 16×16 (area 256,
+                        // >> 5), so H264BaselineSliceEncoder's ME effort budget — which reads
+                        // ThreadSearchEffort and changes encoder decisions from it — sees identical
+                        // numbers with the seam on or off. Reading the grid instead of calling the
+                        // kernel is a cost change, not a work change, and the accounting says so.
+                        t_searchEffort += 256 >> 5;
+                        s = batchSadGrid[(((dyAbs * dySign) + searchRange) * rangeLen) + dx + searchRange];
+                    }
+                    else if (useMotionSatd &&
                         CanUseTransformDomainSatd4x4(sourceTransformCoefficients, refTransformCache))
                     {
                         t_searchEffort += (bw * bh) >> 4;

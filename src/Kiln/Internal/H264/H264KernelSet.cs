@@ -5,7 +5,9 @@ namespace Kiln.Internal.H264;
 
 internal static class H264KernelSet
 {
-    public static IH264KernelSet CreateBest()
+    public static IH264KernelSet CreateBest() => H264WeftPilot.Decorate(CreateBestCore());
+
+    private static IH264KernelSet CreateBestCore()
     {
         if (Avx2.IsSupported) return new Avx2KernelSet();
         if (Ssse3.IsSupported) return new Ssse3KernelSet();
