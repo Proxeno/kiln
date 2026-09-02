@@ -1,6 +1,8 @@
 #if KILN_WEFT_PILOT
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
+using System.Reflection;
 using Weft.Backends.Cpu;
 using Weft.Ir;
 using Weft.Ir.Plan;
@@ -20,8 +22,47 @@ internal static partial class H264WeftPilot
     {
         if (H264WeftBatchSadKernelSet.Enabled && kernels is not IH264BatchSadSearch)
         {
+            AssertWeftMatchesOurConfiguration();
             kernels = new H264WeftBatchSadKernelSet(kernels);
         }
+    }
+
+    private static int s_weftConfigurationChecked;
+
+    /// <summary>
+    /// Runtime half of the Debug-Weft guard. <c>Kiln.csproj</c> makes the Weft references inherit
+    /// this build's configuration and fails the build if they did not; this checks the assembly
+    /// that was actually <em>loaded</em>, which is the one a benchmark measures — a hand-copied or
+    /// stale Weft DLL never went through our build at all.
+    ///
+    /// <para>It fires only on a MISMATCH: a Release kiln paired with an unoptimized Weft. A Debug
+    /// kiln with a Debug Weft is consistent and silent, so <c>dotnet test</c> is unaffected. Set
+    /// <c>KILN_WEFT_ALLOW_DEBUG_WEFT=1</c> to proceed anyway when deliberately debugging into Weft;
+    /// no measurement taken in that state should be reported.</para>
+    /// </summary>
+    private static void AssertWeftMatchesOurConfiguration()
+    {
+        if (Interlocked.Exchange(ref s_weftConfigurationChecked, 1) != 0)
+        {
+            return;
+        }
+
+#if !DEBUG
+        var weft = typeof(Weft.Kernels.SadBatchedU8Provider).Assembly;
+        var debuggable = weft.GetCustomAttribute<DebuggableAttribute>();
+        if (debuggable is not null && debuggable.IsJITOptimizerDisabled &&
+            Environment.GetEnvironmentVariable("KILN_WEFT_ALLOW_DEBUG_WEFT") is not ("1" or "true" or "TRUE" or "True"))
+        {
+            throw new InvalidOperationException(
+                $"Kiln is a Release build but the loaded Weft assembly '{weft.GetName().Name}' " +
+                $"({weft.Location}) was compiled with optimizations DISABLED. Any timing taken in " +
+                "this state measures an unoptimized Weft and is meaningless. Rebuild the pilot so " +
+                "the Weft projects inherit Kiln's configuration (see the " +
+                "ShouldUnsetParentConfigurationAndPlatform comment in src/Kiln/Kiln.csproj), or set " +
+                "KILN_WEFT_ALLOW_DEBUG_WEFT=1 if you are deliberately debugging and will not report " +
+                "a number from this run.");
+        }
+#endif
     }
 }
 
@@ -276,7 +317,7 @@ internal sealed class H264WeftBatchSadKernelSet : IH264KernelSet, IH264BatchSadS
 
     /// <summary>
     /// The one parametric program. Real production pipeline — <c>GraphBuilder</c> →
-    /// <c>ElementwiseFusionOptimizer.Compile</c> → <c>RegionMergePass.Run([SadBatchedU8Provider])</c>
+    /// <c>ElementwiseFusionOptimizer.Compile</c> → <c>RegionMergePass.Run(<see cref="SadArms"/>)</c>
     /// → <c>PlanVerifier.Verify().ThrowIfInvalid()</c> → <c>IlRenderer.Render</c> — the same one
     /// PP4's <c>ParametricKilnGraph.CompileParametric</c> uses.
     /// </summary>
@@ -308,10 +349,29 @@ internal sealed class H264WeftBatchSadKernelSet : IH264KernelSet, IH264BatchSadS
 
         var graph = b.Build();
         var plan0 = new ElementwiseFusionOptimizer().Compile(graph, new CompileOptions());
-        var plan = RegionMergePass.Run(plan0, [new SadBatchedU8Provider()]);
+        var plan = RegionMergePass.Run(plan0, SadArms());
         PlanVerifier.Verify(plan).ThrowIfInvalid();
-        return new IlRenderer(providers: [new SadBatchedU8Provider()]).Render(plan);
+        return new IlRenderer(providers: [.. SadArms().Cast<IKernelProvider>()]).Render(plan);
     }
+
+    /// <summary>
+    /// Every Weft arm that can serve this region, in one place, so the region pass and the renderer
+    /// cannot disagree about what is available.
+    ///
+    /// <para><b>Why both.</b> The graph above reduces a rank-3 batched domain, so its idiom is
+    /// <c>sad.u8.sum.batched</c>. Weft ships two arms for that idiom on the two ISAs kiln runs on:
+    /// <c>SadBatchedU8Provider</c> (<c>RequiredIsa = arm64-advsimd</c>) and
+    /// <c>SadBatchedU8Sse2Provider</c> (<c>RequiredIsa = x64-sse2</c>). Registering only the first —
+    /// which is what this pilot did until now — left the x86 path with <em>no</em> SIMD SAD arm
+    /// registered at all: the region fell to Weft's generic lowering while still paying the pilot's
+    /// per-call staging and <c>SetParameters</c> cost. That is a defect in the pilot on its own
+    /// terms; it advertises a batched SIMD SAD seam and on x86 did not have one.</para>
+    ///
+    /// <para>Each provider gates on its own <c>RequiredIsa</c>, so exactly one can claim on a given
+    /// machine and the arm64 behaviour is unchanged by the second entry.</para>
+    /// </summary>
+    private static IRegionProvider[] SadArms() =>
+        [new SadBatchedU8Provider(), new SadBatchedU8Sse2Provider()];
 
     // ---- IH264KernelSet: everything else is the wrapped set, unchanged --------------------------
 
