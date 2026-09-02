@@ -58,7 +58,7 @@ internal static partial class H264WeftPilot
                 $"({weft.Location}) was compiled with optimizations DISABLED. Any timing taken in " +
                 "this state measures an unoptimized Weft and is meaningless. Rebuild the pilot so " +
                 "the Weft projects inherit Kiln's configuration (see the " +
-                "ShouldUnsetParentConfigurationAndPlatform comment in src/Kiln/Kiln.csproj), or set " +
+                "ShouldUnsetParentConfigurationAndPlatform comment in Directory.Build.props), or set " +
                 "KILN_WEFT_ALLOW_DEBUG_WEFT=1 if you are deliberately debugging and will not report " +
                 "a number from this run.");
         }

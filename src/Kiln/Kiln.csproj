@@ -64,28 +64,6 @@
   <PropertyGroup Condition="'$(KilnWeftPilot)' == 'true'">
     <WeftRepoRoot Condition="'$(WeftRepoRoot)' == ''">$(MSBuildThisFileDirectory)../../../weft/</WeftRepoRoot>
     <DefineConstants>$(DefineConstants);KILN_WEFT_PILOT</DefineConstants>
-    <!--
-      THE Kiln.slnx DEBUG FOOT-GUN, AND ITS ROOT-CAUSE FIX.
-
-      The Weft projects cannot be members of Kiln.slnx: WeftRepoRoot is a build-time property and a
-      solution file has to name its projects statically. When MSBuild builds a solution it runs
-      every ProjectReference through AssignProjectConfiguration, which maps in-solution references
-      via the solution's configuration table. An OUT-of-solution reference has no row in that table,
-      and MSBuild's default response outside Visual Studio (ShouldUnsetParentConfigurationAndPlatform
-      defaults to true) is to STRIP Configuration/Platform from the global properties passed down —
-      so the referenced project builds at its own default, which is Debug.
-
-      Observed before this line, on both arm64 and x86:
-        dotnet build -c Release -p:KilnWeftPilot=true ... Kiln.slnx
-          Kiln    -> src/Kiln/bin/Release/net10.0/Kiln.dll        <- Release
-          Weft.Ir -> src/Weft.Ir/bin/DEBUG/net10.0/Weft.Ir.dll    <- unoptimized, silently
-
-      Anyone benchmarking the pilot through the solution measured an unoptimized Weft and would
-      conclude Weft is far slower than it is. Setting this false makes the parent's Configuration
-      flow to the Weft references. It is scoped to the pilot: without KilnWeftPilot=true there are
-      no out-of-solution references, and this property is never set.
-    -->
-    <ShouldUnsetParentConfigurationAndPlatform>false</ShouldUnsetParentConfigurationAndPlatform>
   </PropertyGroup>
 
   <Target Name="KilnWeftPilotCheck" BeforeTargets="BeforeBuild" Condition="'$(KilnWeftPilot)' == 'true'">
@@ -94,26 +72,20 @@
   </Target>
 
   <!--
-    BUILD-TIME GUARD for the same foot-gun. The property above fixes the cause; this target proves
-    it stayed fixed, on every build, whatever the entry point (solution, project file, IDE, a future
-    MSBuild whose defaults differ). It reads the paths the Weft references actually RESOLVED to and
-    fails if any of them did not land in this build's configuration.
-
-    A README line would not survive; a build error cannot be forgotten.
+    Kiln.csproj is the only project that references Weft directly, so it is the only one that can
+    tell "the pilot is on but nothing got wired" from "the pilot is off". The CONFIGURATION guard
+    lives in Directory.Build.props instead, because the consumers reach Weft transitively and each
+    of them has to check for itself — see the long comment there.
   -->
-  <Target Name="KilnWeftPilotConfigurationGuard"
+  <Target Name="KilnWeftPilotReferencePresenceGuard"
           AfterTargets="ResolveProjectReferences"
-          Condition="'$(KilnWeftPilot)' == 'true' and '$(Configuration)' != ''">
+          Condition="'$(KilnWeftPilot)' == 'true'">
     <ItemGroup>
       <_KilnWeftResolvedRef Include="@(_ResolvedProjectReferencePaths)"
                             Condition="$([System.String]::Copy('%(Filename)').StartsWith('Weft.'))" />
-      <_KilnWeftWrongConfig Include="@(_KilnWeftResolvedRef)"
-                            Condition="!$([System.String]::Copy('%(Identity)').Replace('\', '/').Contains('/bin/$(Configuration)/'))" />
     </ItemGroup>
     <Error Condition="'@(_KilnWeftResolvedRef)' == ''"
            Text="KilnWeftPilot=true but no Weft.* project reference resolved. The pilot would compile against nothing; refusing to produce a binary that silently is not the pilot." />
-    <Error Condition="'@(_KilnWeftWrongConfig)' != ''"
-           Text="Kiln is building '$(Configuration)' but these Weft references resolved to a DIFFERENT configuration: @(_KilnWeftWrongConfig, '%0A  '). This is the Kiln.slnx foot-gun (see the ShouldUnsetParentConfigurationAndPlatform comment above): a Release Kiln linked against a Debug Weft benchmarks as an unoptimized Weft and the number is meaningless. Build the project file directly, or restore the configuration flow, before trusting any measurement." />
   </Target>
 
   <ItemGroup Condition="'$(KilnWeftPilot)' == 'true'">

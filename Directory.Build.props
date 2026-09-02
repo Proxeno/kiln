@@ -16,4 +16,65 @@
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
+
+  <!--
+    ===========================================================================================
+    THE Kiln.slnx DEBUG FOOT-GUN, AND ITS FIX. Applies only to the EXPERIMENTAL Weft pilot
+    (-p:KilnWeftPilot=true); an ordinary kiln build never evaluates any of it.
+    ===========================================================================================
+
+    The Weft projects cannot be members of Kiln.slnx: WeftRepoRoot is a build-time property and a
+    solution file has to name its projects statically. When MSBuild builds a solution it runs every
+    ProjectReference through AssignProjectConfiguration, which maps in-solution references through
+    the solution's configuration table. An OUT-of-solution reference has no row in that table, and
+    MSBuild's default outside Visual Studio (ShouldUnsetParentConfigurationAndPlatform = true) is
+    to STRIP Configuration/Platform from the properties passed down — so the referenced project
+    builds at its own default, which is Debug.
+
+    Measured, before this file changed (webhost1, kiln 74fb8d7, kx-runs/10-slnx-footgun.log):
+
+      dotnet build -c Release -p:KilnWeftPilot=true ... Kiln.slnx
+        Kiln    -> src/Kiln/bin/Release/net10.0/Kiln.dll        <- Release
+        Weft.Ir -> src/Weft.Ir/bin/DEBUG/net10.0/Weft.Ir.dll    <- unoptimized, silently
+      and the Weft.Ir.dll copied next to Kiln.dll md5-matched the Debug build exactly.
+
+    Anyone benchmarking the pilot that way measures an unoptimized Weft.
+
+    WHY THIS LIVES HERE AND NOT IN Kiln.csproj. It was tried in Kiln.csproj first, and that fixed
+    only half the problem — measured, not assumed (kx-runs/11-slnx-diagnostic.log): src/Kiln got
+    Release Weft, while tests/Kiln.Tests, bench/Kiln.Benchmarks and samples/Kiln.Capture all still
+    copied the DEBUG Weft, because each of them resolves Weft TRANSITIVELY through Kiln and runs
+    its own AssignProjectConfiguration, which knew nothing about the property. The benchmark
+    project was among the ones still getting Debug — i.e. the half-fix would have left the exact
+    measurement this matters for still broken. Directory.Build.props is the only place that
+    reaches every project that can transitively see Weft.
+  -->
+  <PropertyGroup Condition="'$(KilnWeftPilot)' == 'true'">
+    <ShouldUnsetParentConfigurationAndPlatform>false</ShouldUnsetParentConfigurationAndPlatform>
+  </PropertyGroup>
+
+  <!--
+    BUILD-TIME GUARD. The property above fixes the cause; this proves it stayed fixed on every
+    build, from every entry point (solution, project file, IDE, a future MSBuild whose defaults
+    differ), in every project — not just the one that declares the references.
+
+    It inspects @(ReferenceCopyLocalPaths), which is the set of files this project is about to copy
+    into its own output directory, with their SOURCE paths. That is deliberately the strongest
+    available signal: it is the actual Weft.dll the built program will load, direct or transitive,
+    rather than a property whose propagation we would otherwise be taking on trust.
+
+    A README line does not survive; a build error cannot be forgotten.
+  -->
+  <Target Name="KilnWeftPilotConfigurationGuard"
+          AfterTargets="ResolveAssemblyReferences"
+          Condition="'$(KilnWeftPilot)' == 'true' and '$(Configuration)' != ''">
+    <ItemGroup>
+      <_KilnWeftCopied Include="@(ReferenceCopyLocalPaths)"
+                       Condition="'%(Extension)' == '.dll' and $([System.String]::Copy('%(Filename)').StartsWith('Weft.'))" />
+      <_KilnWeftWrongConfig Include="@(_KilnWeftCopied)"
+                            Condition="!$([System.String]::Copy('%(Identity)').Replace('\', '/').Contains('/bin/$(Configuration)/'))" />
+    </ItemGroup>
+    <Error Condition="'@(_KilnWeftWrongConfig)' != ''"
+           Text="$(MSBuildProjectName) is building '$(Configuration)' but is about to copy Weft assemblies built in a DIFFERENT configuration:%0A  @(_KilnWeftWrongConfig, '%0A  ')%0AThis is the Kiln.slnx foot-gun (see the ShouldUnsetParentConfigurationAndPlatform comment in Directory.Build.props). A Release Kiln linked against a Debug Weft benchmarks as an unoptimized Weft and the number is meaningless. Fix the configuration flow before trusting any measurement." />
+  </Target>
 </Project>
