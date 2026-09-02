@@ -369,9 +369,42 @@ internal sealed class H264WeftBatchSadKernelSet : IH264KernelSet, IH264BatchSadS
     ///
     /// <para>Each provider gates on its own <c>RequiredIsa</c>, so exactly one can claim on a given
     /// machine and the arm64 behaviour is unchanged by the second entry.</para>
+    ///
+    /// <para><b>Why the SHARED arms come first, and why that ordering is the whole point.</b>
+    /// <c>RegionMergePass</c> takes the <em>first interested</em> provider, so this order is the
+    /// selection. Weft ships a second pair for the same idiom — <c>SadSharedU8Provider</c>
+    /// (<c>arm64-advsimd</c>) and <c>SadSharedU8SseProvider</c> (<c>x64-ssse3</c>) — which slide one
+    /// register file across neighbouring candidates instead of reloading every window. That is
+    /// exactly the load-traffic deficit <c>experiments/kiln-pilot</c> Packet 2 measured as the
+    /// largest single gap between Weft and an expert kernel (9,248 loads/MB against 816).</para>
+    ///
+    /// <para>It matters more than it sounds, because <b>registering only the batched pair does not
+    /// pay.</b> Priced at kiln's own geometry (R=8, K=289, 1080p plane) on an AVX2 host, with kiln's
+    /// own <c>H264MotionSad.Sad16x16Avx2</c> composition as the control — the kernel the seam
+    /// actually replaces, not Weft's generic lowering:</para>
+    /// <code>
+    ///   generic lowering (no arm registered)  450.5 us/MB   0.026x   <- what the pilot did before
+    ///   sad-u8-batched-psadbw                  11.8 us/MB   0.983x   <- a WASH against kiln's own
+    ///   sad-u8-shared-palignr                   6.6 us/MB   1.761x
+    ///   kiln's own AVX2 loop (CONTROL)         11.6 us/MB   1.000x
+    /// </code>
+    /// <para>All four arms were verified to agree elementwise over 200 macroblocks x 289 candidates
+    /// before any timing was taken. Receipts and method:
+    /// <c>experiments/kiln-surface/</c> in the Weft repo (§4), whose end-to-end run also shows this
+    /// ordering erasing the 0-2.7% x86 regression the re-baselining packet measured.</para>
+    ///
+    /// <para><b>NOT MEASURED:</b> the arm64 half. This list now offers <c>SadSharedU8Provider</c>
+    /// ahead of <c>SadBatchedU8Provider</c> on arm64 too, and that reorder has not been benchmarked
+    /// there. It is safe by construction — each arm gates on its own <c>RequiredIsa</c> and the seam
+    /// is default-off — but the x86 ratios above must not be read as an arm64 claim.</para>
     /// </summary>
     private static IRegionProvider[] SadArms() =>
-        [new SadBatchedU8Provider(), new SadBatchedU8Sse2Provider()];
+    [
+        new SadSharedU8Provider(),
+        new SadSharedU8SseProvider(),
+        new SadBatchedU8Provider(),
+        new SadBatchedU8Sse2Provider(),
+    ];
 
     // ---- IH264KernelSet: everything else is the wrapped set, unchanged --------------------------
 
