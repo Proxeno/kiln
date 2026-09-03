@@ -18,6 +18,101 @@ namespace Kiln.Internal.H264;
 /// </remarks>
 internal static class H264QpelLumaInterp
 {
+#if KILN_QPEL_INSTRUMENT
+    // --- experiments/kiln-qpel-gate: opt-in shape census, off unless KILN_QPEL_CENSUS=1 ---
+    // Counts, not timings. Answers "what (xFrac,yFrac,bw,bh) does a real encode actually ask for?",
+    // which decides whether a Weft qpel seam could vectorize the calls kiln really makes.
+    private static readonly bool CensusEnabled =
+        Environment.GetEnvironmentVariable("KILN_QPEL_CENSUS") == "1";
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> CensusCounts = new();
+
+    static H264QpelLumaInterp()
+    {
+        if (DumpPath is not null)
+            AppDomain.CurrentDomain.ProcessExit += static (_, _) => CloseDump();
+        if (!CensusEnabled)
+            return;
+        AppDomain.CurrentDomain.ProcessExit += static (_, _) => DumpCensus();
+    }
+
+    private static void DumpCensus()
+    {
+        var rows = CensusCounts.ToArray();
+        long total = 0;
+        foreach (var r in rows) total += r.Value;
+        Console.Error.WriteLine($"QPELCENSUS total={total} distinct={rows.Length}");
+        Array.Sort(rows, static (a, b) => b.Value.CompareTo(a.Value));
+        foreach (var r in rows)
+        {
+            var k = r.Key;
+            var xf = (int)(k & 0xFF);
+            var yf = (int)((k >> 8) & 0xFF);
+            var bw = (int)((k >> 16) & 0xFFFF);
+            var bh = (int)((k >> 32) & 0xFFFF);
+            var pct = total == 0 ? 0 : 100.0 * r.Value / total;
+            Console.Error.WriteLine($"QPELCENSUS xFrac={xf} yFrac={yf} bw={bw} bh={bh} calls={r.Value} pct={pct:F3}");
+        }
+    }
+
+    // --- experiments/kiln-qpel-gate: opt-in patch DUMP, off unless KILN_QPEL_DUMP is set ---
+    // Writes every Nth call's (xFrac, yFrac, bw, bh) plus the (bh+6)x(bw+6) padded source patch
+    // that the filter actually reads, so the gate harness can prove byte-identity against the
+    // real bytes a real encode fed this filter rather than against synthetic noise.
+    // Record: [u8 xFrac][u8 yFrac][u16 bw][u16 bh][(bh+6)*(bw+6) patch bytes], origin at (2,2).
+    private static readonly string? DumpPath = Environment.GetEnvironmentVariable("KILN_QPEL_DUMP");
+    private static readonly int DumpEvery =
+        int.TryParse(Environment.GetEnvironmentVariable("KILN_QPEL_DUMP_EVERY"), out var de) && de > 0 ? de : 4096;
+    private static readonly object DumpLock = new();
+    private static FileStream? _dumpStream;
+    private static long _dumpSeen;
+
+    private static void MaybeDump(
+        ReadOnlySpan<byte> src, int srcStride, int srcOriginX, int srcOriginY,
+        int xFrac, int yFrac, int bw, int bh)
+    {
+        if (Interlocked.Increment(ref _dumpSeen) % DumpEvery != 0)
+            return;
+
+        var pw = bw + 6;
+        var ph = bh + 6;
+        var x0 = srcOriginX - 2;
+        var y0 = srcOriginY - 2;
+        if (x0 < 0 || y0 < 0)
+            return;
+        var last = ((y0 + ph - 1) * srcStride) + x0 + pw;
+        if (x0 + pw > srcStride || last > src.Length)
+            return;
+
+        var patch = new byte[ph * pw];
+        for (var r = 0; r < ph; r++)
+            src.Slice(((y0 + r) * srcStride) + x0, pw).CopyTo(patch.AsSpan(r * pw));
+
+        lock (DumpLock)
+        {
+            _dumpStream ??= new FileStream(DumpPath!, FileMode.Create, FileAccess.Write);
+            Span<byte> head = stackalloc byte[6];
+            head[0] = (byte)xFrac;
+            head[1] = (byte)yFrac;
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(head[2..4], (ushort)bw);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(head[4..6], (ushort)bh);
+            _dumpStream.Write(head);
+            _dumpStream.Write(patch);
+        }
+    }
+
+    private static void CloseDump()
+    {
+        lock (DumpLock)
+        {
+            _dumpStream?.Flush();
+            _dumpStream?.Dispose();
+            _dumpStream = null;
+        }
+    }
+
+#endif
+
     private static readonly Vector128<short> TapMinus5 = Vector128.Create((short)(-5));
     private static readonly Vector128<short> Tap20 = Vector128.Create((short)20);
 
@@ -35,6 +130,20 @@ internal static class H264QpelLumaInterp
         int blockWidth, int blockHeight,
         Span<byte> dst, int dstStride)
     {
+#if KILN_QPEL_INSTRUMENT
+        if (DumpPath is not null)
+            MaybeDump(src, srcStride, srcOriginX, srcOriginY, xFrac, yFrac, blockWidth, blockHeight);
+
+        if (CensusEnabled)
+        {
+            var key = (long)(byte)xFrac
+                      | ((long)(byte)yFrac << 8)
+                      | ((long)(ushort)blockWidth << 16)
+                      | ((long)(ushort)blockHeight << 32);
+            CensusCounts.AddOrUpdate(key, 1L, static (_, v) => v + 1);
+        }
+#endif
+
         if (!IsSimdSupported)
         {
             Interpolate(src, srcStride, srcOriginX, srcOriginY, xFrac, yFrac,

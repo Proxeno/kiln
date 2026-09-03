@@ -46,6 +46,7 @@
     <InternalsVisibleTo Include="Kiln.Tests" />
     <InternalsVisibleTo Include="Kiln.Benchmarks" />
     <InternalsVisibleTo Include="KilnWeftPilotHarness" />
+    <InternalsVisibleTo Include="QpelGate" />
   </ItemGroup>
 
   <!--
