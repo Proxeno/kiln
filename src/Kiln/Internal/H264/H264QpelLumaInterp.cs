@@ -27,10 +27,31 @@ internal static class H264QpelLumaInterp
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> CensusCounts = new();
 
+    // --- in-situ per-call cost, off unless KILN_QPEL_TIME=1 ---
+    // The gate harness measures this filter on an L1-resident patch. The encoder does not: it
+    // reads scattered windows of a 1080p reference plane on four contending threads. This sums
+    // Stopwatch ticks around the filter body in a real encode so the two can be compared. The
+    // instrumentation cost inflates the result, so the number is an UPPER bound on in-situ cost --
+    // which is the conservative direction for judging how much of the site a kernel swap can win.
+    private static readonly bool TimeEnabled =
+        Environment.GetEnvironmentVariable("KILN_QPEL_TIME") == "1";
+
+    private static long _timeTicks;
+    private static long _timeCalls;
+
+    private static void DumpTiming()
+    {
+        var ns = _timeTicks * (1_000_000_000.0 / System.Diagnostics.Stopwatch.Frequency);
+        Console.Error.WriteLine(
+            $"QPELTIME calls={_timeCalls} totalMs={ns / 1e6:F1} nsPerCall={(_timeCalls == 0 ? 0 : ns / _timeCalls):F1}");
+    }
+
     static H264QpelLumaInterp()
     {
         if (DumpPath is not null)
             AppDomain.CurrentDomain.ProcessExit += static (_, _) => CloseDump();
+        if (TimeEnabled)
+            AppDomain.CurrentDomain.ProcessExit += static (_, _) => DumpTiming();
         if (!CensusEnabled)
             return;
         AppDomain.CurrentDomain.ProcessExit += static (_, _) => DumpCensus();
@@ -151,6 +172,11 @@ internal static class H264QpelLumaInterp
             return;
         }
 
+#if KILN_QPEL_INSTRUMENT
+        var t0 = TimeEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+        try
+        {
+#endif
         switch ((xFrac, yFrac))
         {
             case (0, 0):
@@ -170,6 +196,17 @@ internal static class H264QpelLumaInterp
                                blockWidth, blockHeight, dst, dstStride);
                 break;
         }
+#if KILN_QPEL_INSTRUMENT
+        }
+        finally
+        {
+            if (TimeEnabled)
+            {
+                System.Threading.Interlocked.Add(ref _timeTicks, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+                System.Threading.Interlocked.Increment(ref _timeCalls);
+            }
+        }
+#endif
     }
 
     // ─── SIMD kernels ─────────────────────────────────────────────────────────
