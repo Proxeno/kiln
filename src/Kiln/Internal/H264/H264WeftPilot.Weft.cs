@@ -126,11 +126,32 @@ internal sealed class H264WeftBatchSadKernelSet : IH264KernelSet, IH264BatchSadS
     public static bool Enabled { get; set; } = ReadFlag("KILN_WEFT_BATCH_SAD");
 
     /// <summary>
-    /// Largest search range served, from <c>KILN_WEFT_BATCH_SAD_MAX_RANGE</c> (default 8 — the
-    /// K = 289 shape every prior packet in this pilot measured). Larger ranges are declined, not
-    /// approximated, so the estimator falls back to its own per-candidate kernel.
+    /// Largest search range served, from <c>KILN_WEFT_BATCH_SAD_MAX_RANGE</c>. Default: the
+    /// estimator's own ceiling, <see cref="H264MotionEstimator.MaxBatchSadSearchRange"/> (32).
+    /// Larger ranges are declined, not approximated, so the estimator falls back to its own
+    /// per-candidate kernel.
+    ///
+    /// <para><b>Why the default is the estimator's ceiling and not 8.</b> The default used to be
+    /// 8 — the K = 289 shape the pilot's early packets measured — while the one search path that
+    /// reaches this seam at kiln's shipped <c>FastSearch = true</c> is the hex search's exhaustive
+    /// fallback, which <c>H264BaselineSliceEncoder</c> seeds at <c>seedSearchRangeThisMb = 32</c>.
+    /// So at the old default every offer on the shipped path was declined on range and no Weft
+    /// kernel ever ran: kiln's own counters read 520 offered / 0 engaged / 520 declined-for-range
+    /// over 24 frames at 1920×1080 on both ISAs (Weft repo, <c>experiments/anchor-sweep-x64</c>,
+    /// <c>experiments/anchor-sweep-arm64</c>). The provider's served set and the caller's asked
+    /// range were chosen independently and never checked against each other; reading the default
+    /// off the estimator's constant removes the second copy of that number. A narrower set is
+    /// still available through the environment variable.</para>
+    ///
+    /// <para>What the wider default costs: one parametric program per (plane geometry, range), and
+    /// at R = 32 the grid is 65² = 4,225 candidates, so a 1080p compile measured 550.6 ms (x64,
+    /// AVX2 rental) / 396.4 ms (arm64, M5 Max) against tens of ms at R = 8; break-even against
+    /// kiln's own encoder on the engaged arm is ~200 frames. On the shipped path only three ranges
+    /// can ever be asked (32, and 16/8 under the effort-budget tiers), so at most three compiles;
+    /// with <c>FastSearch = false</c> every macroblock reaches this seam and <c>adaptiveRange</c>
+    /// can take any value in [8, 32], so up to 25 programs.</para>
     /// </summary>
-    public static int MaxRange { get; set; } = ReadInt("KILN_WEFT_BATCH_SAD_MAX_RANGE", 8);
+    public static int MaxRange { get; set; } = ReadInt("KILN_WEFT_BATCH_SAD_MAX_RANGE", H264MotionEstimator.MaxBatchSadSearchRange);
 
     /// <summary>Macroblock searches served by the Weft program.</summary>
     public static long Engaged => Interlocked.Read(ref s_engaged);

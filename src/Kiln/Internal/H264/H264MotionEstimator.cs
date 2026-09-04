@@ -52,9 +52,12 @@ internal static class H264MotionEstimator
     /// Largest <c>searchRange</c> the <see cref="IH264BatchSadSearch"/> seam is offered. 32 is the
     /// ceiling <see cref="H264BaselineSliceEncoder"/>'s adaptive range clamps to, so this excludes
     /// nothing the encoder actually asks for; it exists so a provider is never handed an unbounded
-    /// grid size by a caller that passed an arbitrary range.
+    /// grid size by a caller that passed an arbitrary range. Internal so a provider can size its
+    /// served set to this ceiling instead of carrying a second copy of the number (see
+    /// <c>H264WeftBatchSadKernelSet.MaxRange</c>, whose default was 8 while this was 32 — and every
+    /// offer on the shipped search path declined on range as a result).
     /// </summary>
-    private const int MaxBatchSadSearchRange = 32;
+    internal const int MaxBatchSadSearchRange = 32;
 
     /// <summary>
     /// Search a 16×16 block in <paramref name="reference"/> for the best match to <paramref name="current"/>,
