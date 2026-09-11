@@ -73,7 +73,12 @@ mkdir -p "$OUTDIR"
 echo "arms=${#ARMS[@]} rounds=$ROUNDS frames=$FRAMES slices=$SLICES ${W}x${H} out=$OUTDIR" >&2
 
 run_one() { # $1 tag, $2 rows (empty = live), $3 round
-  local tag="$1" rows="$2" round="$3" f="$OUTDIR/${tag}-r${round}.txt"
+  # Separate locals: one `local` statement evaluates every right-hand side before assigning any
+  # of them, so ${tag} inside a sharing statement would read the (unset) outer variable.
+  local tag="$1"
+  local rows="$2"
+  local round="$3"
+  local f="$OUTDIR/${tag}-r${round}.txt"
   if [[ -n "$rows" ]]; then
     KILN_H264_SLICE_ROWS="$rows" dotnet "$BENCH" --perf-probe phases default "$SLICES" "$FRAMES" >"$f" 2>&1
   else
