@@ -58,6 +58,34 @@ internal static class H264PInterDiagnostics
         "1",
         StringComparison.Ordinal);
 
+    /// <summary>
+    /// Measurement-only fixed slice partition, e.g. <c>KILN_H264_SLICE_ROWS=0,31,34,37,68</c> —
+    /// MB row boundaries of the tiling, strictly increasing, starting at 0. Read once at type init.
+    /// The encoder applies it only when the boundary count matches the frame's slice count and the
+    /// last boundary is the coded picture height, so a value left over from a different geometry
+    /// falls through to the normal partitioner instead of producing an invalid tiling. Exists so a
+    /// candidate partition can be priced against the live one without recompiling the balancer.
+    /// </summary>
+    internal static readonly int[]? SliceRowsOverride = ParseSliceRowsOverride();
+
+    private static int[]? ParseSliceRowsOverride()
+    {
+        var raw = Environment.GetEnvironmentVariable("KILN_H264_SLICE_ROWS");
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+        var parts = raw.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+            return null;
+        var rows = new int[parts.Length];
+        for (var i = 0; i < parts.Length; i++)
+        {
+            if (!int.TryParse(parts[i], out rows[i]) || (i > 0 && rows[i] <= rows[i - 1]))
+                return null;
+        }
+
+        return rows[0] == 0 ? rows : null;
+    }
+
     private static long s_phase1Skip;
     private static long s_phase2Entered;
     private static long s_phase2bIntraWin;
@@ -209,6 +237,12 @@ internal static class H264PInterDiagnostics
     private static long s_fpSliceCopyTicks;
     private static long s_fpSliceDeblockTicks;
     private static readonly long[] s_fpSliceTicksByIndex = new long[16];
+
+    /// <summary>Boundaries of the last partition chosen; slice k covers rows [rows[k], rows[k+1]).</summary>
+    private static readonly int[] s_fpSliceRows = new int[17];
+    private static int s_fpSliceRowCount;
+    private static long s_fpSliceRowChanges;
+    private static long s_fpSliceRowFrames;
     private const int MaxRowStats = 1024;
     private static readonly long[] s_rowTicks = new long[MaxRowStats];
     private static readonly long[] s_rowSkip = new long[MaxRowStats];
@@ -231,6 +265,10 @@ internal static class H264PInterDiagnostics
         Interlocked.Exchange(ref s_fpSliceCopyTicks, 0);
         Interlocked.Exchange(ref s_fpSliceDeblockTicks, 0);
         Array.Clear(s_fpSliceTicksByIndex);
+        Array.Clear(s_fpSliceRows);
+        s_fpSliceRowCount = 0;
+        Interlocked.Exchange(ref s_fpSliceRowChanges, 0);
+        Interlocked.Exchange(ref s_fpSliceRowFrames, 0);
     }
 
     /// <summary>Records one multi-slice frame's phase ticks (orchestrator thread, once per frame).</summary>
@@ -259,6 +297,24 @@ internal static class H264PInterDiagnostics
         if (!CollectFramePhases || (uint)sliceIndex >= (uint)s_fpSliceTicksByIndex.Length)
             return;
         Interlocked.Add(ref s_fpSliceTicksByIndex[sliceIndex], ticks);
+    }
+
+    /// <summary>
+    /// Records the MB row partition (slice k covers rows [rows[k], rows[k+1])) the frame encoder
+    /// just selected. Orchestrator thread, before the parallel loop, so no interleaving with the
+    /// per-slice notifications. Keeps the most recent partition plus how many frames differed from
+    /// the previous frame's — the convergence signal for the cost-balanced partitioner.
+    /// </summary>
+    internal static void NotifySlicePartition(ReadOnlySpan<int> rows)
+    {
+        if (!CollectFramePhases || rows.Length < 2 || rows.Length > s_fpSliceRows.Length)
+            return;
+        Interlocked.Increment(ref s_fpSliceRowFrames);
+        if (s_fpSliceRowCount == rows.Length && rows.SequenceEqual(s_fpSliceRows.AsSpan(0, rows.Length)))
+            return;
+        Interlocked.Increment(ref s_fpSliceRowChanges);
+        rows.CopyTo(s_fpSliceRows);
+        s_fpSliceRowCount = rows.Length;
     }
 
     /// <summary>Records one slice's source-copy and deblock ticks (slice worker, once per slice).</summary>
@@ -350,12 +406,26 @@ internal static class H264PInterDiagnostics
             .Append(" sliceCopySum=").Append(copy.ToString("F3"))
             .Append(" sliceDeblockSum=").Append(deblock.ToString("F3"));
         sb.AppendLine().Append("  perSlice:");
+        var rowCount = s_fpSliceRowCount;
         for (var i = 0; i < s_fpSliceTicksByIndex.Length; i++)
         {
             var t = Volatile.Read(ref s_fpSliceTicksByIndex[i]);
             if (t == 0)
                 continue;
             sb.Append(" [").Append(i).Append("]=").Append(Ms(t, frames).ToString("F2"));
+            // Row range of slice i in the most recent partition (MB rows, [lo, hi) half-open).
+            if (i + 1 < rowCount)
+                sb.Append(" rows[").Append(s_fpSliceRows[i]).Append('.').Append(s_fpSliceRows[i + 1]).Append(')');
+        }
+
+        var partFrames = Volatile.Read(ref s_fpSliceRowFrames);
+        if (partFrames > 0)
+        {
+            sb.AppendLine().Append("  partition: last=(");
+            for (var i = 0; i + 1 < rowCount; i++)
+                sb.Append(i == 0 ? "" : " ").Append(s_fpSliceRows[i]).Append("..").Append(s_fpSliceRows[i + 1]);
+            sb.Append(") frames=").Append(partFrames)
+                .Append(" changed=").Append(Volatile.Read(ref s_fpSliceRowChanges));
         }
 
         if (reset)
