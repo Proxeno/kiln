@@ -1018,6 +1018,8 @@ public sealed class H264BaselineEncoder : IDisposable
         // first_mb_in_slice boundaries fall (§7.4.3 only requires slices to tile the picture).
         ComputeSlicePartition(sliceCount);
         var partitionRows = _slicePartitionRows;
+        if (collectFramePhases)
+            H264PInterDiagnostics.NotifySlicePartition(partitionRows.AsSpan(0, sliceCount + 1));
 
         // Single-threaded fence: clear shared per-MB caches and (if IDR) invalidate the reference.
         // Done once before the parallel loop so disjoint per-slice writes don't race with the reset.
@@ -1166,6 +1168,21 @@ public sealed class H264BaselineEncoder : IDisposable
         // content) and the resulting partition is a small net loss, so SAD-mode encodes keep the
         // historical equal-height split.
         var balanceDisabled = !_useMotionSatd || H264PInterDiagnostics.DisableSlicePartitionBalance;
+
+        // Measurement-only fixed tiling (KILN_H264_SLICE_ROWS): price a candidate partition against
+        // the live one. Accepted only when it tiles exactly this picture at this slice count, so a
+        // stale value from another geometry falls through to the normal partitioner.
+        var fixedRows = H264PInterDiagnostics.SliceRowsOverride;
+        if (fixedRows is not null && fixedRows.Length == sliceCount + 1 && fixedRows[^1] == _mbH)
+        {
+            fixedRows.CopyTo(rows, 0);
+            // Keep the balancer's accumulators clean so removing the override resumes from a
+            // fresh window rather than from a stale one grown across the fixed-tiling run.
+            Array.Clear(_rowEffortWindow);
+            _partitionWindowFrames = 0;
+            return;
+        }
+
         if (_partitionSliceCount != sliceCount || balanceDisabled)
         {
             // First frame at this slice count: equal-height start, matching the historical layout.
