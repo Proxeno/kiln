@@ -9,9 +9,9 @@ namespace Kiln.Internal.H264;
 /// <summary>
 /// SIMD 8×8 SAD over a (U, V) chroma plane pair, used by intra chroma mode RDO (H.264 8.3.4).
 /// Replaces the per-pixel scalar reduction in <c>H264BaselineSliceEncoder.ChooseChromaIntraMode</c>
-/// with a single accumulating-vector pass + one horizontal reduce — i.e. the senior parent's
-/// "accumulate vector partials across rows, reduce once at end" pattern, applied to the chroma
-/// kernel that's the next-most-frequent SAD callsite after J1's <see cref="H264Intra4X4Simd.SadU8x16"/>.
+/// with a single accumulating-vector pass and one horizontal reduce: vector partial sums are
+/// accumulated across rows and reduced once at the end, the same pattern as
+/// <see cref="H264Intra4X4Simd.SadU8x16"/>.
 /// </summary>
 internal static class H264ChromaSadSimd
 {

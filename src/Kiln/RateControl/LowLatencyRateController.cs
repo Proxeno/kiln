@@ -5,17 +5,18 @@ using Kiln.Recovery;
 namespace Kiln.RateControl;
 
 /// <summary>
-/// Adaptive rate controller for low-latency H.264 cloud gaming.
-/// Makes per-frame decisions about bitrate, resolution, frame rate, and quality
-/// in response to network and encoder state feedback.
+/// Rate controller for low-latency H.264 streaming. Once per frame it decides the target bitrate,
+/// the QP, the per-frame byte ceiling and any recovery action, from network feedback and encoder
+/// statistics. It also moves to a faster speed mode when encoding itself falls behind. It does not
+/// choose resolution or frame rate: it carries the values last reported through
+/// <see cref="SyncAppliedState"/>.
 /// <para>
-/// OWNERSHIP CONTRACT — this controller integrates the recovery policy itself: each
-/// <see cref="Decide"/> call invokes <see cref="H264RecoveryPolicy.DecideRecovery"/> exactly once and
-/// folds <c>ForceIdr</c> / <c>EnableIntraRefresh</c> into the returned decision. A composing layer must
-/// therefore NOT call the recovery policy again, and must pass <em>this controller's</em> recovery
-/// instance (not a second one) anywhere else it is needed — otherwise the stateful IDR cooldown is
-/// advanced twice per frame, halving keyframe-storm protection and double-counting metrics. (This is
-/// the exact trap a former master controller fell into.)
+/// <b>Ownership of recovery.</b> The controller owns the recovery policy. Each <see cref="Decide"/>
+/// call invokes <see cref="H264RecoveryPolicy.DecideRecovery"/> exactly once and folds
+/// <c>ForceIdr</c> and <c>EnableIntraRefresh</c> into the returned decision. A composing layer must
+/// not call the recovery policy again, and must use this controller's instance
+/// (<see cref="RecoveryPolicy"/>) wherever it needs one. Otherwise the IDR cooldown advances twice
+/// per frame, which halves the protection against keyframe storms and double-counts the metrics.
 /// </para>
 /// </summary>
 public sealed class LowLatencyRateController
@@ -84,9 +85,8 @@ public sealed class LowLatencyRateController
     }
 
     /// <summary>
-    /// Decides on the next encoder configuration based on network and pipeline feedback.
-    /// Implements Phase 2 rate control logic: bitrate adaptation, QP adjustment,
-    /// and encode backpressure handling.
+    /// Decides the encoder settings for the next frame from network and pipeline feedback:
+    /// bitrate adaptation, QP adjustment, encode-backpressure handling and recovery.
     /// </summary>
     /// <param name="feedback">Current network state and transport metrics.</param>
     /// <param name="stats">Current encoder pipeline and frame metrics.</param>
