@@ -6,6 +6,29 @@ using System.Runtime.CompilerServices;
 namespace Kiln.Internal.H264;
 
 /// <summary>
+/// Disjoint stage buckets measured by <see cref="H264PInterDiagnostics.CollectStageProfile"/>.
+/// The order is the report order; <see cref="SliceTotal"/> is the whole per-slice encode and the
+/// other per-slice stages are disjoint subsets of it (never counted twice).
+/// </summary>
+internal enum H264ProfileStage
+{
+    FramePrologue = 0,
+    SkipPrecheck,
+    MeInteger,
+    MeSubpel,
+    MeSubpartition,
+    IntraDecision,
+    InterPredBuild,
+    Residual,
+    Entropy,
+    Deblock,
+    RateControl,
+    NalGather,
+    SliceTotal,
+    Count,
+}
+
+/// <summary>
 /// Interpolated-string handler for <see cref="H264PInterDiagnostics.TraceMbDecision"/> that skips
 /// all formatting (and evaluation of the interpolation-hole expressions) unless the macroblock is
 /// actually being traced. Without this, every call site materialised its message string per
@@ -99,6 +122,7 @@ internal static class H264PInterDiagnostics
     private static long s_phase1FractionalLumaCount;
     private static long s_phase2ReconCallCount;
     private static long s_phase2ReconSkipMvRebuildCount;
+    private static long s_phase2ReconSkipMvReuseCount;
     private static readonly ConcurrentQueue<string> s_mbTraceLines = new();
     private static int s_mbTraceLineCount;
     private const int MaxMbTraceLines = 4096;
@@ -149,6 +173,13 @@ internal static class H264PInterDiagnostics
     public static bool DisableTemporalSeedProbe { get; set; }
 
     /// <summary>
+    /// Manual A/B kill switch for reusing the Phase-1 skip prediction when the Phase-2 search lands
+    /// on the same 16x16 refIdx-0 MV. Keep false in normal operation; benchmarks/tests set it to
+    /// measure the rebuild behaviour interleaved in the same process.
+    /// </summary>
+    public static bool DisablePhase2PredReuse { get; set; }
+
+    /// <summary>
     /// Manual A/B kill switch for the rate-aware margin ref1 must clear to beat ref0 in the P-slice
     /// reference competition. Keep false in normal operation; benchmarks/tests set it to
     /// measure the raw-SAD tie-break behaviour interleaved in the same process.
@@ -176,6 +207,169 @@ internal static class H264PInterDiagnostics
     /// Keep false in normal operation; the perf probe enables it around bounded runs.
     /// </summary>
     public static bool CollectFramePhases { get; set; }
+
+    /// <summary>
+    /// Measurement-only per-stage tick accounting: pass S of the stage profiler. Every stage except
+    /// <see cref="H264ProfileStage.SliceTotal"/> (the whole slice call) is a disjoint subset of it,
+    /// so the per-slice stages sum to at most <see cref="H264ProfileStage.SliceTotal"/> and the
+    /// remainder is reported as unattributed. Keep false in normal operation; instrumentation must
+    /// never change one output byte and costs nothing measurable when off (one static bool read per
+    /// method, <c>Stopwatch.GetTimestamp()</c> only under it).
+    /// </summary>
+    public static bool CollectStageProfile { get; set; }
+
+    /// <summary>
+    /// Stage whose timed region the current thread is inside, or <c>-1</c> outside any timed region.
+    /// Set by the stage timers while <see cref="CollectStageProfile"/> is on; the pass-C counting
+    /// kernel set reads it to attribute each kernel call to the stage that issued it.
+    /// </summary>
+    [ThreadStatic]
+    internal static int t_profileStage = -1;
+
+    private static readonly long[] s_stageTicks = new long[(int)H264ProfileStage.Count];
+
+    /// <summary>Adds one timed region's ticks to <paramref name="stage"/> (gated by <see cref="CollectStageProfile"/>).</summary>
+    internal static void NotifyStage(H264ProfileStage stage, long ticks)
+    {
+        if (!CollectStageProfile)
+            return;
+        Interlocked.Add(ref s_stageTicks[(int)stage], ticks);
+    }
+
+    /// <summary>
+    /// Per-stage tick totals since the last reset (indexed by <see cref="H264ProfileStage"/>).
+    /// With <paramref name="reset"/> the accumulators are zeroed as they are read.
+    /// </summary>
+    public static long[] SnapshotStageTicks(bool reset)
+    {
+        var snapshot = new long[(int)H264ProfileStage.Count];
+        for (var i = 0; i < snapshot.Length; i++)
+        {
+            snapshot[i] = reset
+                ? Interlocked.Exchange(ref s_stageTicks[i], 0)
+                : Interlocked.Read(ref s_stageTicks[i]);
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Measurement-only slice-threading accounting: each slice task's busy window, the frame's
+    /// dispatch-to-join wall time, and per-row wall ticks alongside the search-effort proxy.
+    /// Keep false in normal operation. When off, each slice task reads this flag once and
+    /// allocates nothing; when on the per-row timing is captured at row boundaries (never inside
+    /// the per-MB loop) so it costs no allocation and no thread-static read per macroblock.
+    /// </summary>
+    public static bool CollectSliceThreading { get; set; }
+
+    /// <summary>Rows tracked per frame by the slice-threading account (covers 8K luma rows).</summary>
+    private const int MaxThreadingRows = 1024;
+
+    private static readonly long[] s_threadRowTicks = new long[MaxThreadingRows];
+    private static readonly long[] s_threadRowEffort = new long[MaxThreadingRows];
+    private static readonly ConcurrentQueue<SliceThreadingFrame> s_sliceThreadingFrames = new();
+
+    /// <summary>One slice task's busy window within one frame (process <see cref="System.Diagnostics.Stopwatch"/> clock).</summary>
+    public readonly record struct SliceThreadingWindow(int SliceIndex, long StartTicks, long EndTicks);
+
+    /// <summary>
+    /// One multi-slice frame's threading sample: the dispatch and join timestamps around the
+    /// parallel slice region plus every slice's busy window and the per-row wall ticks and effort
+    /// proxy captured at row boundaries.
+    /// </summary>
+    public sealed record SliceThreadingFrame(
+        long DispatchTicks,
+        long JoinTicks,
+        IReadOnlyList<SliceThreadingWindow> Slices,
+        long[] RowTicks,
+        long[] RowEffort);
+
+    /// <summary>
+    /// Records one slice task's busy window and publishes the frame sample once the parallel
+    /// region has joined (orchestrator thread). Rows are snapshotted and cleared here so the next
+    /// frame starts clean; disabled, this returns immediately after one flag read.
+    /// </summary>
+    internal static void NotifySliceThreadingFrame(
+        long dispatchTicks,
+        long joinTicks,
+        ReadOnlySpan<SliceThreadingWindow> slices,
+        int mbRows)
+    {
+        if (!CollectSliceThreading)
+            return;
+        mbRows = Math.Clamp(mbRows, 0, MaxThreadingRows);
+        var rowTicks = new long[mbRows];
+        var rowEffort = new long[mbRows];
+        Array.Copy(s_threadRowTicks, rowTicks, mbRows);
+        Array.Copy(s_threadRowEffort, rowEffort, mbRows);
+        Array.Clear(s_threadRowTicks, 0, mbRows);
+        Array.Clear(s_threadRowEffort, 0, mbRows);
+        s_sliceThreadingFrames.Enqueue(
+            new SliceThreadingFrame(dispatchTicks, joinTicks, slices.ToArray(), rowTicks, rowEffort));
+    }
+
+    /// <summary>
+    /// Records one MB row's measured wall ticks and its search-effort proxy (slice worker, row
+    /// boundary). Each row belongs to exactly one slice, so this is a plain single-writer store;
+    /// gated by <see cref="CollectSliceThreading"/>.
+    /// </summary>
+    internal static void NotifyThreadingRow(int mbRow, long ticks, long effort)
+    {
+        if (!CollectSliceThreading || (uint)mbRow >= (uint)MaxThreadingRows)
+            return;
+        s_threadRowTicks[mbRow] = ticks;
+        s_threadRowEffort[mbRow] = effort;
+    }
+
+    /// <summary>Drains the slice-threading samples recorded since the last drain (orchestrator thread).</summary>
+    public static List<SliceThreadingFrame> DrainSliceThreadingFrames()
+    {
+        var frames = new List<SliceThreadingFrame>();
+        while (s_sliceThreadingFrames.TryDequeue(out var frame))
+            frames.Add(frame);
+        return frames;
+    }
+
+    /// <summary>Clears the slice-threading queue and any partially recorded rows.</summary>
+    public static void ResetSliceThreading()
+    {
+        while (s_sliceThreadingFrames.TryDequeue(out _))
+        {
+            // Drain any stale samples from an earlier run.
+        }
+
+        Array.Clear(s_threadRowTicks);
+        Array.Clear(s_threadRowEffort);
+    }
+
+    private static long s_meIntegerCandidates;
+    private static long s_meSubpelCandidates;
+
+    /// <summary>
+    /// Adds one slice's integer-pel and fractional (sub-pel) candidate evaluations to the process
+    /// totals. Counted by the motion estimator whether or not the search is inside a
+    /// whole-sub-partition region, so the report's candidate mix is not swallowed by that bucket.
+    /// </summary>
+    internal static void NotifyMeCandidates(long integer, long subpel)
+    {
+        if (!CollectStageProfile)
+            return;
+        Interlocked.Add(ref s_meIntegerCandidates, integer);
+        Interlocked.Add(ref s_meSubpelCandidates, subpel);
+    }
+
+    /// <summary>
+    /// Integer-pel and sub-pel candidate totals since the last reset. With <paramref name="reset"/>
+    /// the accumulators are zeroed as they are read.
+    /// </summary>
+    public static (long Integer, long Subpel) SnapshotMeCandidates(bool reset)
+    {
+        return reset
+            ? (Interlocked.Exchange(ref s_meIntegerCandidates, 0),
+                Interlocked.Exchange(ref s_meSubpelCandidates, 0))
+            : (Interlocked.Read(ref s_meIntegerCandidates),
+                Interlocked.Read(ref s_meSubpelCandidates));
+    }
 
     /// <summary>
     /// Measurement-only A/B kill switch for the effort-balanced slice partition: when true the
@@ -468,6 +662,7 @@ internal static class H264PInterDiagnostics
         Interlocked.Exchange(ref s_phase1FractionalLumaCount, 0);
         Interlocked.Exchange(ref s_phase2ReconCallCount, 0);
         Interlocked.Exchange(ref s_phase2ReconSkipMvRebuildCount, 0);
+        Interlocked.Exchange(ref s_phase2ReconSkipMvReuseCount, 0);
     }
 
     /// <summary>Phase-1 outcome for <see cref="NotifyPhase1Timing"/> (measurement accounting only).</summary>
@@ -524,6 +719,26 @@ internal static class H264PInterDiagnostics
             Interlocked.Increment(ref s_phase2ReconSkipMvRebuildCount);
     }
 
+    /// <summary>
+    /// Records one Phase-2 inter prediction that reused the Phase-1 prediction instead of rebuilding
+    /// it (same 16x16 refIdx-0 MV). Gated by <see cref="CollectPhase1Timing"/>.
+    /// </summary>
+    internal static void NotifyPhase2InterPredReused()
+    {
+        if (!CollectPhase1Timing)
+            return;
+
+        Interlocked.Increment(ref s_phase2ReconSkipMvReuseCount);
+    }
+
+    /// <summary>Phase-2 inter-prediction rebuild/reuse counts recorded under <see cref="CollectPhase1Timing"/>.</summary>
+    public static (long Calls, long Duplicating, long Reused) ReadPhase2ReconCounts() =>
+        (
+            Volatile.Read(ref s_phase2ReconCallCount),
+            Volatile.Read(ref s_phase2ReconSkipMvRebuildCount),
+            Volatile.Read(ref s_phase2ReconSkipMvReuseCount)
+        );
+
     public static string BuildPhase1TimingReport(bool reset = false)
     {
         var count = Volatile.Read(ref s_phase1TimingCount);
@@ -555,7 +770,8 @@ internal static class H264PInterDiagnostics
             .Append(" mvUnsafe=").Append(Volatile.Read(ref s_phase1MvUnsafeCount))
             .Append(" fractionalLumaMv=").Append(Volatile.Read(ref s_phase1FractionalLumaCount)).AppendLine();
         sb.Append("  phase2 pred rebuilds=").Append(Volatile.Read(ref s_phase2ReconCallCount))
-            .Append(" duplicatingPhase1=").Append(Volatile.Read(ref s_phase2ReconSkipMvRebuildCount));
+            .Append(" duplicatingPhase1=").Append(Volatile.Read(ref s_phase2ReconSkipMvRebuildCount))
+            .Append(" reusedPhase1=").Append(Volatile.Read(ref s_phase2ReconSkipMvReuseCount));
 
         if (reset)
             ResetPhase1Timing();
