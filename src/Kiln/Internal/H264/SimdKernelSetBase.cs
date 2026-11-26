@@ -8,6 +8,22 @@ internal abstract class SimdKernelSetBase : IH264KernelSet
     public abstract int Sad8x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
     public abstract int Sad8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
 
+    // The four-candidate kernels fall back to the scalar reference on x64 tiers; the arm64 sets
+    // override them with the fused NEON path.
+    public virtual void Sad16x16x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads) =>
+        H264MotionSad.Sad16x16x4Scalar(a, strideA, b0, b1, b2, b3, strideB, sads);
+
+    public virtual void Sad8x8x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads) =>
+        H264MotionSad.Sad8x8x4Scalar(a, strideA, b0, b1, b2, b3, strideB, sads);
+
     public abstract void SadMany4x4(ReadOnlySpan<byte> src, ReadOnlySpan<byte> predConcat, Span<int> sads, int count);
 
     public abstract int SadIntra16x16(ReadOnlySpan<byte> src256, ReadOnlySpan<byte> pred256, int srcStride);
