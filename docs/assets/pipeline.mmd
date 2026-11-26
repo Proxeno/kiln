@@ -1,0 +1,33 @@
+%% Kiln encode pipeline, as shown in README.md and docs/architecture.md.
+%% Render with:
+%%   mmdc -i docs/assets/pipeline.mmd -o docs/assets/pipeline.svg -c docs/assets/mermaid.config.json -b transparent
+flowchart TB
+    in(["I420 frame: Y, U and V planes"])
+    frame["`**Frame setup**
+    IDR or P picture · SPS/PPS ahead of an IDR · slice partition`"]
+    in --> frame
+
+    subgraph slices["Each slice (1 to 8 bands of macroblock rows, encoded in parallel)"]
+        direction LR
+        pred["`**Predict**
+        motion search
+        or intra modes`"]
+        tq["`**Transform**
+        4×4 integer DCT
+        and quantization`"]
+        cavlc["`**Entropy code**
+        CAVLC`"]
+        recon["`**Reconstruct**
+        inverse transform,
+        then deblocking`"]
+        pred --> tq --> cavlc
+        tq --> recon
+        recon -. "intra neighbours and the next frame's reference" .-> pred
+    end
+
+    frame --> slices
+    nal["`**NAL packaging**
+    emulation prevention · start codes`"]
+    slices --> nal
+    out(["Annex B access unit"])
+    nal --> out

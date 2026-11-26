@@ -1,66 +1,100 @@
-# H.264 SIMD Perf Gate Runbook
+# Performance gate
 
-This runbook defines the benchmark set and regression policy that guards
-Kiln's SIMD hot paths (motion search, SAD/SATD kernels, and the P-inter
-Phase 2b ablation) against silent slowdowns. It documents what
-[`scripts/h264-simd-capture-baseline.sh`](../scripts/h264-simd-capture-baseline.sh)
-and [`scripts/h264-simd-perf-gate.sh`](../scripts/h264-simd-perf-gate.sh)
-actually do — read the scripts if this drifts, they are the source of truth.
+The performance gate guards Kiln's SIMD hot paths against silent slowdowns. It runs a fixed set of
+BenchmarkDotNet benchmarks and compares each mean against a baseline committed in `perf/`.
 
-## Required benchmark suites
+Two scripts implement it, and they are the source of truth if this page drifts:
 
-All three live in [`bench/Kiln.Benchmarks`](../bench/Kiln.Benchmarks)
-(BenchmarkDotNet):
+- [`scripts/h264-simd-capture-baseline.sh`](../scripts/h264-simd-capture-baseline.sh) records a
+  baseline.
+- [`scripts/h264-simd-perf-gate.sh`](../scripts/h264-simd-perf-gate.sh) compares a fresh run
+  against it.
 
-1. `H264SadKernelMicroBenchmarks` — only `Satd4x4_Once` and
-   `SatdMany4x4_9Modes` are gated.
-2. `H264MotionEstimatorBenchmarks` — only `Sad8x8_Dispatch`,
-   `Sad16x16_Dispatch_Stride720`, and `SearchMb16x16_SearchRange8` are gated.
-3. `H264PInterPhase2bAblationBenchmarks` — only the `Encode_primmed_P*`
-   benchmark family is gated (end-to-end encode, both Phase 2b on/off rows
-   are captured but only the production-on row is gated — see below).
+The gate is a local tool. CI does not run it.
 
-## Commands
+## Running it
 
-Capture (or refresh) the committed baseline:
+Both scripts need the .NET SDK, `jq` and `awk`. Run them from anywhere inside the repository, on a
+quiet machine.
 
 ```bash
-scripts/h264-simd-capture-baseline.sh [baseline-path]
-# default baseline-path: perf/h264-simd-perf-baseline-latest.json
-```
-
-Run the gate against the committed baseline:
-
-```bash
+# Compare against the committed baseline.
 scripts/h264-simd-perf-gate.sh [baseline-path]
+
+# Record a new baseline.
+scripts/h264-simd-capture-baseline.sh [baseline-path]
+
+# Default baseline-path: perf/h264-simd-perf-baseline-latest.json
 ```
 
-Both scripts `cd` to the repo root and shell out to `dotnet run -c Release
---project bench/Kiln.Benchmarks`, e.g. (abridged, see the scripts for exact
-filters and job settings):
+Exit codes from the gate:
+
+| Code | Meaning |
+|---|---|
+| 0 | Passed. The last line printed is `perf gate passed`. |
+| 1 | At least one benchmark regressed beyond its threshold. |
+| 2 | The baseline file does not exist. |
+
+The gate prints one line per benchmark with `baseline=`, `current=`, `delta_pct=`, `threshold=`,
+`noise_pad_pct=` and `effective_threshold=`, so a failure shows which benchmark moved and by how
+much.
+
+## What is measured
+
+All benchmarks live in [`bench/Kiln.Benchmarks`](../bench/Kiln.Benchmarks). Three suites are run,
+each restricted to the methods listed:
+
+| Suite | Methods | Parameters | Job |
+|---|---|---|---|
+| `H264SadKernelMicroBenchmarks` | `Satd4x4_Once`, `SatdMany4x4_9Modes` | `PreferHardwareIntrinsics` = true, false | 3 iterations, 1 warmup |
+| `H264MotionEstimatorBenchmarks` | `Sad8x8_Dispatch`, `Sad16x16_Dispatch_Stride720`, `SearchMb16x16_SearchRange8` | none | 8 iterations, 3 warmups |
+| `H264PInterPhase2bAblationBenchmarks` | `Encode_primmed_P` (a steady P picture at 1280×720, one slice) | `EnableIntraInPFallback` = true, false | 8 iterations, 3 warmups |
+
+Every run uses BenchmarkDotNet's short job with the JSON exporter. The equivalent command for the
+first suite is:
 
 ```bash
 dotnet run -c Release --project bench/Kiln.Benchmarks -- \
   --filter "*H264SadKernelMicroBenchmarks.Satd4x4_Once*" "*H264SadKernelMicroBenchmarks.SatdMany4x4_9Modes*" \
   --job short --iterationCount 3 --warmupCount 1 --exporters json
-
-dotnet run -c Release --project bench/Kiln.Benchmarks -- \
-  --filter "*H264MotionEstimatorBenchmarks.Sad8x8_Dispatch*" "*H264MotionEstimatorBenchmarks.Sad16x16_Dispatch_Stride720*" "*H264MotionEstimatorBenchmarks.SearchMb16x16_SearchRange8*" \
-  --job short --iterationCount 8 --warmupCount 3 --exporters json
-
-dotnet run -c Release --project bench/Kiln.Benchmarks -- \
-  --filter "*H264PInterPhase2bAblationBenchmarks.Encode_primmed_P*" \
-  --job short --iterationCount 8 --warmupCount 3 --exporters json
 ```
 
-Both scripts then read BenchmarkDotNet's compressed JSON report from
-`BenchmarkDotNet.Artifacts/results/Kiln.Benchmarks.<SuiteClass>-report-full-compressed.json`
-for each of the three suites and fail immediately (`h264-simd-perf-gate.sh`)
-or (`h264-simd-capture-baseline.sh`) if any expected artifact is missing.
+The scripts then read
+`BenchmarkDotNet.Artifacts/results/Kiln.Benchmarks.<Suite>-report-full-compressed.json` for each
+suite. The capture script stops with an error if one is missing.
 
-## Baseline format
+## How a row is judged
 
-`perf/h264-simd-perf-baseline-latest.json`:
+Each row of the current run is matched to the baseline by its exact suite, method and parameter
+string. Then:
+
+1. **Scalar rows are skipped.** A row whose parameters contain `PreferHardwareIntrinsics=False` is
+   recorded for reference but not gated.
+2. **A row with no baseline is skipped with a warning.** This is expected when a benchmark is
+   added before the baseline is refreshed.
+3. **The base threshold depends on the suite.** It is 3.0% for the two kernel suites
+   (`SIMD_THRESHOLD_PCT`) and 2.0% for the end-to-end encode suite (`E2E_THRESHOLD_PCT`).
+4. **Noise widens the threshold.** For each row the script takes the coefficient of variation
+   (standard deviation ÷ mean, as a percentage) of the baseline and of the current run, uses the
+   larger of the two, and caps it at 12.0% (`NOISE_PAD_CAP_PCT`). The result is added to the base
+   threshold. A noisy run is therefore less likely to fail falsely, and the cap keeps a very noisy
+   run from hiding a real regression.
+5. **The row fails if it is slower by more than that.** The test is
+   `(current_mean − baseline_mean) ÷ baseline_mean × 100 > effective_threshold`.
+
+All three settings can be overridden through environment variables of the same name.
+
+Both `EnableIntraInPFallback` rows of the encode suite are gated. The gate script also contains a
+skip for rows whose parameters contain `DisablePhase2bManual=True`, but no current benchmark
+produces that parameter, so the skip never applies.
+
+A passing gate says nothing about correctness. For a new kernel or a new `IH264KernelSet`
+implementation, get the SIMD and scalar parity tests green first. See
+[SIMD kernel sets](architecture.md#simd-kernel-sets).
+
+## Baseline file
+
+`perf/h264-simd-perf-baseline-latest.json` has this shape:
 
 ```json
 {
@@ -79,59 +113,16 @@ or (`h264-simd-capture-baseline.sh`) if any expected artifact is missing.
 }
 ```
 
-Each row is extracted from BenchmarkDotNet's `.Benchmarks[]` array via `jq`
-(`suite`, `method`, `parameters`, `full_name`, `Statistics.Mean` as
-`mean_ns`, `Statistics.StandardDeviation` as `stddev_ns`).
+`mean_ns` and `stddev_ns` are BenchmarkDotNet's `Statistics.Mean` and
+`Statistics.StandardDeviation`.
 
-## Gate policy (exactly what `h264-simd-perf-gate.sh` implements)
+Rules for the baseline:
 
-For every current-run row, matched against the baseline by exact
-`(suite, method, parameters)`:
-
-1. **Skip scalar rows** — any row whose `parameters` contains
-   `PreferHardwareIntrinsics=False` is skipped. The SIMD gate is about SIMD
-   paths; scalar timings are captured for visibility only.
-2. **Skip ablation-off rows** — any row whose `parameters` contains
-   `DisablePhase2bManual=True` is skipped. Both Phase 2b on/off rows are
-   benchmarked for visibility, but the gate only cares about the
-   production-on path.
-3. **No baseline for a row** — warn and skip (does not fail the gate). This
-   is expected when a new benchmark method is added before the baseline is
-   refreshed.
-4. **Threshold** — `SIMD_THRESHOLD_PCT` (env override, default `3.0`) for
-   `H264SadKernelMicroBenchmarks` and `H264MotionEstimatorBenchmarks`;
-   `E2E_THRESHOLD_PCT` (env override, default `2.0`) for
-   `H264PInterPhase2bAblationBenchmarks` (end-to-end encode rows get a
-   tighter budget than isolated kernel micro-benchmarks).
-5. **Noise padding** — `noise_pad_pct = min(max(baseline_cv, current_cv), NOISE_PAD_CAP_PCT)`
-   where `cv = stddev/mean * 100` and `NOISE_PAD_CAP_PCT` defaults to `12.0`
-   (env override). This is added to the base threshold to get
-   `effective_threshold`, so a noisy host doesn't manufacture false-positive
-   regressions, capped so a truly noisy run still fails on a real
-   regression.
-6. **Regression test** — `delta_pct = (current_mean - baseline_mean) / baseline_mean * 100`.
-   If `delta_pct > effective_threshold`, that row is a `FAIL`.
-7. The script exits `1` if `fail_count > 0` across all rows, `2` if the
-   baseline file doesn't exist, `0` (with `perf gate passed`) otherwise.
-   Every row's comparison (`baseline=`, `current=`, `delta_pct=`,
-   `threshold=`, `noise_pad_pct=`, `effective_threshold=`) is printed, so a
-   failing CI run shows exactly which benchmark regressed and by how much.
-
-For new kernels (a new `IH264KernelSet` implementation or a new dispatch
-path), get the SIMD/scalar parity tests green first (see
-[docs/architecture.md](architecture.md#simd-kernel-structure)) — the perf
-gate only tells you about speed, not correctness.
-
-## Baseline handling
-
-- Baselines are host/ISA-specific in practice: capture separately on an x64
-  host (AVX2/SSSE3 path) and an arm64 host (NEON path) if you maintain gates
-  for both; `perf/h264-simd-perf-baseline-latest.json` reflects whichever
-  host last ran the capture script (`machine` field records `uname -a`).
-- Refresh the baseline only when an intentional algorithmic change moves the
-  numbers — after parity tests and any relevant golden/quality tests pass —
-  and note why in the commit/PR that updates
-  `perf/h264-simd-perf-baseline-latest.json`.
-- Keep CI-run benchmark JSON artifacts (the `BenchmarkDotNet.Artifacts/results/*.json`
-  files) attached to the CI run for any gated build, so a regression can be
-  diagnosed after the fact without re-running the benchmark.
+- **It belongs to one machine.** Timings do not transfer between hosts or instruction sets. The
+  committed baseline was captured on an arm64 Mac, so it gates the NEON path. To gate AVX2 or
+  SSSE3, capture a separate baseline on an x64 host and pass its path to both scripts. The
+  `machine` field records where a baseline came from. It is the output of `uname -a`, which
+  includes the host name.
+- **Refresh it only for an intended change.** When a deliberate algorithmic change moves the
+  numbers, re-capture after the parity and quality tests pass, and say why in the commit that
+  updates the file.

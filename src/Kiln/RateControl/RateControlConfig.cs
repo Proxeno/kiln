@@ -17,13 +17,13 @@ public sealed class RateControlConfig
     /// <summary>Initial target bitrate before any adaptation (bps). Default: 8 Mbps.</summary>
     public int InitialTargetBitrateBps { get; init; } = 8_000_000;
 
-    /// <summary>Minimum quality parameter (higher quality). Default: 10.</summary>
+    /// <summary>Lowest QP the controller will ask for (the highest quality). Default: 10.</summary>
     public int MinQp { get; init; } = 10;
 
-    /// <summary>Maximum quality parameter (lower quality). Default: 51.</summary>
+    /// <summary>Highest QP the controller will ask for (the lowest quality). Default: 51.</summary>
     public int MaxQp { get; init; } = 51;
 
-    /// <summary>Default starting quality parameter. Default: 28.</summary>
+    /// <summary>QP used at or above <see cref="InitialTargetBitrateBps"/>; the controller raises QP as the target bitrate falls below it. Default: 28.</summary>
     public int BaseQp { get; init; } = 28;
 
     /// <summary>
@@ -40,8 +40,9 @@ public sealed class RateControlConfig
     public double DownshiftFactor { get; init; } = 0.7;
 
     /// <summary>
-    /// Multiplicative factor for upward bitrate adaptation during stability.
-    /// Default: 1.05 (increase by 5% per frame).
+    /// Multiplicative factor for upward bitrate adaptation during stability, applied each time
+    /// <see cref="StabilityWindowFrames"/> frames pass without congestion.
+    /// Default: 1.05 (a 5% increase per stability window).
     /// </summary>
     public double UpshiftFactor { get; init; } = 1.05;
 

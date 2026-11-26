@@ -88,7 +88,7 @@ internal static class H264InterBoundaryStrength
     /// tC0[indexA, 0] == tC0[indexA, 1] — true at the QPs the byte-exact oracle tests happened to
     /// use (23, 28, 33, 34) — but at e.g. QP 31/32/35/36 (or any per-MB-QP stream whose edge
     /// averages land there) the encoder's reconstruction silently drifted from every conformant
-    /// decoder's, compounding through the DPB exactly like the v0.2.0 P_Skip bug.
+    /// decoder's, compounding through the DPB.
     /// </para>
     /// </summary>
     private static byte ComputeBs(InterEdgeNeighbour a, InterEdgeNeighbour b)
