@@ -28,4 +28,19 @@ internal static class MotionSadTestHelpers
         rng.NextBytes(b);
         return (a, b);
     }
+
+    internal static (byte[] a, byte[][] refs) RandomFour(
+        Random rng, int strideA, int rowsA, int strideB, int rowsB)
+    {
+        var a = new byte[strideA * rowsA];
+        rng.NextBytes(a);
+        var refs = new byte[4][];
+        for (var i = 0; i < refs.Length; i++)
+        {
+            refs[i] = new byte[strideB * rowsB];
+            rng.NextBytes(refs[i]);
+        }
+
+        return (a, refs);
+    }
 }
