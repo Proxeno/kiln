@@ -122,6 +122,7 @@ internal static class H264PInterDiagnostics
     private static long s_phase1FractionalLumaCount;
     private static long s_phase2ReconCallCount;
     private static long s_phase2ReconSkipMvRebuildCount;
+    private static long s_phase2ReconSkipMvReuseCount;
     private static readonly ConcurrentQueue<string> s_mbTraceLines = new();
     private static int s_mbTraceLineCount;
     private const int MaxMbTraceLines = 4096;
@@ -170,6 +171,13 @@ internal static class H264PInterDiagnostics
     /// interleaved in the same process.
     /// </summary>
     public static bool DisableTemporalSeedProbe { get; set; }
+
+    /// <summary>
+    /// Manual A/B kill switch for reusing the Phase-1 skip prediction when the Phase-2 search lands
+    /// on the same 16x16 refIdx-0 MV. Keep false in normal operation; benchmarks/tests set it to
+    /// measure the rebuild behaviour interleaved in the same process.
+    /// </summary>
+    public static bool DisablePhase2PredReuse { get; set; }
 
     /// <summary>
     /// Manual A/B kill switch for the rate-aware margin ref1 must clear to beat ref0 in the P-slice
@@ -565,6 +573,7 @@ internal static class H264PInterDiagnostics
         Interlocked.Exchange(ref s_phase1FractionalLumaCount, 0);
         Interlocked.Exchange(ref s_phase2ReconCallCount, 0);
         Interlocked.Exchange(ref s_phase2ReconSkipMvRebuildCount, 0);
+        Interlocked.Exchange(ref s_phase2ReconSkipMvReuseCount, 0);
     }
 
     /// <summary>Phase-1 outcome for <see cref="NotifyPhase1Timing"/> (measurement accounting only).</summary>
@@ -621,6 +630,26 @@ internal static class H264PInterDiagnostics
             Interlocked.Increment(ref s_phase2ReconSkipMvRebuildCount);
     }
 
+    /// <summary>
+    /// Records one Phase-2 inter prediction that reused the Phase-1 prediction instead of rebuilding
+    /// it (same 16x16 refIdx-0 MV). Gated by <see cref="CollectPhase1Timing"/>.
+    /// </summary>
+    internal static void NotifyPhase2InterPredReused()
+    {
+        if (!CollectPhase1Timing)
+            return;
+
+        Interlocked.Increment(ref s_phase2ReconSkipMvReuseCount);
+    }
+
+    /// <summary>Phase-2 inter-prediction rebuild/reuse counts recorded under <see cref="CollectPhase1Timing"/>.</summary>
+    public static (long Calls, long Duplicating, long Reused) ReadPhase2ReconCounts() =>
+        (
+            Volatile.Read(ref s_phase2ReconCallCount),
+            Volatile.Read(ref s_phase2ReconSkipMvRebuildCount),
+            Volatile.Read(ref s_phase2ReconSkipMvReuseCount)
+        );
+
     public static string BuildPhase1TimingReport(bool reset = false)
     {
         var count = Volatile.Read(ref s_phase1TimingCount);
@@ -652,7 +681,8 @@ internal static class H264PInterDiagnostics
             .Append(" mvUnsafe=").Append(Volatile.Read(ref s_phase1MvUnsafeCount))
             .Append(" fractionalLumaMv=").Append(Volatile.Read(ref s_phase1FractionalLumaCount)).AppendLine();
         sb.Append("  phase2 pred rebuilds=").Append(Volatile.Read(ref s_phase2ReconCallCount))
-            .Append(" duplicatingPhase1=").Append(Volatile.Read(ref s_phase2ReconSkipMvRebuildCount));
+            .Append(" duplicatingPhase1=").Append(Volatile.Read(ref s_phase2ReconSkipMvRebuildCount))
+            .Append(" reusedPhase1=").Append(Volatile.Read(ref s_phase2ReconSkipMvReuseCount));
 
         if (reset)
             ResetPhase1Timing();

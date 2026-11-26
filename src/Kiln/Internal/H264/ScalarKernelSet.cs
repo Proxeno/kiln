@@ -14,6 +14,20 @@ internal sealed class ScalarKernelSet : IH264KernelSet
     public int Sad8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
         H264MotionSad.Sad8x8Scalar(a, strideA, b, strideB);
 
+    public void Sad16x16x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads) =>
+        H264MotionSad.Sad16x16x4Scalar(a, strideA, b0, b1, b2, b3, strideB, sads);
+
+    public void Sad8x8x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads) =>
+        H264MotionSad.Sad8x8x4Scalar(a, strideA, b0, b1, b2, b3, strideB, sads);
+
     public int Ssd16x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
         H264MotionSsd.Ssd16x16Scalar(a, strideA, b, strideB);
 

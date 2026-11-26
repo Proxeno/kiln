@@ -11,6 +11,26 @@ internal interface IH264KernelSet
     int Sad8x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
     int Sad8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
 
+    /// <summary>
+    /// SAD of one 16×16 source block against four reference blocks that share <paramref name="strideB"/>.
+    /// Writes one result per candidate to <paramref name="sads"/>, which must have length at least 4.
+    /// </summary>
+    void Sad16x16x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads);
+
+    /// <summary>
+    /// SAD of one 8×8 source block against four reference blocks that share <paramref name="strideB"/>.
+    /// Writes one result per candidate to <paramref name="sads"/>, which must have length at least 4.
+    /// </summary>
+    void Sad8x8x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads);
+
     void SadMany4x4(ReadOnlySpan<byte> src, ReadOnlySpan<byte> predConcat, Span<int> sads, int count);
     int SadIntra16x16(ReadOnlySpan<byte> src256, ReadOnlySpan<byte> pred256, int srcStride);
     int SadChromaPair(ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV, ReadOnlySpan<byte> predU, ReadOnlySpan<byte> predV);

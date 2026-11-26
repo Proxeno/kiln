@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -1292,9 +1293,16 @@ public sealed class H264BaselineEncoder : IDisposable
     /// <see cref="Thread"/> workers (not the shared thread pool). Workers are started on the first
     /// queued task and reused for the lifetime of the process.
     /// </summary>
-    private sealed class LimitedConcurrencyLevelTaskScheduler : TaskScheduler
+    internal sealed class LimitedConcurrencyLevelTaskScheduler : TaskScheduler
     {
-        private readonly LinkedList<Task> _tasks = new();
+        // A lock-free FIFO plus one permit per queued task. The previous design held a single lock
+        // over a LinkedList and used Monitor.PulseAll: every enqueue woke every worker, and all but
+        // one immediately re-acquired the lock and went back to sleep (a thundering herd that costs
+        // more than the slice bodies at small frame sizes). Here each enqueue releases the
+        // semaphore exactly once and exactly one waiting worker consumes it, so a wakeup is spent
+        // only when there is a task for it.
+        private readonly ConcurrentQueue<Task> _tasks = new();
+        private readonly SemaphoreSlim _workAvailable = new(0);
         private readonly int _maxDegreeOfParallelism;
         private readonly List<Thread> _threads;
         private int _workersStarted;
@@ -1308,22 +1316,15 @@ public sealed class H264BaselineEncoder : IDisposable
 
         public sealed override int MaximumConcurrencyLevel => _maxDegreeOfParallelism;
 
-        protected sealed override IEnumerable<Task> GetScheduledTasks()
-        {
-            lock (_tasks)
-            {
-                return _tasks.ToArray();
-            }
-        }
+        protected sealed override IEnumerable<Task> GetScheduledTasks() => _tasks.ToArray();
 
         protected sealed override void QueueTask(Task task)
         {
             EnsureWorkersStarted();
-            lock (_tasks)
-            {
-                _tasks.AddLast(task);
-                Monitor.PulseAll(_tasks);
-            }
+            // Publish before signalling: ConcurrentQueue.Enqueue and SemaphoreSlim.Release are
+            // full fences, so a woken worker is guaranteed to observe the enqueued task.
+            _tasks.Enqueue(task);
+            _workAvailable.Release();
         }
 
         private void EnsureWorkersStarted()
@@ -1360,31 +1361,31 @@ public sealed class H264BaselineEncoder : IDisposable
 
         private void WorkerLoop(CountdownEvent ready)
         {
-            var startupRegistered = false;
+            // Tell EnsureWorkersStarted this worker is parked and ready; it waits for every worker
+            // before the first task can be enqueued.
+            ready.Signal();
+
             while (true)
             {
-                Task taskToRun;
-                lock (_tasks)
+                _workAvailable.Wait();
+                // One permit per enqueue, and no other code drains the queue, so a successful wait
+                // is always followed by a dequeue. The check stays defensive rather than assumed.
+                if (_tasks.TryDequeue(out var task))
                 {
-                    while (_tasks.First is null)
-                    {
-                        if (!startupRegistered)
-                        {
-                            startupRegistered = true;
-                            ready.Signal();
-                        }
-
-                        Monitor.Wait(_tasks);
-                    }
-
-                    taskToRun = _tasks.First!.Value;
-                    _tasks.RemoveFirst();
+                    TryExecuteTask(task);
                 }
-
-                TryExecuteTask(taskToRun);
             }
         }
 
+        // Deliberately no inline execution. The pool holds min(8, ProcessorCount - 1) workers and
+        // the encoder fans out to at most 8 slices, so wherever the pool is at least as large as
+        // the slice count (any system with 9+ logical CPUs) the calling thread can only substitute
+        // for an already-parked worker — it never adds parallelism. Inline would raise concurrency
+        // only where the pool is smaller than the requested slice count; because this scheduler is
+        // a process-wide static shared by every encoder instance, that would then let each
+        // concurrently-encoding caller add a thread on top of the pool's ProcessorCount - 1 bound.
+        // The probe showed no dispatch win worth that oversubscription risk, so the caller keeps
+        // waiting.
         protected sealed override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued) => false;
     }
 }

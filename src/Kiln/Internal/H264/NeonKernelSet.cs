@@ -14,6 +14,20 @@ internal class NeonKernelSet : SimdKernelSetBase
     public override int Sad8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB) =>
         H264MotionSad.Sad8x8AdvSimd(a, strideA, b, strideB);
 
+    public override void Sad16x16x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads) =>
+        H264MotionSad.Sad16x16x4AdvSimd(a, strideA, b0, b1, b2, b3, strideB, sads);
+
+    public override void Sad8x8x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads) =>
+        H264MotionSad.Sad8x8x4AdvSimd(a, strideA, b0, b1, b2, b3, strideB, sads);
+
     public override void SadMany4x4(ReadOnlySpan<byte> src, ReadOnlySpan<byte> predConcat, Span<int> sads, int count) =>
         H264Intra4X4Simd.SadManyAdvSimd(src, predConcat, sads, count);
 
