@@ -8,8 +8,8 @@ internal abstract class SimdKernelSetBase : IH264KernelSet
     public abstract int Sad8x16(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
     public abstract int Sad8x8(ReadOnlySpan<byte> a, int strideA, ReadOnlySpan<byte> b, int strideB);
 
-    // The four-candidate kernels fall back to the scalar reference on x64 tiers; the arm64 sets
-    // override them with the fused NEON path.
+    // The four-candidate kernels fall back to the scalar reference here; the x64 and arm64 tiers
+    // override them with the fused SSE2/AVX2 and NEON paths.
     public virtual void Sad16x16x4(
         ReadOnlySpan<byte> a, int strideA,
         ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,

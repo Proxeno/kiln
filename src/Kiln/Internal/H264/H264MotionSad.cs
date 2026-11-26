@@ -298,6 +298,226 @@ internal static class H264MotionSad
         sads[3] = ReduceUshortAccumulator(acc3);
     }
 
+    /// <summary>
+    /// 16×16 SAD against four reference blocks via 128-bit <c>psadbw</c>. Each source row is loaded
+    /// once and reused by all four candidates; each accumulator lane holds one 8-byte half-row sum.
+    /// </summary>
+    internal static void Sad16x16x4Sse2(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads)
+    {
+        ref var ra = ref MemoryMarshal.GetReference(a);
+        ref var rb0 = ref MemoryMarshal.GetReference(b0);
+        ref var rb1 = ref MemoryMarshal.GetReference(b1);
+        ref var rb2 = ref MemoryMarshal.GetReference(b2);
+        ref var rb3 = ref MemoryMarshal.GetReference(b3);
+
+        // Each lane sums one sample per 8-byte half-row, so the worst case is
+        // 16 rows * 8 * 255 = 32640 per lane, which fits in the 16-bit psadbw result.
+        var acc0 = Vector128<ulong>.Zero;
+        var acc1 = Vector128<ulong>.Zero;
+        var acc2 = Vector128<ulong>.Zero;
+        var acc3 = Vector128<ulong>.Zero;
+        for (var y = 0; y < 16; y++)
+        {
+            var va = Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref ra, y * strideA));
+            var v0 = Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb0, y * strideB));
+            var v1 = Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb1, y * strideB));
+            var v2 = Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb2, y * strideB));
+            var v3 = Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb3, y * strideB));
+            acc0 = Sse2.Add(acc0, Sse2.SumAbsoluteDifferences(va, v0).AsUInt64());
+            acc1 = Sse2.Add(acc1, Sse2.SumAbsoluteDifferences(va, v1).AsUInt64());
+            acc2 = Sse2.Add(acc2, Sse2.SumAbsoluteDifferences(va, v2).AsUInt64());
+            acc3 = Sse2.Add(acc3, Sse2.SumAbsoluteDifferences(va, v3).AsUInt64());
+        }
+
+        sads[0] = ReduceUlongAccumulator(acc0);
+        sads[1] = ReduceUlongAccumulator(acc1);
+        sads[2] = ReduceUlongAccumulator(acc2);
+        sads[3] = ReduceUlongAccumulator(acc3);
+    }
+
+    /// <summary>
+    /// 8×8 SAD against four reference blocks via 128-bit <c>psadbw</c>. Two 8-byte rows are packed
+    /// into one vector per candidate so each <c>psadbw</c> covers two rows.
+    /// </summary>
+    internal static void Sad8x8x4Sse2(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads)
+    {
+        ref var ra = ref MemoryMarshal.GetReference(a);
+        ref var rb0 = ref MemoryMarshal.GetReference(b0);
+        ref var rb1 = ref MemoryMarshal.GetReference(b1);
+        ref var rb2 = ref MemoryMarshal.GetReference(b2);
+        ref var rb3 = ref MemoryMarshal.GetReference(b3);
+
+        // Each lane sums one row, so the worst case is 8 rows * 255 = 2040 per lane.
+        var acc0 = Vector128<ulong>.Zero;
+        var acc1 = Vector128<ulong>.Zero;
+        var acc2 = Vector128<ulong>.Zero;
+        var acc3 = Vector128<ulong>.Zero;
+        for (var y = 0; y < 8; y += 2)
+        {
+            var va0 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ra, y * strideA));
+            var va1 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ra, (y + 1) * strideA));
+            var vb00 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb0, y * strideB));
+            var vb01 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb0, (y + 1) * strideB));
+            var vb10 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb1, y * strideB));
+            var vb11 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb1, (y + 1) * strideB));
+            var vb20 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb2, y * strideB));
+            var vb21 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb2, (y + 1) * strideB));
+            var vb30 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb3, y * strideB));
+            var vb31 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb3, (y + 1) * strideB));
+            var va = Vector128.Create(va0, va1).AsByte();
+            var v0 = Vector128.Create(vb00, vb01).AsByte();
+            var v1 = Vector128.Create(vb10, vb11).AsByte();
+            var v2 = Vector128.Create(vb20, vb21).AsByte();
+            var v3 = Vector128.Create(vb30, vb31).AsByte();
+            acc0 = Sse2.Add(acc0, Sse2.SumAbsoluteDifferences(va, v0).AsUInt64());
+            acc1 = Sse2.Add(acc1, Sse2.SumAbsoluteDifferences(va, v1).AsUInt64());
+            acc2 = Sse2.Add(acc2, Sse2.SumAbsoluteDifferences(va, v2).AsUInt64());
+            acc3 = Sse2.Add(acc3, Sse2.SumAbsoluteDifferences(va, v3).AsUInt64());
+        }
+
+        sads[0] = ReduceUlongAccumulator(acc0);
+        sads[1] = ReduceUlongAccumulator(acc1);
+        sads[2] = ReduceUlongAccumulator(acc2);
+        sads[3] = ReduceUlongAccumulator(acc3);
+    }
+
+    /// <summary>
+    /// 16×16 SAD against four reference blocks via AVX2 <c>vpsadbw</c>, two rows per 256-bit vector.
+    /// Exposed for parity tests and on-host comparison with the SSE2 form, which the AVX2 kernel set
+    /// currently uses.
+    /// </summary>
+    internal static void Sad16x16x4Avx2(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads)
+    {
+        ref var ra = ref MemoryMarshal.GetReference(a);
+        ref var rb0 = ref MemoryMarshal.GetReference(b0);
+        ref var rb1 = ref MemoryMarshal.GetReference(b1);
+        ref var rb2 = ref MemoryMarshal.GetReference(b2);
+        ref var rb3 = ref MemoryMarshal.GetReference(b3);
+
+        // Each lane sums one 8-byte half-row, so the worst case is
+        // 16 rows * 8 * 255 = 32640 per lane.
+        var acc0 = Vector256<ulong>.Zero;
+        var acc1 = Vector256<ulong>.Zero;
+        var acc2 = Vector256<ulong>.Zero;
+        var acc3 = Vector256<ulong>.Zero;
+        for (var y = 0; y < 16; y += 2)
+        {
+            var va = Vector256.Create(
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref ra, y * strideA)),
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref ra, (y + 1) * strideA)));
+            var v0 = Vector256.Create(
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb0, y * strideB)),
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb0, (y + 1) * strideB)));
+            var v1 = Vector256.Create(
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb1, y * strideB)),
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb1, (y + 1) * strideB)));
+            var v2 = Vector256.Create(
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb2, y * strideB)),
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb2, (y + 1) * strideB)));
+            var v3 = Vector256.Create(
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb3, y * strideB)),
+                Unsafe.ReadUnaligned<Vector128<byte>>(ref Unsafe.Add(ref rb3, (y + 1) * strideB)));
+            acc0 = Avx2.Add(acc0, Avx2.SumAbsoluteDifferences(va, v0).AsUInt64());
+            acc1 = Avx2.Add(acc1, Avx2.SumAbsoluteDifferences(va, v1).AsUInt64());
+            acc2 = Avx2.Add(acc2, Avx2.SumAbsoluteDifferences(va, v2).AsUInt64());
+            acc3 = Avx2.Add(acc3, Avx2.SumAbsoluteDifferences(va, v3).AsUInt64());
+        }
+
+        sads[0] = ReduceUlongAccumulator(acc0);
+        sads[1] = ReduceUlongAccumulator(acc1);
+        sads[2] = ReduceUlongAccumulator(acc2);
+        sads[3] = ReduceUlongAccumulator(acc3);
+    }
+
+    /// <summary>
+    /// 8×8 SAD against four reference blocks via AVX2 <c>vpsadbw</c>, four rows per 256-bit vector.
+    /// </summary>
+    internal static void Sad8x8x4Avx2(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads)
+    {
+        ref var ra = ref MemoryMarshal.GetReference(a);
+        ref var rb0 = ref MemoryMarshal.GetReference(b0);
+        ref var rb1 = ref MemoryMarshal.GetReference(b1);
+        ref var rb2 = ref MemoryMarshal.GetReference(b2);
+        ref var rb3 = ref MemoryMarshal.GetReference(b3);
+
+        // Each lane sums one row, so the worst case is 8 rows * 255 = 2040 per lane.
+        var acc0 = Vector256<ulong>.Zero;
+        var acc1 = Vector256<ulong>.Zero;
+        var acc2 = Vector256<ulong>.Zero;
+        var acc3 = Vector256<ulong>.Zero;
+        for (var y = 0; y < 8; y += 4)
+        {
+            var va = Vector256.Create(
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ra, y * strideA)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ra, (y + 1) * strideA))),
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ra, (y + 2) * strideA)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref ra, (y + 3) * strideA)))).AsByte();
+            var v0 = Vector256.Create(
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb0, y * strideB)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb0, (y + 1) * strideB))),
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb0, (y + 2) * strideB)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb0, (y + 3) * strideB)))).AsByte();
+            var v1 = Vector256.Create(
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb1, y * strideB)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb1, (y + 1) * strideB))),
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb1, (y + 2) * strideB)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb1, (y + 3) * strideB)))).AsByte();
+            var v2 = Vector256.Create(
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb2, y * strideB)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb2, (y + 1) * strideB))),
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb2, (y + 2) * strideB)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb2, (y + 3) * strideB)))).AsByte();
+            var v3 = Vector256.Create(
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb3, y * strideB)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb3, (y + 1) * strideB))),
+                Vector128.Create(
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb3, (y + 2) * strideB)),
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref rb3, (y + 3) * strideB)))).AsByte();
+            acc0 = Avx2.Add(acc0, Avx2.SumAbsoluteDifferences(va, v0).AsUInt64());
+            acc1 = Avx2.Add(acc1, Avx2.SumAbsoluteDifferences(va, v1).AsUInt64());
+            acc2 = Avx2.Add(acc2, Avx2.SumAbsoluteDifferences(va, v2).AsUInt64());
+            acc3 = Avx2.Add(acc3, Avx2.SumAbsoluteDifferences(va, v3).AsUInt64());
+        }
+
+        sads[0] = ReduceUlongAccumulator(acc0);
+        sads[1] = ReduceUlongAccumulator(acc1);
+        sads[2] = ReduceUlongAccumulator(acc2);
+        sads[3] = ReduceUlongAccumulator(acc3);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ReduceUlongAccumulator(Vector128<ulong> acc) =>
+        (int)(acc.GetElement(0) + acc.GetElement(1));
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ReduceUlongAccumulator(Vector256<ulong> acc) =>
+        (int)(acc.GetElement(0) + acc.GetElement(1) + acc.GetElement(2) + acc.GetElement(3));
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int SadScalarNxM(
         ReadOnlySpan<byte> a, int strideA,

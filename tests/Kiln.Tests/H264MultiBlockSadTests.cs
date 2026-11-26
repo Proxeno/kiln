@@ -1,6 +1,7 @@
 using FluentAssertions;
 using Kiln.Internal.H264;
 using System.Runtime.Intrinsics.Arm;
+using System.Runtime.Intrinsics.X86;
 using Xunit;
 
 namespace Kiln.Tests;
@@ -319,7 +320,7 @@ public sealed class H264MultiBlockSadTests
         Span<int> simd = stackalloc int[4];
         for (var trial = 0; trial < 50; trial++)
         {
-            var (a, refs) = RandomFour(rng, strideA, rowsA, strideB, rowsB);
+            var (a, refs) = MotionSadTestHelpers.RandomFour(rng, strideA, rowsA, strideB, rowsB);
             H264MotionSad.Sad16x16x4Scalar(a, strideA, refs[0], refs[1], refs[2], refs[3], strideB, sads);
             for (var c = 0; c < 4; c++)
             {
@@ -347,7 +348,7 @@ public sealed class H264MultiBlockSadTests
         Span<int> simd = stackalloc int[4];
         for (var trial = 0; trial < 50; trial++)
         {
-            var (a, refs) = RandomFour(rng, strideA, rowsA, strideB, rowsB);
+            var (a, refs) = MotionSadTestHelpers.RandomFour(rng, strideA, rowsA, strideB, rowsB);
             H264MotionSad.Sad8x8x4Scalar(a, strideA, refs[0], refs[1], refs[2], refs[3], strideB, sads);
             for (var c = 0; c < 4; c++)
             {
@@ -442,30 +443,173 @@ public sealed class H264MultiBlockSadTests
         Span<int> want = stackalloc int[4];
         for (var trial = 0; trial < 50; trial++)
         {
-            var (a16, refs16) = RandomFour(rng, 24, 18, 22, 18);
+            var (a16, refs16) = MotionSadTestHelpers.RandomFour(rng, 24, 18, 22, 18);
             best.Sad16x16x4(a16, 24, refs16[0], refs16[1], refs16[2], refs16[3], 22, got);
             scalar.Sad16x16x4(a16, 24, refs16[0], refs16[1], refs16[2], refs16[3], 22, want);
             got.ToArray().Should().Equal(want.ToArray());
 
-            var (a8, refs8) = RandomFour(rng, 16, 12, 14, 12);
+            var (a8, refs8) = MotionSadTestHelpers.RandomFour(rng, 16, 12, 14, 12);
             best.Sad8x8x4(a8, 16, refs8[0], refs8[1], refs8[2], refs8[3], 14, got);
             scalar.Sad8x8x4(a8, 16, refs8[0], refs8[1], refs8[2], refs8[3], 14, want);
             got.ToArray().Should().Equal(want.ToArray());
         }
     }
 
-    private static (byte[] a, byte[][] refs) RandomFour(
-        Random rng, int strideA, int rowsA, int strideB, int rowsB)
+    [Theory]
+    [InlineData(21, 18, 19, 18)]
+    [InlineData(18, 17, 17, 17)]
+    public void Resolved_kernel_set_x4_matches_scalar_set_for_unaligned_strides(
+        int strideA, int rowsA, int strideB, int rowsB)
     {
-        var a = new byte[strideA * rowsA];
-        rng.NextBytes(a);
-        var refs = new byte[4][];
-        for (var i = 0; i < refs.Length; i++)
+        var best = H264KernelSet.CreateBest();
+        var scalar = new ScalarKernelSet();
+        var rng = new Random(0x4F04);
+
+        Span<int> got = stackalloc int[4];
+        Span<int> want = stackalloc int[4];
+        for (var trial = 0; trial < 50; trial++)
         {
-            refs[i] = new byte[strideB * rowsB];
-            rng.NextBytes(refs[i]);
+            var (a16, refs16) = MotionSadTestHelpers.RandomFour(rng, strideA, rowsA, strideB, rowsB);
+            best.Sad16x16x4(a16, strideA, refs16[0], refs16[1], refs16[2], refs16[3], strideB, got);
+            scalar.Sad16x16x4(a16, strideA, refs16[0], refs16[1], refs16[2], refs16[3], strideB, want);
+            got.ToArray().Should().Equal(want.ToArray());
+
+            var (a8, refs8) = MotionSadTestHelpers.RandomFour(rng, 13, 10, 11, 10);
+            best.Sad8x8x4(a8, 13, refs8[0], refs8[1], refs8[2], refs8[3], 11, got);
+            scalar.Sad8x8x4(a8, 13, refs8[0], refs8[1], refs8[2], refs8[3], 11, want);
+            got.ToArray().Should().Equal(want.ToArray());
+        }
+    }
+
+    // ── x64 (SSE2/SSSE3) four-candidate parity ──────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(24, 18, 22, 18)]
+    [InlineData(21, 16, 19, 16)]
+    [InlineData(33, 18, 24, 16)]
+    public void Sad16x16x4_sse2_matches_scalar_when_available(int strideA, int rowsA, int strideB, int rowsB)
+    {
+        if (!Ssse3.IsSupported)
+        {
+            return;
         }
 
-        return (a, refs);
+        EncoderSimdTestFacts.RequiresX64EncoderSimd();
+
+        var rng = new Random(0x4E51);
+        Span<int> want = stackalloc int[4];
+        Span<int> got = stackalloc int[4];
+        for (var trial = 0; trial < 50; trial++)
+        {
+            var (a, refs) = MotionSadTestHelpers.RandomFour(rng, strideA, rowsA, strideB, rowsB);
+            H264MotionSad.Sad16x16x4Scalar(a, strideA, refs[0], refs[1], refs[2], refs[3], strideB, want);
+            H264MotionSad.Sad16x16x4Sse2(a, strideA, refs[0], refs[1], refs[2], refs[3], strideB, got);
+            got.ToArray().Should().Equal(want.ToArray());
+            for (var c = 0; c < 4; c++)
+            {
+                got[c].Should().Be(MotionSadTestHelpers.NaiveSad(a, strideA, refs[c], strideB, 16, 16));
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(16, 12, 14, 12)]
+    [InlineData(13, 10, 11, 10)]
+    [InlineData(9, 9, 11, 9)]
+    public void Sad8x8x4_sse2_matches_scalar_when_available(int strideA, int rowsA, int strideB, int rowsB)
+    {
+        if (!Ssse3.IsSupported)
+        {
+            return;
+        }
+
+        EncoderSimdTestFacts.RequiresX64EncoderSimd();
+
+        var rng = new Random(0x4E52);
+        Span<int> want = stackalloc int[4];
+        Span<int> got = stackalloc int[4];
+        for (var trial = 0; trial < 50; trial++)
+        {
+            var (a, refs) = MotionSadTestHelpers.RandomFour(rng, strideA, rowsA, strideB, rowsB);
+            H264MotionSad.Sad8x8x4Scalar(a, strideA, refs[0], refs[1], refs[2], refs[3], strideB, want);
+            H264MotionSad.Sad8x8x4Sse2(a, strideA, refs[0], refs[1], refs[2], refs[3], strideB, got);
+            got.ToArray().Should().Equal(want.ToArray());
+            for (var c = 0; c < 4; c++)
+            {
+                got[c].Should().Be(MotionSadTestHelpers.NaiveSad(a, strideA, refs[c], strideB, 8, 8));
+            }
+        }
+    }
+
+    [Fact]
+    public void Sad16x16x4_sse2_extreme_patterns()
+    {
+        if (!Ssse3.IsSupported)
+        {
+            return;
+        }
+
+        EncoderSimdTestFacts.RequiresX64EncoderSimd();
+
+        const int stride = 24;
+        var zeros = new byte[stride * 16];
+        var ones = new byte[stride * 16];
+        Array.Fill(ones, (byte)255);
+        var mixed = new byte[stride * 16];
+        for (var i = 0; i < mixed.Length; i++)
+        {
+            mixed[i] = (byte)(i * 37);
+        }
+
+        Span<int> sads = stackalloc int[4];
+
+        H264MotionSad.Sad16x16x4Sse2(zeros, stride, zeros, zeros, zeros, zeros, stride, sads);
+        sads.ToArray().Should().Equal(0, 0, 0, 0);
+
+        // Max-difference pattern: every source sample is 255 from its candidate sample, the 16-bit
+        // worst case for each accumulator lane.
+        H264MotionSad.Sad16x16x4Sse2(zeros, stride, ones, ones, ones, ones, stride, sads);
+        sads.ToArray().Should().Equal(255 * 16 * 16, 255 * 16 * 16, 255 * 16 * 16, 255 * 16 * 16);
+
+        H264MotionSad.Sad16x16x4Sse2(zeros, stride, ones, zeros, mixed, ones, stride, sads);
+        sads[0].Should().Be(255 * 16 * 16);
+        sads[1].Should().Be(0);
+        sads[2].Should().Be(MotionSadTestHelpers.NaiveSad(zeros, stride, mixed, stride, 16, 16));
+        sads[3].Should().Be(255 * 16 * 16);
+    }
+
+    [Fact]
+    public void Sad8x8x4_sse2_extreme_patterns()
+    {
+        if (!Ssse3.IsSupported)
+        {
+            return;
+        }
+
+        EncoderSimdTestFacts.RequiresX64EncoderSimd();
+
+        const int stride = 16;
+        var zeros = new byte[stride * 8];
+        var ones = new byte[stride * 8];
+        Array.Fill(ones, (byte)255);
+        var mixed = new byte[stride * 8];
+        for (var i = 0; i < mixed.Length; i++)
+        {
+            mixed[i] = (byte)(i * 37);
+        }
+
+        Span<int> sads = stackalloc int[4];
+
+        H264MotionSad.Sad8x8x4Sse2(zeros, stride, zeros, zeros, zeros, zeros, stride, sads);
+        sads.ToArray().Should().Equal(0, 0, 0, 0);
+
+        H264MotionSad.Sad8x8x4Sse2(zeros, stride, ones, ones, ones, ones, stride, sads);
+        sads.ToArray().Should().Equal(255 * 8 * 8, 255 * 8 * 8, 255 * 8 * 8, 255 * 8 * 8);
+
+        H264MotionSad.Sad8x8x4Sse2(ones, stride, mixed, zeros, ones, mixed, stride, sads);
+        sads[0].Should().Be(MotionSadTestHelpers.NaiveSad(ones, stride, mixed, stride, 8, 8));
+        sads[1].Should().Be(255 * 8 * 8);
+        sads[2].Should().Be(0);
+        sads[3].Should().Be(MotionSadTestHelpers.NaiveSad(ones, stride, mixed, stride, 8, 8));
     }
 }
