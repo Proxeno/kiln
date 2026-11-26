@@ -1052,6 +1052,7 @@ public sealed class H264BaselineEncoder : IDisposable
         var tFrameStart = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var collectStage = H264PInterDiagnostics.CollectStageProfile;
         var tStageFrameStart = collectStage ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var collectThreading = H264PInterDiagnostics.CollectSliceThreading;
 
         // Cost-balanced slice partition: the frame wall clock is the *slowest* slice, and with
         // equal-height slices the band containing the moving content runs 2x+ longer than the rest
@@ -1082,6 +1083,7 @@ public sealed class H264BaselineEncoder : IDisposable
         var yLen = y.Length;
         var uLen = u.Length;
         var vLen = v.Length;
+        var tThreadDispatch = collectThreading ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         fixed (byte* yPin = y)
         fixed (byte* uPin = u)
         fixed (byte* vPin = v)
@@ -1125,6 +1127,18 @@ public sealed class H264BaselineEncoder : IDisposable
 
         var tAfterParallel = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var tStageParallel = collectStage ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (collectThreading)
+        {
+            var tThreadJoin = System.Diagnostics.Stopwatch.GetTimestamp();
+            var windows = new H264PInterDiagnostics.SliceThreadingWindow[sliceCount];
+            for (var k = 0; k < sliceCount; k++)
+            {
+                windows[k] = new H264PInterDiagnostics.SliceThreadingWindow(
+                    k, sliceEncoders[k].LastSliceStartTicks, sliceEncoders[k].LastSliceEndTicks);
+            }
+
+            H264PInterDiagnostics.NotifySliceThreadingFrame(tThreadDispatch, tThreadJoin, windows, _mbH);
+        }
 
         // Gather NALs in raster (slice-index) order. WriteNal must run sequentially because each
         // call advances `pos` and writes into the shared output buffer.

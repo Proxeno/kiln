@@ -496,6 +496,8 @@ internal sealed class H264BaselineSliceEncoder
         int pictureTargetBitsOverride = -1)
     {
         var collectFramePhases = H264PInterDiagnostics.CollectFramePhases;
+        var collectThreading = H264PInterDiagnostics.CollectSliceThreading;
+        var threadingStartTicks = collectThreading ? Stopwatch.GetTimestamp() : 0;
         var sliceStartTicks = collectFramePhases ? Stopwatch.GetTimestamp() : 0;
         var collectStage = H264PInterDiagnostics.CollectStageProfile;
         var stageSliceStartTicks = collectStage ? Stopwatch.GetTimestamp() : 0;
@@ -615,7 +617,7 @@ internal sealed class H264BaselineSliceEncoder
         // (H.264 7.3.4) — flushing inside the MB loop and then once more after the loop if the
         // slice ends in a skip tail (an all-skip slice ends here with a single ue(_mbCount)).
         var pendingSkipRun = 0;
-        var rowStartTicks = collectFramePhases ? Stopwatch.GetTimestamp() : 0;
+        var rowStartTicks = (collectFramePhases || collectThreading) ? Stopwatch.GetTimestamp() : 0;
         var rowStartEffort = H264MotionEstimator.ThreadSearchEffort;
         var rowFlushMb = firstMbInSlice + _mbW - 1;
         for (var mb = firstMbInSlice; mb < firstMbInSlice + effectiveMbCount; mb++)
@@ -673,10 +675,14 @@ internal sealed class H264BaselineSliceEncoder
                 _shared.RowMeEffort[mb / _mbW] = rowEndEffort - rowStartEffort;
                 rowStartEffort = rowEndEffort;
                 rowFlushMb += _mbW;
-                if (collectFramePhases)
+                if (collectFramePhases || collectThreading)
                 {
                     var rowEndTicks = Stopwatch.GetTimestamp();
-                    NotifyRowStats(mb / _mbW, rowEndTicks - rowStartTicks);
+                    if (collectFramePhases)
+                        NotifyRowStats(mb / _mbW, rowEndTicks - rowStartTicks);
+                    if (collectThreading)
+                        H264PInterDiagnostics.NotifyThreadingRow(
+                            mb / _mbW, rowEndTicks - rowStartTicks, _shared.RowMeEffort[mb / _mbW]);
                     rowStartTicks = rowEndTicks;
                 }
             }
@@ -722,6 +728,12 @@ internal sealed class H264BaselineSliceEncoder
             var endTicks = Stopwatch.GetTimestamp();
             LastSliceElapsedTicks = endTicks - sliceStartTicks;
             H264PInterDiagnostics.NotifySlicePhases(copyTicks, endTicks - deblockStartTicks);
+        }
+
+        if (collectThreading)
+        {
+            LastSliceStartTicks = threadingStartTicks;
+            LastSliceEndTicks = Stopwatch.GetTimestamp();
         }
 
         if (collectStage)
@@ -838,6 +850,17 @@ internal sealed class H264BaselineSliceEncoder
     /// multi-slice orchestrator reads it after the parallel region to measure slice imbalance.
     /// </summary>
     internal long LastSliceElapsedTicks { get; private set; }
+
+    /// <summary>
+    /// Stopwatch timestamp captured on the slice thread when the most recent
+    /// <see cref="EncodeSliceRbsp"/> call started and when it finished. Recorded only while
+    /// <see cref="H264PInterDiagnostics.CollectSliceThreading"/> is set; the orchestrator reads
+    /// both after the parallel region to derive per-slice busy time and dispatch/join latency.
+    /// </summary>
+    internal long LastSliceStartTicks { get; private set; }
+
+    /// <summary>Stopwatch timestamp when the most recent slice task finished (see <see cref="LastSliceStartTicks"/>).</summary>
+    internal long LastSliceEndTicks { get; private set; }
 
     /// <summary>
     /// Pad the fully-reconstructed frame into the internal padded reference buffer so inter

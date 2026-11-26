@@ -16,6 +16,12 @@ namespace Kiln.Benchmarks;
 /// <item><c>--stage-profile &lt;outdir&gt; [--quick] [--sha &lt;sha&gt;]</c>: runs the matrix, writes
 /// <c>profile.json</c> and <c>profile.md</c>, and returns 1 if any row's Annex B output is not
 /// byte-identical across every pass-T round and its pass-C encode.</item>
+/// <item><c>--stage-profile &lt;outdir&gt; --threads [--quick] [--sha &lt;sha&gt;]</c>: pass Th, the
+/// slice-threading profile. For 2, 4 and 8 slices on 720p and 1080p, VeryFast and HighQuality,
+/// moving and divergent content it records each slice task's busy time, the frame's dispatch-to-join
+/// wall time, idle share, imbalance, dispatch/join latency, and how well the per-row effort proxy
+/// predicts per-row time. Writes <c>threading.md</c> and <c>threading.jsonl</c>; returns 1 if the
+/// hook-on bitstream differs from a hook-off encode.</item>
 /// <item><c>--stage-profile-selftest</c>: the negative control for that identity gate — one quick
 /// row, pass C decorated with a kernel whose <c>Sad16x16</c> returns inner+1. Exit 0 only if the
 /// identity check reports the expected mismatch, 1 if the hashes still match.</item>
@@ -62,6 +68,15 @@ internal static class H264StageProfiler
     private static readonly int[] AllSlices = [1, 4];
     private static readonly int[] QuickSlices = [1];
 
+    // Pass Th (--threads): the slice-threading matrix is fixed by the brief regardless of --quick,
+    // because the question is whether intra-frame load balancing is worth building, and that only
+    // shows up at slice counts above one. --quick only shortens the frame count.
+    private static readonly string[] ThreadingContents = ["moving", "divergent"];
+    private static readonly (int Width, int Height)[] ThreadingResolutions = [(1280, 720), (1920, 1080)];
+    private static readonly EncoderSpeedMode[] ThreadingPresets =
+        [EncoderSpeedMode.VeryFast, EncoderSpeedMode.HighQuality];
+    private static readonly int[] ThreadingSlices = [2, 4, 8];
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -101,7 +116,7 @@ internal static class H264StageProfiler
 
         if (args.Length < 2)
         {
-            Console.Error.WriteLine("Usage: --stage-profile <outdir> [--quick] [--sha <sha>]");
+            Console.Error.WriteLine("Usage: --stage-profile <outdir> [--quick] [--threads] [--sha <sha>]");
             return 1;
         }
 
@@ -112,6 +127,7 @@ internal static class H264StageProfiler
     private static int RunProfile(string outDir, string[] extraArgs)
     {
         var quick = false;
+        var threads = false;
         var sha = "unknown";
         for (var i = 0; i < extraArgs.Length; i++)
         {
@@ -119,6 +135,9 @@ internal static class H264StageProfiler
             {
                 case "--quick":
                     quick = true;
+                    break;
+                case "--threads":
+                    threads = true;
                     break;
                 case "--sha":
                     if (i + 1 >= extraArgs.Length)
@@ -136,6 +155,11 @@ internal static class H264StageProfiler
         }
 
         var rawArgs = string.Join(' ', ["--stage-profile", outDir, .. extraArgs]);
+        if (threads)
+        {
+            return RunThreading(quick, outDir, sha, rawArgs);
+        }
+
         var settings = quick
             ? new Settings(QuickContents, QuickResolutions, 8, QuickPresets, QuickSlices,
                 TimedRounds, DiscardedRounds, SkipQuietGate: false, Sad16x16Bias: 0, ExpectIdentityMismatch: false)
@@ -144,6 +168,339 @@ internal static class H264StageProfiler
 
         Directory.CreateDirectory(outDir);
         return Execute(settings, outDir, sha, rawArgs);
+    }
+
+    /// <summary>
+    /// Pass Th (slice threading): for each (content, resolution, preset, slice count) cell the
+    /// clip is encoded twice — once with the hook off, once with it on — and the two bitstreams
+    /// must be identical. The hook-on encode records, per frame, each slice task's busy window,
+    /// the dispatch-to-join wall time, and per-row wall ticks alongside the search-effort proxy.
+    /// Writes <c>threading.md</c> and <c>threading.jsonl</c>; returns 1 on any identity mismatch.
+    /// </summary>
+    private static int RunThreading(bool quick, string outDir, string sha, string rawArgs)
+    {
+        Directory.CreateDirectory(outDir);
+        var frames = quick ? 8 : 24;
+        var settings = new Settings(
+            ThreadingContents, ThreadingResolutions, frames, ThreadingPresets, ThreadingSlices,
+            TimedRounds, DiscardedRounds, SkipQuietGate: true, Sad16x16Bias: 0, ExpectIdentityMismatch: false);
+        Console.WriteLine(
+            $"// stage-profile --threads: contents={string.Join(',', settings.Contents)} " +
+            $"frames={settings.Frames} presets={string.Join(',', settings.Presets)} " +
+            $"slices={string.Join(',', settings.Slices)}");
+
+        var clips = BuildClips(settings);
+        var maxPixels = settings.Resolutions.Max(r => r.Width * r.Height);
+        var annex = new byte[(maxPixels * 2) + 1_048_576];
+
+        var summary = new List<ThreadingRow>();
+        var frameRecords = new List<ThreadingFrameRecord>();
+        var identityMismatch = false;
+
+        foreach (var clip in clips)
+        {
+            foreach (var preset in settings.Presets)
+            {
+                foreach (var slices in settings.Slices)
+                {
+                    var options = CreateOptions(preset, slices);
+
+                    // Reference: the same clip with the hook off. Timers must not change one byte.
+                    var plain = EncodeClip(options, clip, annex);
+                    var (threadHash, samples) = EncodeThreadedClip(options, clip, annex);
+                    var identity = string.Equals(plain.BitstreamSha256, threadHash, StringComparison.Ordinal);
+                    if (!identity)
+                    {
+                        Console.WriteLine(
+                            $"identity MISMATCH: {clip.Content} {clip.Width}x{clip.Height} " +
+                            $"{preset} s{slices}");
+                        identityMismatch = true;
+                    }
+
+                    var metrics = new List<ThreadingFrameMetrics>(samples.Count);
+                    for (var f = 0; f < samples.Count; f++)
+                    {
+                        var frame = samples[f];
+                        var m = MeasureThreadingFrame(frame);
+                        // The rebalancer only ever sees the previous frames' row effort, so pair
+                        // this frame's measured row time with the prior frame's effort proxy.
+                        var (r, mape) = f > 0
+                            ? RowPrediction(samples[f - 1].RowEffort, frame.RowTicks)
+                            : (double.NaN, double.NaN);
+                        var full = m with { PearsonR = r, MapePct = mape };
+                        metrics.Add(full);
+                        frameRecords.Add(new ThreadingFrameRecord(
+                            clip.Content, clip.Width, clip.Height, preset.ToString(), slices, f,
+                            Math.Round(full.FrameWallMs, 4, MidpointRounding.AwayFromZero),
+                            full.SliceBusyMs.Select(b => Math.Round(b, 4, MidpointRounding.AwayFromZero)).ToArray(),
+                            Math.Round(full.IdleShare, 5, MidpointRounding.AwayFromZero),
+                            Math.Round(full.Imbalance, 4, MidpointRounding.AwayFromZero),
+                            Math.Round(full.DispatchLatencyMs, 4, MidpointRounding.AwayFromZero),
+                            Math.Round(full.JoinLatencyMs, 4, MidpointRounding.AwayFromZero),
+                            double.IsNaN(r) ? null : Math.Round(r, 4, MidpointRounding.AwayFromZero),
+                            double.IsNaN(mape) ? null : Math.Round(mape, 3, MidpointRounding.AwayFromZero),
+                            frame.RowTicks,
+                            frame.RowEffort));
+                    }
+
+                    var row = SummarizeThreading(clip, preset, slices, metrics, threadHash, identity);
+                    summary.Add(row);
+                    Console.WriteLine(
+                        $"threading {Label(row)}: frame={row.FrameWallMs:F2}ms " +
+                        $"idle={row.IdlePctMean:F1}% imbalance={row.ImbalanceMean:F3} " +
+                        $"(max {row.ImbalanceMax:F3}) dispatch={row.DispatchLatencyUsMean:F1}us " +
+                        $"join={row.JoinLatencyUsMean:F1}us r={FormatNullable(row.PearsonRMean, "F3")} " +
+                        $"mape={FormatNullable(row.MapePctMean, "F1")}% identity={(identity ? "equal" : "MISMATCH")}");
+                }
+            }
+        }
+
+        var markdown = BuildThreadingMarkdown(settings, summary);
+        var jsonPath = Path.Combine(outDir, "threading.jsonl");
+        var mdPath = Path.Combine(outDir, "threading.md");
+        using (var writer = new StreamWriter(jsonPath))
+        {
+            foreach (var record in frameRecords)
+            {
+                writer.WriteLine(JsonSerializer.Serialize(record, JsonOptions));
+            }
+        }
+
+        File.WriteAllText(mdPath, markdown);
+        Console.WriteLine($"wrote {jsonPath}");
+        Console.WriteLine($"wrote {mdPath}");
+        Console.WriteLine($"// stage-profile --threads: args={rawArgs} sha={sha}");
+        return identityMismatch ? 1 : 0;
+    }
+
+    /// <summary>Per-frame slice-threading metrics (mixture of raw and derived values).</summary>
+    private sealed record ThreadingFrameMetrics(
+        double FrameWallMs,
+        double[] SliceBusyMs,
+        double IdleShare,
+        double Imbalance,
+        double DispatchLatencyMs,
+        double JoinLatencyMs,
+        double PearsonR,
+        double MapePct);
+
+    /// <summary>
+    /// Derives one frame's busy/idle split from the recorded slice windows: per-slice busy time,
+    /// idle share <c>1 - sum(busy)/(sliceCount*frameWall)</c>, imbalance <c>max(busy)/mean(busy)</c>,
+    /// and the dispatch and join latencies around the parallel region.
+    /// </summary>
+    private static ThreadingFrameMetrics MeasureThreadingFrame(H264PInterDiagnostics.SliceThreadingFrame frame)
+    {
+        var sliceCount = frame.Slices.Count;
+        var frameWallTicks = frame.JoinTicks - frame.DispatchTicks;
+        var frameWallMs = TicksToMs(frameWallTicks);
+        var busy = new double[sliceCount];
+        long sumBusy = 0;
+        long maxBusy = 0;
+        long firstStart = long.MaxValue;
+        long lastEnd = long.MinValue;
+        for (var k = 0; k < sliceCount; k++)
+        {
+            var slice = frame.Slices[k];
+            var sliceBusy = slice.EndTicks - slice.StartTicks;
+            busy[k] = TicksToMs(sliceBusy);
+            sumBusy += sliceBusy;
+            maxBusy = Math.Max(maxBusy, sliceBusy);
+            firstStart = Math.Min(firstStart, slice.StartTicks);
+            lastEnd = Math.Max(lastEnd, slice.EndTicks);
+        }
+
+        var meanBusy = sliceCount > 0 ? sumBusy / (double)sliceCount : 0.0;
+        var idleShare = frameWallTicks > 0 && sliceCount > 0
+            ? Math.Clamp(1.0 - (sumBusy / (sliceCount * (double)frameWallTicks)), 0.0, 1.0)
+            : 0.0;
+        var imbalance = meanBusy > 0 ? maxBusy / meanBusy : 0.0;
+        var dispatchLatencyMs = frameWallTicks > 0 && firstStart != long.MaxValue
+            ? TicksToMs(firstStart - frame.DispatchTicks)
+            : 0.0;
+        var joinLatencyMs = frameWallTicks > 0 && lastEnd != long.MinValue
+            ? TicksToMs(frame.JoinTicks - lastEnd)
+            : 0.0;
+        return new ThreadingFrameMetrics(
+            frameWallMs, busy, idleShare, imbalance, dispatchLatencyMs, joinLatencyMs, double.NaN, double.NaN);
+    }
+
+    /// <summary>
+    /// Pearson correlation between the previous frame's per-row effort proxy and this frame's
+    /// per-row wall ticks, plus the mean absolute error between each row's predicted share of the
+    /// frame's row time (its effort share) and its measured share, as a percentage of the mean
+    /// measured share. That percentage is the total variation between the two share distributions
+    /// times 100, so it is stable and bounded by 200 (a relative per-row percentage error is
+    /// dominated by the tiny rows the balancer cannot act on). Rows with a zero effort or zero
+    /// measured time are skipped; NaN when fewer than two rows remain or a series is flat.
+    /// </summary>
+    private static (double PearsonR, double MapePct) RowPrediction(long[] effort, long[] ticks)
+    {
+        var count = Math.Min(effort.Length, ticks.Length);
+        double sumX = 0, sumY = 0, sumXx = 0, sumYy = 0, sumXy = 0;
+        var n = 0;
+        for (var i = 0; i < count; i++)
+        {
+            if (effort[i] <= 0 || ticks[i] <= 0)
+                continue;
+            double x = effort[i];
+            double y = ticks[i];
+            sumX += x;
+            sumY += y;
+            sumXx += x * x;
+            sumYy += y * y;
+            sumXy += x * y;
+            n++;
+        }
+
+        if (n < 2)
+            return (double.NaN, double.NaN);
+
+        var covariance = sumXy - (sumX * sumY / n);
+        var varianceX = sumXx - (sumX * sumX / n);
+        var varianceY = sumYy - (sumY * sumY / n);
+        var r = varianceX > 0 && varianceY > 0 ? covariance / Math.Sqrt(varianceX * varianceY) : double.NaN;
+
+        var mape = double.NaN;
+        if (sumX > 0 && sumY > 0)
+        {
+            double absoluteShareError = 0;
+            for (var i = 0; i < count; i++)
+            {
+                if (effort[i] <= 0 || ticks[i] <= 0)
+                    continue;
+                absoluteShareError += Math.Abs((effort[i] / sumX) - (ticks[i] / sumY));
+            }
+
+            // The shares sum to 1 over the included rows, so the mean measured share is 1/n and
+            // the mean absolute share error as a fraction of it is just the total variation.
+            mape = absoluteShareError * 100.0;
+        }
+
+        return (r, mape);
+    }
+
+    private static ThreadingRow SummarizeThreading(
+        Clip clip, EncoderSpeedMode preset, int slices, List<ThreadingFrameMetrics> metrics,
+        string bitstreamSha256, bool identity)
+    {
+        double Mean(Func<ThreadingFrameMetrics, double> selector)
+        {
+            double sum = 0;
+            var n = 0;
+            foreach (var m in metrics)
+            {
+                var value = selector(m);
+                if (double.IsNaN(value))
+                    continue;
+                sum += value;
+                n++;
+            }
+
+            return n > 0 ? sum / n : double.NaN;
+        }
+
+        return new ThreadingRow(
+            clip.Content, clip.Width, clip.Height, preset.ToString(), slices, metrics.Count,
+            Mean(m => m.FrameWallMs),
+            Mean(m => m.IdleShare) * 100.0,
+            Mean(m => m.Imbalance),
+            metrics.Count > 0 ? metrics.Max(m => m.Imbalance) : double.NaN,
+            Mean(m => m.DispatchLatencyMs) * 1000.0,
+            Mean(m => m.JoinLatencyMs) * 1000.0,
+            Mean(m => m.PearsonR),
+            Mean(m => m.MapePct),
+            bitstreamSha256,
+            identity);
+    }
+
+    private static string BuildThreadingMarkdown(Settings settings, List<ThreadingRow> rows)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("# H.264 slice-threading profile");
+        sb.AppendLine();
+        sb.AppendLine(
+            "Per slice task: busy time measured on the slice thread (task start to task end); " +
+            "frame wall time is dispatch to join. Idle share is `1 - sum(busy) / (sliceCount * " +
+            "frameWall)`; imbalance is `max(busy) / mean(busy)`; dispatch latency is dispatch to " +
+            "the first slice start; join latency is the last slice end to join return.");
+        sb.AppendLine();
+        sb.AppendLine(
+            "Row prediction pairs each frame's per-row measured time with the **previous** frame's " +
+            "per-row search-effort proxy (the signal the rebalancer actually has). Pearson r is " +
+            "across rows; MAPE is the mean absolute error between each row's effort share and its " +
+            "measured share of the frame's row time, as a percentage of the mean measured share " +
+            "(the total variation between the two distributions, x100; 0 is a perfect predictor). " +
+            "Timing on a loaded machine is evidence only.");
+        sb.AppendLine();
+        sb.AppendLine($"- Frames per cell: {settings.Frames}");
+        sb.AppendLine(
+            $"| Content | Resolution | Preset | Slices | Frames | Frame ms | Idle % | " +
+            $"Imbalance mean | Imbalance max | Dispatch us | Join us | Pearson r | MAPE % | Identity |");
+        sb.AppendLine(
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |");
+        foreach (var row in rows)
+        {
+            sb.AppendLine(
+                $"| {row.Content} | {row.Width}x{row.Height} | {row.Preset} | {row.Slices} | " +
+                $"{row.Frames} | {row.FrameWallMs:F2} | {row.IdlePctMean:F1} | " +
+                $"{row.ImbalanceMean:F3} | {row.ImbalanceMax:F3} | " +
+                $"{row.DispatchLatencyUsMean:F1} | {row.JoinLatencyUsMean:F1} | " +
+                $"{FormatNullable(row.PearsonRMean, "F3")} | {FormatNullable(row.MapePctMean, "F1")} | " +
+                $"{(row.Identity ? "equal" : "MISMATCH")} |");
+        }
+
+        return sb.ToString();
+    }
+
+    private static string FormatNullable(double value, string format)
+        => double.IsNaN(value) ? "n/a" : value.ToString(format, CultureInfo.InvariantCulture);
+
+    private static double TicksToMs(long ticks) => ticks * (1000.0 / Stopwatch.Frequency);
+
+    private static string Label(ThreadingRow row)
+        => $"{row.Content} {row.Width}x{row.Height} {row.Preset} s{row.Slices}";
+
+    /// <summary>
+    /// Encodes the clip once with the slice-threading hook on and returns the bitstream hash plus
+    /// every recorded frame sample. Mirrors <see cref="EncodeWith"/> so the hash covers the same
+    /// Annex B bytes the hook-off reference produced.
+    /// </summary>
+    private static (string BitstreamSha256, List<H264PInterDiagnostics.SliceThreadingFrame> Samples) EncodeThreadedClip(
+        H264BaselineEncoderOptions options, Clip clip, byte[] annex)
+    {
+        using var encoder = new H264BaselineEncoder(clip.Width, clip.Height, options);
+        var width = clip.Width;
+        var height = clip.Height;
+        var ySize = width * height;
+        var uvSize = ySize / 4;
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+        H264PInterDiagnostics.ResetSliceThreading();
+        H264PInterDiagnostics.CollectSliceThreading = true;
+        try
+        {
+            var idr = clip.Frames[0];
+            var written = encoder.EncodeFrame(
+                idr.AsSpan(0, ySize), idr.AsSpan(ySize, uvSize), idr.AsSpan(ySize + uvSize, uvSize),
+                width, width / 2, annex, forceKeyframe: true);
+            hash.AppendData(annex, 0, written);
+
+            for (var i = 1; i < clip.Frames.Length; i++)
+            {
+                var frame = clip.Frames[i];
+                written = encoder.EncodeFrame(
+                    frame.AsSpan(0, ySize), frame.AsSpan(ySize, uvSize), frame.AsSpan(ySize + uvSize, uvSize),
+                    width, width / 2, annex, forceKeyframe: false);
+                hash.AppendData(annex, 0, written);
+            }
+        }
+        finally
+        {
+            H264PInterDiagnostics.CollectSliceThreading = false;
+        }
+
+        return (Convert.ToHexString(hash.GetHashAndReset()), H264PInterDiagnostics.DrainSliceThreadingFrames());
     }
 
     /// <summary>
@@ -1241,3 +1598,41 @@ internal sealed record ProfileDocument(
     IReadOnlyList<ProfileQuietRound> QuietLog,
     IReadOnlyDictionary<string, double> KernelUnitCostsNs,
     string KernelUnitCostTier);
+
+/// <summary>One (content, resolution, preset, slice count) row aggregated across its frames.</summary>
+internal sealed record ThreadingRow(
+    string Content,
+    int Width,
+    int Height,
+    string Preset,
+    int Slices,
+    int Frames,
+    double FrameWallMs,
+    double IdlePctMean,
+    double ImbalanceMean,
+    double ImbalanceMax,
+    double DispatchLatencyUsMean,
+    double JoinLatencyUsMean,
+    double PearsonRMean,
+    double MapePctMean,
+    string BitstreamSha256,
+    bool Identity);
+
+/// <summary>One frame's row in <c>threading.jsonl</c>.</summary>
+internal sealed record ThreadingFrameRecord(
+    string Content,
+    int Width,
+    int Height,
+    string Preset,
+    int Slices,
+    int Frame,
+    double FrameWallMs,
+    double[] SliceBusyMs,
+    double IdleShare,
+    double Imbalance,
+    double DispatchLatencyMs,
+    double JoinLatencyMs,
+    double? PearsonR,
+    double? MapePct,
+    long[] RowTicks,
+    long[] RowEffort);
