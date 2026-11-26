@@ -253,6 +253,95 @@ internal static class H264PInterDiagnostics
         return snapshot;
     }
 
+    /// <summary>
+    /// Measurement-only slice-threading accounting: each slice task's busy window, the frame's
+    /// dispatch-to-join wall time, and per-row wall ticks alongside the search-effort proxy.
+    /// Keep false in normal operation. When off, each slice task reads this flag once and
+    /// allocates nothing; when on the per-row timing is captured at row boundaries (never inside
+    /// the per-MB loop) so it costs no allocation and no thread-static read per macroblock.
+    /// </summary>
+    public static bool CollectSliceThreading { get; set; }
+
+    /// <summary>Rows tracked per frame by the slice-threading account (covers 8K luma rows).</summary>
+    private const int MaxThreadingRows = 1024;
+
+    private static readonly long[] s_threadRowTicks = new long[MaxThreadingRows];
+    private static readonly long[] s_threadRowEffort = new long[MaxThreadingRows];
+    private static readonly ConcurrentQueue<SliceThreadingFrame> s_sliceThreadingFrames = new();
+
+    /// <summary>One slice task's busy window within one frame (process <see cref="System.Diagnostics.Stopwatch"/> clock).</summary>
+    public readonly record struct SliceThreadingWindow(int SliceIndex, long StartTicks, long EndTicks);
+
+    /// <summary>
+    /// One multi-slice frame's threading sample: the dispatch and join timestamps around the
+    /// parallel slice region plus every slice's busy window and the per-row wall ticks and effort
+    /// proxy captured at row boundaries.
+    /// </summary>
+    public sealed record SliceThreadingFrame(
+        long DispatchTicks,
+        long JoinTicks,
+        IReadOnlyList<SliceThreadingWindow> Slices,
+        long[] RowTicks,
+        long[] RowEffort);
+
+    /// <summary>
+    /// Records one slice task's busy window and publishes the frame sample once the parallel
+    /// region has joined (orchestrator thread). Rows are snapshotted and cleared here so the next
+    /// frame starts clean; disabled, this returns immediately after one flag read.
+    /// </summary>
+    internal static void NotifySliceThreadingFrame(
+        long dispatchTicks,
+        long joinTicks,
+        ReadOnlySpan<SliceThreadingWindow> slices,
+        int mbRows)
+    {
+        if (!CollectSliceThreading)
+            return;
+        mbRows = Math.Clamp(mbRows, 0, MaxThreadingRows);
+        var rowTicks = new long[mbRows];
+        var rowEffort = new long[mbRows];
+        Array.Copy(s_threadRowTicks, rowTicks, mbRows);
+        Array.Copy(s_threadRowEffort, rowEffort, mbRows);
+        Array.Clear(s_threadRowTicks, 0, mbRows);
+        Array.Clear(s_threadRowEffort, 0, mbRows);
+        s_sliceThreadingFrames.Enqueue(
+            new SliceThreadingFrame(dispatchTicks, joinTicks, slices.ToArray(), rowTicks, rowEffort));
+    }
+
+    /// <summary>
+    /// Records one MB row's measured wall ticks and its search-effort proxy (slice worker, row
+    /// boundary). Each row belongs to exactly one slice, so this is a plain single-writer store;
+    /// gated by <see cref="CollectSliceThreading"/>.
+    /// </summary>
+    internal static void NotifyThreadingRow(int mbRow, long ticks, long effort)
+    {
+        if (!CollectSliceThreading || (uint)mbRow >= (uint)MaxThreadingRows)
+            return;
+        s_threadRowTicks[mbRow] = ticks;
+        s_threadRowEffort[mbRow] = effort;
+    }
+
+    /// <summary>Drains the slice-threading samples recorded since the last drain (orchestrator thread).</summary>
+    public static List<SliceThreadingFrame> DrainSliceThreadingFrames()
+    {
+        var frames = new List<SliceThreadingFrame>();
+        while (s_sliceThreadingFrames.TryDequeue(out var frame))
+            frames.Add(frame);
+        return frames;
+    }
+
+    /// <summary>Clears the slice-threading queue and any partially recorded rows.</summary>
+    public static void ResetSliceThreading()
+    {
+        while (s_sliceThreadingFrames.TryDequeue(out _))
+        {
+            // Drain any stale samples from an earlier run.
+        }
+
+        Array.Clear(s_threadRowTicks);
+        Array.Clear(s_threadRowEffort);
+    }
+
     private static long s_meIntegerCandidates;
     private static long s_meSubpelCandidates;
 
