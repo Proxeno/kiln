@@ -8,9 +8,9 @@ internal enum H264ResidualKind : byte
     ChromaAc = 2,
     /// <summary>
     /// Luma 4×4 DC block of an Intra_16×16 macroblock (16 coefficients, post-Hadamard) per H.264 9.2.1
-    /// nC selection treating it as a luma block. Senior stub for Junior-D-cavlc; the existing else-branch
-    /// in <see cref="H264CavlcResidual.WriteBlockResidual"/> routes this kind through the luma tables, which
-    /// is the correct table choice for Intra_16×16 luma DC; the junior verifies and tightens with goldens.
+    /// nC selection treating it as a luma block. <see cref="H264CavlcResidual.WriteBlockResidual"/>
+    /// routes this kind through the luma tables, which is the correct table choice for
+    /// Intra_16×16 luma DC.
     /// </summary>
     Luma16x16Dc = 3,
     /// <summary>

@@ -8,7 +8,7 @@ namespace Kiln.Internal.H264;
 /// H.264 in-loop deblocking filter (8.7). Operates on full reconstructed Y/U/V planes for one slice.
 /// </summary>
 /// <remarks>
-/// The senior pre-computes the per-MB boundary-strength arrays (8.7.2.1) inside the encoder using
+/// The slice encoder pre-computes the per-MB boundary-strength arrays (8.7.2.1) using
 /// mb_type / mv / ref-difference rules; the filter only consumes them. The function operates in
 /// place: <paramref name="y"/>, <paramref name="u"/>, and <paramref name="v"/> are mutated to the
 /// post-filter reference-picture state.
