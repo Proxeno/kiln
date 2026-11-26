@@ -497,6 +497,12 @@ internal sealed class H264BaselineSliceEncoder
     {
         var collectFramePhases = H264PInterDiagnostics.CollectFramePhases;
         var sliceStartTicks = collectFramePhases ? Stopwatch.GetTimestamp() : 0;
+        var collectStage = H264PInterDiagnostics.CollectStageProfile;
+        var stageSliceStartTicks = collectStage ? Stopwatch.GetTimestamp() : 0;
+        // Arm/clear this thread's ME stage timers for the whole slice (they are drained at slice end).
+        H264MotionEstimator.SetStageProfiling(collectStage);
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = -1;
         var effectiveMbCount = mbCountInSlice < 0 ? _mbCount : mbCountInSlice;
         if (firstMbInSlice % _mbW != 0)
         {
@@ -582,6 +588,7 @@ internal sealed class H264BaselineSliceEncoder
         // (H264RateControl.StartFrame was always designed to take a per-picture override; this is the
         // first caller to pass one).
         var pictureTargetBits = pictureTargetBitsOverride > 0 ? pictureTargetBitsOverride : _rateControl.PictureTargetBits;
+        var stageRateControlStart = collectStage ? Stopwatch.GetTimestamp() : 0;
         if (effectiveMbCount < _mbCount && pictureTargetBits > 0)
         {
             var sliceBudget = (int)((long)pictureTargetBits * effectiveMbCount / _mbCount);
@@ -598,6 +605,9 @@ internal sealed class H264BaselineSliceEncoder
                 constantSliceLumaQp: sliceQpApplied);
         }
 
+        if (collectStage)
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.RateControl, Stopwatch.GetTimestamp() - stageRateControlStart);
+
         _lastMbQp = sliceQpApplied;
 
         var useTrellis = _useTrellis;
@@ -611,9 +621,12 @@ internal sealed class H264BaselineSliceEncoder
         for (var mb = firstMbInSlice; mb < firstMbInSlice + effectiveMbCount; mb++)
         {
             var mbLocal = mb - firstMbInSlice;
+            var stageQpStart = collectStage ? Stopwatch.GetTimestamp() : 0;
             var bitsBefore = _rbspBuffer.BitLength;
             var aqOffset = _aqStrength > 0 ? _mbAqQpOffset[mb] : 0;
             var qpThisMb = Math.Clamp(_rateControl.NextMbQp(mbLocal, complexity: 0) - aqOffset, 0, 51);
+            if (collectStage)
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.RateControl, Stopwatch.GetTimestamp() - stageQpStart);
 
             var didSkip = false;
             var inRefreshBand = false;
@@ -640,6 +653,7 @@ internal sealed class H264BaselineSliceEncoder
                 WriteMacroblock(_rbspBuffer, mb, y, strideY, u, v, strideUv, isPslice, qpThisMb, useTrellis);
             }
 
+            var stageUpdateStart = collectStage ? Stopwatch.GetTimestamp() : 0;
             var bitsAfterMb = _rbspBuffer.BitLength;
             var bitsSpent = bitsAfterMb - bitsBefore;
             _rateControl.Update(mbLocal, bitsSpent);
@@ -648,6 +662,8 @@ internal sealed class H264BaselineSliceEncoder
             // decoder QPY,PREV. Skips and zero-CBP inter MBs do NOT advance _lastMbQp.
             _qpY[mb] = _lastMbQp;
             _qpUv[mb] = H264ChromaDcScale.ChromaQpFromLuma(_lastMbQp, 0);
+            if (collectStage)
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.RateControl, Stopwatch.GetTimestamp() - stageUpdateStart);
             if (mb == rowFlushMb)
             {
                 // Row boundary: publish this row's deterministic motion-search effort for the
@@ -681,6 +697,7 @@ internal sealed class H264BaselineSliceEncoder
         }
 
         var deblockStartTicks = collectFramePhases ? Stopwatch.GetTimestamp() : 0;
+        var stageDeblockStart = collectStage ? Stopwatch.GetTimestamp() : 0;
         if (firstMbInSlice == 0 && mbCountInSlice < 0)
         {
             // Single-slice legacy path: deblock full picture then rotate DPB and pad reference.
@@ -696,6 +713,9 @@ internal sealed class H264BaselineSliceEncoder
             ApplyInLoopDeblockScoped(firstMbInSlice, effectiveMbCount);
         }
 
+        if (collectStage)
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.Deblock, Stopwatch.GetTimestamp() - stageDeblockStart);
+
         _rbspBuffer.WriteRbspTrailingBits();
         if (collectFramePhases)
         {
@@ -703,6 +723,21 @@ internal sealed class H264BaselineSliceEncoder
             LastSliceElapsedTicks = endTicks - sliceStartTicks;
             H264PInterDiagnostics.NotifySlicePhases(copyTicks, endTicks - deblockStartTicks);
         }
+
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.SliceTotal, Stopwatch.GetTimestamp() - stageSliceStartTicks);
+            var me = H264MotionEstimator.DrainStageTicks();
+            if (me.Integer != 0)
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.MeInteger, me.Integer);
+            if (me.Subpel != 0)
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.MeSubpel, me.Subpel);
+            if (me.Subpartition != 0)
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.MeSubpartition, me.Subpartition);
+            H264PInterDiagnostics.NotifyMeCandidates(me.IntegerCandidates, me.SubpelCandidates);
+            H264PInterDiagnostics.t_profileStage = -1;
+        }
+
         return _rbspBuffer.WrittenSpan();
     }
 
@@ -1774,6 +1809,12 @@ internal sealed class H264BaselineSliceEncoder
         var uvW = _width / 2;
         var mbX = mbx * 16;
         var mbY = mby * 16;
+        var collectStage = H264PInterDiagnostics.CollectStageProfile;
+        // The P-skip pre-check's own inputs (neighbour MVs, median predictor, skip predictor) are
+        // per-MB fixed cost; charge them to SkipPrecheck so the closure can see them.
+        var stageSkipStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.SkipPrecheck;
 
         // §8.4.1.3.1: gather all inter neighbours without refIdx filtering for the median MVP.
         // §8.4.1.1: P_Skip additionally requires A and B to have refIdx=0; aRefIdx/bRefIdx carry that.
@@ -1957,9 +1998,20 @@ internal sealed class H264BaselineSliceEncoder
                         H264PInterDiagnostics.Phase1Outcome.Accept,
                         fractionalLumaMv: ((mvSkipPred.X | mvSkipPred.Y) & 3) != 0);
                 }
+                if (collectStage)
+                {
+                    H264PInterDiagnostics.NotifyStage(H264ProfileStage.SkipPrecheck, Stopwatch.GetTimestamp() - stageSkipStart);
+                    H264PInterDiagnostics.t_profileStage = -1;
+                }
                 return true;
                 }
             }
+        }
+
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.SkipPrecheck, Stopwatch.GetTimestamp() - stageSkipStart);
+            H264PInterDiagnostics.t_profileStage = -1;
         }
 
         if (collectPhase1Timing)
@@ -1984,6 +2036,9 @@ internal sealed class H264BaselineSliceEncoder
 
         var srcMbOff = mbY * strideY + mbX;
         var current = srcY.Slice(srcMbOff);
+        var stageMeSetupStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.MeSubpartition;
         var variance = _kernels.VarianceMb16x16(current, strideY);
         var adaptiveRange = variance < 64 ? 8 : variance < 512 ? 16 : 32;
         H264MotionEstimator.Mv? temporalMv = _shared.PaddedRefValid ? _shared.PrevMbMvs[mbIndex] : null;
@@ -2076,6 +2131,12 @@ internal sealed class H264BaselineSliceEncoder
             }
         }
 
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.MeSubpartition, Stopwatch.GetTimestamp() - stageMeSetupStart);
+            H264PInterDiagnostics.t_profileStage = -1;
+        }
+
         var lambdaThisMb = LambdaSatdForQp(qpThisMb);
 
         // ME against DPB slot 0 (most recent reference, refIdx=0).
@@ -2096,6 +2157,9 @@ internal sealed class H264BaselineSliceEncoder
             allowSubPartitionSearch: allowSubPartitionSearch,
             subPartitionRangeCap: rangeCapThisMb,
             allowExhaustiveFallback: allowExhaustiveFallback);
+        var stageRef1Start = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.MeSubpartition;
         var winRefIdx = 0;
         // Ref1 must beat ref0 by a rate-aware margin (below); when ref0 already sits at the
         // "good enough" floor (4 per sample over a 16x16 luma MB, the same floor the sub-partition
@@ -2125,6 +2189,12 @@ internal sealed class H264BaselineSliceEncoder
                 SeedProbeSadLuma(_shared.DpbPaddedY[1], current, strideY, mbX, mbY, mv0));
             var probeRef0 = SeedProbeSadLuma(_paddedRefY, current, strideY, mbX, mbY, mv0);
             searchRef1 = probeRef1 != int.MaxValue && probeRef1 + ref1TieMargin < probeRef0;
+        }
+
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.MeSubpartition, Stopwatch.GetTimestamp() - stageRef1Start);
+            H264PInterDiagnostics.t_profileStage = -1;
         }
 
         if (searchRef1)
@@ -2307,6 +2377,11 @@ internal sealed class H264BaselineSliceEncoder
         // switch. Runs before the inter residual loop so the loser path is never reconstructed.
         if (_enableIntraInPFallback && !H264PInterDiagnostics.ShouldDisablePhase2b())
         {
+            // The reused and rebuilt paths are the same stage: a reuse skips the rebuild's work but
+            // still stands in for it, so the stage timer covers both branches.
+            var stagePredStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+            if (collectStage)
+                H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.InterPredBuild;
             if (reusePhase1Pred)
             {
                 H264PInterDiagnostics.NotifyPhase2InterPredReused();
@@ -2318,8 +2393,16 @@ internal sealed class H264BaselineSliceEncoder
                 ReconstructInterPredPerPartition(
                     partResult, winRefIdx, mbX, mbY, chromaMbX, chromaMbY, predY, predU, predV, _kernels);
             }
+            if (collectStage)
+            {
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.InterPredBuild, Stopwatch.GetTimestamp() - stagePredStart);
+                H264PInterDiagnostics.t_profileStage = -1;
+            }
             interPredReconstructed = true;
 
+            var stageIntraStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+            if (collectStage)
+                H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.IntraDecision;
             Span<byte> i16SrcFlat = stackalloc byte[256];
             for (var ry = 0; ry < 16; ry++)
                 srcY.Slice((mbY + ry) * strideY + mbX, 16).CopyTo(i16SrcFlat.Slice(ry * 16, 16));
@@ -2366,6 +2449,11 @@ internal sealed class H264BaselineSliceEncoder
             // margin reserves the fallback for genuine prediction failures (scene cuts, occlusion,
             // off-screen content) where intra is dramatically cheaper.
             var chooseIntra = intraRd + (intraRd >> 2) < interRd;
+            if (collectStage)
+            {
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.IntraDecision, Stopwatch.GetTimestamp() - stageIntraStart);
+                H264PInterDiagnostics.t_profileStage = -1;
+            }
             H264PInterDiagnostics.NotifyPhase2bCandidateRd(
                 interSatd, interBits, interRd,
                 intraSatd, intraBits, intraRd,
@@ -2385,7 +2473,15 @@ internal sealed class H264BaselineSliceEncoder
                 && _enableIntraInPFallback
                 && interSatd >= I4x4InPInterSatdGate)
             {
+                var stageI4Start = collectStage ? Stopwatch.GetTimestamp() : 0;
+                if (collectStage)
+                    H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.IntraDecision;
                 var i4Satd = EstimateMbI4x4SatdFromSource(srcY, strideY, mbx, mby);
+                if (collectStage)
+                {
+                    H264PInterDiagnostics.NotifyStage(H264ProfileStage.IntraDecision, Stopwatch.GetTimestamp() - stageI4Start);
+                    H264PInterDiagnostics.t_profileStage = -1;
+                }
                 var i4Bits = intraBits + I4x4InPModeBitsEstimate;
                 var i4Rd = checked(i4Satd + rdLambda * i4Bits);
                 if (i4Rd + (i4Rd >> 2) < interRd && i4Rd < intraRd)
@@ -2423,6 +2519,11 @@ internal sealed class H264BaselineSliceEncoder
         var phase2PredStartTicks = collectPhase2Timing ? Stopwatch.GetTimestamp() : 0;
         if (!interPredReconstructed)
         {
+            // The reused and rebuilt paths are the same stage: a reuse skips the rebuild's work but
+            // still stands in for it, so the stage timer covers both branches.
+            var stagePredStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+            if (collectStage)
+                H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.InterPredBuild;
             if (reusePhase1Pred)
             {
                 H264PInterDiagnostics.NotifyPhase2InterPredReused();
@@ -2436,6 +2537,11 @@ internal sealed class H264BaselineSliceEncoder
                 ReconstructInterPredPerPartition(
                     partResult, winRefIdx, mbX, mbY, chromaMbX, chromaMbY, predY, predU, predV, _kernels);
             }
+            if (collectStage)
+            {
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.InterPredBuild, Stopwatch.GetTimestamp() - stagePredStart);
+                H264PInterDiagnostics.t_profileStage = -1;
+            }
         }
         if (collectPhase2Timing)
             phase2PredTicks = Stopwatch.GetTimestamp() - phase2PredStartTicks;
@@ -2445,6 +2551,9 @@ internal sealed class H264BaselineSliceEncoder
 
         // Compute residual + transform + quant + reconstruct for all 16 luma 4×4 blocks.
         var phase2LumaStartTicks = collectPhase2Timing ? Stopwatch.GetTimestamp() : 0;
+        var stageResidualStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.Residual;
         Span<short> mbBlkZ = stackalloc short[16 * 16];
         Span<byte> srcBlk = stackalloc byte[16];
         Span<byte> predBlk = stackalloc byte[16];
@@ -2502,6 +2611,11 @@ internal sealed class H264BaselineSliceEncoder
         nzV.CopyTo(_chromaNonZeros.AsSpan(mbIndex * 8 + 4, 4));
         if (collectPhase2Timing)
             phase2ChromaTicks = Stopwatch.GetTimestamp() - phase2ChromaStartTicks;
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.Residual, Stopwatch.GetTimestamp() - stageResidualStart);
+            H264PInterDiagnostics.t_profileStage = -1;
+        }
 
         var anyDcU = ChromaDcCoeffAny(chromaDcU);
         var anyDcV = ChromaDcCoeffAny(chromaDcV);
@@ -2546,6 +2660,9 @@ internal sealed class H264BaselineSliceEncoder
         }
 
         var phase2WriteStartTicks = collectPhase2Timing ? Stopwatch.GetTimestamp() : 0;
+        var stageEntropyStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.Entropy;
         // Flush pending mb_skip_run per H.264 7.3.4.
         bs.WriteUe((uint)pendingSkipRun);
         pendingSkipRun = 0;
@@ -2605,6 +2722,12 @@ internal sealed class H264BaselineSliceEncoder
             }
         }
 
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.Entropy, Stopwatch.GetTimestamp() - stageEntropyStart);
+            H264PInterDiagnostics.t_profileStage = -1;
+        }
+
         if (collectPhase2Timing)
         {
             phase2WriteTicks = Stopwatch.GetTimestamp() - phase2WriteStartTicks;
@@ -2646,6 +2769,7 @@ internal sealed class H264BaselineSliceEncoder
         var mbX = mbx * 16;
         var mbY = mby * 16;
         var uvW = _width / 2;
+        var collectStage = H264PInterDiagnostics.CollectStageProfile;
 
         // ── Luma I16×16 prediction ──────────────────────────────────────────────
         Span<byte> predY16 = stackalloc byte[256];
@@ -2659,6 +2783,9 @@ internal sealed class H264BaselineSliceEncoder
         Span<int> coeffStore = stackalloc int[16 * 16]; // indexed [raster * 16 + coeff]
         Span<short> residualBuf = stackalloc short[16]; // reused per block
 
+        var stageResidualStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.Residual;
         for (var raster = 0; raster < 16; raster++)
         {
             var br = raster >> 2;  // block row (0-3)
@@ -2782,7 +2909,15 @@ internal sealed class H264BaselineSliceEncoder
         }
 
         // ── Chroma ─────────────────────────────────────────────────────────────
+        var stageChromaModeStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.IntraDecision;
         var chromaMode = ChooseChromaIntraMode(mbx, mby, srcU, srcV, strideUv, _recU.AsSpan(), _recV.AsSpan(), uvW, qpThisMb);
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.IntraDecision, Stopwatch.GetTimestamp() - stageChromaModeStart);
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.Residual;
+        }
         GetIntraMbNeighbourUsability(mbx, mby, out var chromaTop, out var chromaLeft, out var chromaTopLeft);
         Span<byte> chromaPredU = stackalloc byte[64];
         Span<byte> chromaPredV = stackalloc byte[64];
@@ -2801,6 +2936,11 @@ internal sealed class H264BaselineSliceEncoder
             chromaDcV, chromaAcV, nzV, qpThisMb, _preferRealtimeLatencyTuning);
         nzU.CopyTo(_chromaNonZeros.AsSpan(mbIndex * 8, 4));
         nzV.CopyTo(_chromaNonZeros.AsSpan(mbIndex * 8 + 4, 4));
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.Residual, Stopwatch.GetTimestamp() - stageResidualStart);
+            H264PInterDiagnostics.t_profileStage = -1;
+        }
 
         var anyDcU = ChromaDcCoeffAny(chromaDcU);
         var anyDcV = ChromaDcCoeffAny(chromaDcV);
@@ -2830,6 +2970,9 @@ internal sealed class H264BaselineSliceEncoder
         var nzUArr = nzU.ToArray();
         var nzVArr = nzV.ToArray();
 
+        var stageEntropyStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.Entropy;
         H264SliceMbWriter.WriteIntra16x16Macroblock(
             bs,
             predMode: i16Mode,
@@ -2858,6 +3001,11 @@ internal sealed class H264BaselineSliceEncoder
                 return nc;
             },
             ncLookup: blk => DeriveLumaNc(mbIndex, blk >> 2, blk & 3));
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.Entropy, Stopwatch.GetTimestamp() - stageEntropyStart);
+            H264PInterDiagnostics.t_profileStage = -1;
+        }
 
         // Per H.264 8.3.1.1: when a neighbouring MB is Intra_16x16 its I4x4 prediction
         // mode is treated as DC_PRED (2) by any subsequent I4x4 MB's MPM derivation.
@@ -3549,6 +3697,7 @@ internal sealed class H264BaselineSliceEncoder
         var mbx = mbIndex % _mbW;
         var mby = mbIndex / _mbW;
         var uvW = _width / 2;
+        var collectStage = H264PInterDiagnostics.CollectStageProfile;
 
         Span<sbyte> modeCtx = stackalloc sbyte[LumaCtxSlots];
         FillIntra4x4ModeContext(mbIndex, modeCtx);
@@ -3887,6 +4036,9 @@ internal sealed class H264BaselineSliceEncoder
 
         for (var sIdx = 0; sIdx < 16; sIdx++)
         {
+            var stageBlockDecisionStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+            if (collectStage)
+                H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.IntraDecision;
             var br = ScanIdxToBr[sIdx];
             var bc = ScanIdxToBc[sIdx];
             var raster = (br << 2) + bc;
@@ -3969,6 +4121,12 @@ internal sealed class H264BaselineSliceEncoder
             }
 
             // Bundled residual encode + reconstruct (see H264TransformBundle).
+            var stageBlockResidualStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+            if (collectStage)
+            {
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.IntraDecision, stageBlockResidualStart - stageBlockDecisionStart);
+                H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.Residual;
+            }
             var nz = useTrellis
                 ? H264TransformBundle.EncodeResidual4x4Trellis(
                     srcBlk,
@@ -3995,6 +4153,12 @@ internal sealed class H264BaselineSliceEncoder
                 blkCbp |= 1 << (bi * 2 + bj);
             }
 
+            if (collectStage)
+            {
+                H264PInterDiagnostics.NotifyStage(H264ProfileStage.Residual, Stopwatch.GetTimestamp() - stageBlockResidualStart);
+                H264PInterDiagnostics.t_profileStage = -1;
+            }
+
             var predMode = predModeForRdo;
             var modeFlag = bestMode == predMode;
             bs.WriteBit(modeFlag);
@@ -4017,7 +4181,15 @@ internal sealed class H264BaselineSliceEncoder
 
         // Choose chroma intra prediction mode (H.264 8.3.4 modes 0=DC, 1=Horizontal, 2=Vertical, 3=Plane).
         // SAD-only joint scoring across U+V; same mode applies to both planes per spec.
+        var stageChromaModeStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.IntraDecision;
         var chosenChromaMode = ChooseChromaIntraMode(mbx, mby, u, v, strideUv, _recU.AsSpan(), _recV.AsSpan(), uvW, qpThisMb);
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.IntraDecision, Stopwatch.GetTimestamp() - stageChromaModeStart);
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.Residual;
+        }
         bs.WriteUe((uint)chosenChromaMode);
 
         GetIntraMbNeighbourUsability(mbx, mby, out var chromaTop, out var chromaLeft, out var chromaTopLeft);
@@ -4045,6 +4217,9 @@ internal sealed class H264BaselineSliceEncoder
             cbpChroma = (byte)((anyAcU || anyAcV) ? 2 : 1);
         }
         var cbp = (byte)(blkCbp | (cbpChroma << 4));
+        var stageEntropyStart = collectStage ? Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.Entropy;
         bs.WriteUe((uint)H264Cbp.IntraCbpCodeNum(cbp));
         if (cbp != 0)
         {
@@ -4105,6 +4280,12 @@ internal sealed class H264BaselineSliceEncoder
                     _chromaNonZeros[mbIndex * 8 + comp * 4 + cb] = (byte)chromaNzcCtx[slot];
                 }
             }
+        }
+
+        if (collectStage)
+        {
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.Entropy, Stopwatch.GetTimestamp() - stageEntropyStart);
+            H264PInterDiagnostics.t_profileStage = -1;
         }
     }
 

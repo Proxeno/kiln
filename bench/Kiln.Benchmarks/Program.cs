@@ -142,6 +142,12 @@ public class H264SingleFrameBenchmarks
 
     public static void Main(string[] args)
     {
+        if (args.Length > 0 && args[0] is "--stage-profile" or "--stage-profile-selftest" or "--stage-profile-selftest-closure")
+        {
+            Environment.ExitCode = H264StageProfiler.RunDispatch(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--quick")
         {
             QuickStopwatchBench();

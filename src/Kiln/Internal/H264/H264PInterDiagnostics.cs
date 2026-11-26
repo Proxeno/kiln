@@ -6,6 +6,29 @@ using System.Runtime.CompilerServices;
 namespace Kiln.Internal.H264;
 
 /// <summary>
+/// Disjoint stage buckets measured by <see cref="H264PInterDiagnostics.CollectStageProfile"/>.
+/// The order is the report order; <see cref="SliceTotal"/> is the whole per-slice encode and the
+/// other per-slice stages are disjoint subsets of it (never counted twice).
+/// </summary>
+internal enum H264ProfileStage
+{
+    FramePrologue = 0,
+    SkipPrecheck,
+    MeInteger,
+    MeSubpel,
+    MeSubpartition,
+    IntraDecision,
+    InterPredBuild,
+    Residual,
+    Entropy,
+    Deblock,
+    RateControl,
+    NalGather,
+    SliceTotal,
+    Count,
+}
+
+/// <summary>
 /// Interpolated-string handler for <see cref="H264PInterDiagnostics.TraceMbDecision"/> that skips
 /// all formatting (and evaluation of the interpolation-hole expressions) unless the macroblock is
 /// actually being traced. Without this, every call site materialised its message string per
@@ -184,6 +207,80 @@ internal static class H264PInterDiagnostics
     /// Keep false in normal operation; the perf probe enables it around bounded runs.
     /// </summary>
     public static bool CollectFramePhases { get; set; }
+
+    /// <summary>
+    /// Measurement-only per-stage tick accounting: pass S of the stage profiler. Every stage except
+    /// <see cref="H264ProfileStage.SliceTotal"/> (the whole slice call) is a disjoint subset of it,
+    /// so the per-slice stages sum to at most <see cref="H264ProfileStage.SliceTotal"/> and the
+    /// remainder is reported as unattributed. Keep false in normal operation; instrumentation must
+    /// never change one output byte and costs nothing measurable when off (one static bool read per
+    /// method, <c>Stopwatch.GetTimestamp()</c> only under it).
+    /// </summary>
+    public static bool CollectStageProfile { get; set; }
+
+    /// <summary>
+    /// Stage whose timed region the current thread is inside, or <c>-1</c> outside any timed region.
+    /// Set by the stage timers while <see cref="CollectStageProfile"/> is on; the pass-C counting
+    /// kernel set reads it to attribute each kernel call to the stage that issued it.
+    /// </summary>
+    [ThreadStatic]
+    internal static int t_profileStage = -1;
+
+    private static readonly long[] s_stageTicks = new long[(int)H264ProfileStage.Count];
+
+    /// <summary>Adds one timed region's ticks to <paramref name="stage"/> (gated by <see cref="CollectStageProfile"/>).</summary>
+    internal static void NotifyStage(H264ProfileStage stage, long ticks)
+    {
+        if (!CollectStageProfile)
+            return;
+        Interlocked.Add(ref s_stageTicks[(int)stage], ticks);
+    }
+
+    /// <summary>
+    /// Per-stage tick totals since the last reset (indexed by <see cref="H264ProfileStage"/>).
+    /// With <paramref name="reset"/> the accumulators are zeroed as they are read.
+    /// </summary>
+    public static long[] SnapshotStageTicks(bool reset)
+    {
+        var snapshot = new long[(int)H264ProfileStage.Count];
+        for (var i = 0; i < snapshot.Length; i++)
+        {
+            snapshot[i] = reset
+                ? Interlocked.Exchange(ref s_stageTicks[i], 0)
+                : Interlocked.Read(ref s_stageTicks[i]);
+        }
+
+        return snapshot;
+    }
+
+    private static long s_meIntegerCandidates;
+    private static long s_meSubpelCandidates;
+
+    /// <summary>
+    /// Adds one slice's integer-pel and fractional (sub-pel) candidate evaluations to the process
+    /// totals. Counted by the motion estimator whether or not the search is inside a
+    /// whole-sub-partition region, so the report's candidate mix is not swallowed by that bucket.
+    /// </summary>
+    internal static void NotifyMeCandidates(long integer, long subpel)
+    {
+        if (!CollectStageProfile)
+            return;
+        Interlocked.Add(ref s_meIntegerCandidates, integer);
+        Interlocked.Add(ref s_meSubpelCandidates, subpel);
+    }
+
+    /// <summary>
+    /// Integer-pel and sub-pel candidate totals since the last reset. With <paramref name="reset"/>
+    /// the accumulators are zeroed as they are read.
+    /// </summary>
+    public static (long Integer, long Subpel) SnapshotMeCandidates(bool reset)
+    {
+        return reset
+            ? (Interlocked.Exchange(ref s_meIntegerCandidates, 0),
+                Interlocked.Exchange(ref s_meSubpelCandidates, 0))
+            : (Interlocked.Read(ref s_meIntegerCandidates),
+                Interlocked.Read(ref s_meSubpelCandidates));
+    }
 
     /// <summary>
     /// Measurement-only A/B kill switch for the effort-balanced slice partition: when true the
