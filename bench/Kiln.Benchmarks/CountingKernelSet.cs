@@ -25,6 +25,8 @@ internal sealed class CountingKernelSet : IH264KernelSet
         Sad16x8,
         Sad8x16,
         Sad8x8,
+        Sad16x16x4,
+        Sad8x8x4,
         SadMany4x4,
         SadIntra16x16,
         SadChromaPair,
@@ -55,6 +57,8 @@ internal sealed class CountingKernelSet : IH264KernelSet
         nameof(IH264KernelSet.Sad16x8),
         nameof(IH264KernelSet.Sad8x16),
         nameof(IH264KernelSet.Sad8x8),
+        nameof(IH264KernelSet.Sad16x16x4),
+        nameof(IH264KernelSet.Sad8x8x4),
         nameof(IH264KernelSet.SadMany4x4),
         nameof(IH264KernelSet.SadIntra16x16),
         nameof(IH264KernelSet.SadChromaPair),
@@ -178,6 +182,26 @@ internal sealed class CountingKernelSet : IH264KernelSet
     {
         Count(Member.Sad8x8);
         return _inner.Sad8x8(a, strideA, b, strideB);
+    }
+
+    public void Sad16x16x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads)
+    {
+        Count(Member.Sad16x16x4);
+        _inner.Sad16x16x4(a, strideA, b0, b1, b2, b3, strideB, sads);
+    }
+
+    public void Sad8x8x4(
+        ReadOnlySpan<byte> a, int strideA,
+        ReadOnlySpan<byte> b0, ReadOnlySpan<byte> b1,
+        ReadOnlySpan<byte> b2, ReadOnlySpan<byte> b3,
+        int strideB, Span<int> sads)
+    {
+        Count(Member.Sad8x8x4);
+        _inner.Sad8x8x4(a, strideA, b0, b1, b2, b3, strideB, sads);
     }
 
     public void SadMany4x4(ReadOnlySpan<byte> src, ReadOnlySpan<byte> predConcat, Span<int> sads, int count)

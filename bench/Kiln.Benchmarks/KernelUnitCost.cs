@@ -69,6 +69,7 @@ internal static class KernelUnitCost
         for (var i = 0; i < manyPreds.Length; i++)
             manyPreds[i] = (byte)(i * 7);
         var manyOut = new int[9];
+        var sadOut4 = new int[4];
 
         var src16 = blockA;
         var pred16 = blockB;
@@ -113,6 +114,10 @@ internal static class KernelUnitCost
             () => kernels.Sad8x16(blockA, stride16, blockB, stride16));
         Time(nameof(IH264KernelSet.Sad8x8),
             () => kernels.Sad8x8(blockA, 8, blockB, 8));
+        Time(nameof(IH264KernelSet.Sad16x16x4),
+            () => kernels.Sad16x16x4(blockA, stride16, blockB, blockB, blockB, blockB, stride16, sadOut4));
+        Time(nameof(IH264KernelSet.Sad8x8x4),
+            () => kernels.Sad8x8x4(blockA, 8, blockB, blockB, blockB, blockB, 8, sadOut4));
         Time(nameof(IH264KernelSet.SadMany4x4),
             () => kernels.SadMany4x4(manySrc, manyPreds, manyOut, 9));
         Time(nameof(IH264KernelSet.SadIntra16x16),
