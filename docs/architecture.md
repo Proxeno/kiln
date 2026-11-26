@@ -1,377 +1,460 @@
 # Architecture
 
-This document describes how Kiln turns raw I420 frames into an Annex B H.264
-baseline-profile bitstream, how its SIMD kernels are structured and selected,
-and which subsystems are production-used versus experimental. It is written
-for contributors; it does not restate the public API (see the README).
+This document explains how Kiln turns raw I420 frames into an Annex B H.264 stream, how its SIMD
+kernels are organised and selected, and how the rate-control layer sits on top of the encoder. It
+is written for contributors. For the public API, start with the [README](../README.md).
+
+Spec references (`§8.7`, `Table 8-17`) are to ITU-T H.264.
+
+- [Encode pipeline](#encode-pipeline)
+- [Slice threading](#slice-threading)
+- [SIMD kernel sets](#simd-kernel-sets)
+- [Rate control and recovery](#rate-control-and-recovery)
+- [What can change mid-stream](#what-can-change-mid-stream)
+- [Diagnostics](#diagnostics)
 
 ## Encode pipeline
 
-### Frame orchestration — `H264BaselineEncoder`
+![Encode pipeline: an I420 frame goes through frame setup, then slices encoded in parallel (predict, transform and quantize, CAVLC, reconstruct), then NAL packaging into an Annex B access unit](assets/pipeline.svg)
 
-[`src/Kiln/H264BaselineEncoder.cs`](../src/Kiln/H264BaselineEncoder.cs) is the
-public entry point (`H264BaselineEncoder.EncodeFrame`). Per encoder instance
-it owns:
+### Frame setup: `H264BaselineEncoder`
 
-- One `H264FrameSharedState` — the picture-sized reconstruction, reference,
-  and per-MB neighbour caches shared by every slice.
-- A pool of up to 8 `H264BaselineSliceEncoder` instances (one per parallel
-  slice), each with independent RBSP buffer, rate control, and slice-header
-  state.
-- The SPS/PPS RBSP, built once at construction by `H264ParameterSets` from
-  width/height/profile/level/`MaxReferenceFrames`.
+[`src/Kiln/H264BaselineEncoder.cs`](../src/Kiln/H264BaselineEncoder.cs) is the public entry point.
+An encoder instance owns:
 
-**Coded vs display dimensions.** The public API speaks *display* size
-(`Width`/`Height`, what the caller passed and what decoders output); everything
-below the orchestrator speaks *coded* size (`CodedWidth`/`CodedHeight`, the
-display size rounded up to the 16×16 macroblock grid). When they differ, the
-constructor sizes all internal state from the coded dimensions and the SPS
-carries a frame-cropping block (§7.3.2.1.1) signalling the display size —
-right/bottom offsets only, in 2-luma-sample crop units (§7.4.2.1.1, Table 6-1),
-which is why dimensions must be even. Per `EncodeFrame`,
-`H264SourcePlaneExtender` extends the caller's display-sized I420 planes to
-coded size by replicating the last real column/row (not zero-fill: the padding
-is coded, deblocked, and stored in the DPB, and the §8.7 loop filter reads it
-into activity tests that update *visible* samples across the crop edge;
-replication also lets the padding MBs collapse to CBP=0/P_Skip). The extension
-step is skipped entirely for aligned dimensions, so those streams remain
-byte-identical to earlier releases. Cropping is display-stage-only in H.264:
-reconstruction, ME, deblocking, and the DPB all operate on the uncropped coded
-picture — exactly as a conformant decoder does — so `LastReconstructedY/U/V`
-return the coded plane (stride `CodedWidth`);
-`CopyLastReconstructedTo` provides a display-sized crop.
+- One `H264FrameSharedState`: the picture-sized reconstruction, the reference pictures, and the
+  per-macroblock neighbour caches that every slice shares.
+- Up to 8 `H264BaselineSliceEncoder` instances, one per slice. Each has its own RBSP buffer,
+  rate-control state and slice-header state.
+- The SPS and PPS, built once at construction by `H264ParameterSets`.
 
-Per `EncodeFrame` call it decides whether the picture is IDR — frame 0,
-`forceKeyframe`, or `codedFrameIndex % KeyframeIntervalFrames == 0` — resets
-`h264FrameNum` on IDR, emits SPS+PPS ahead of IDR NALs only (not every P
-picture — repeating parameter sets in-band before every P-frame is
-non-conventional and some hardware decoders mishandle it), and dispatches to
-either the single-slice path (`_sliceEncoders[0].EncodeSliceRbsp`, kept
-byte-identical to the pre-multi-slice encoder) or `EncodeFrameMultiSlice`.
+Each `EncodeFrame` call does the following:
 
-**Slice parallelism.** When `SliceCount` (or its auto-derived value,
-`min(mbRows, max(1, ProcessorCount-1), 8)`) is greater than 1,
-`EncodeFrameMultiSlice` pins the caller's Y/U/V spans, then runs
-`Parallel.For` over slices on a dedicated `LimitedConcurrencyLevelTaskScheduler`
-— a small fixed pool of background threads private to slice encoding, used
-instead of the shared `ThreadPool` to avoid injection-delay jitter. Each
-slice writes only its own MB-row range of the shared reconstruction/reference
-arrays, so the writes are disjoint and race-free; the once-per-frame reset
-(`BeginFrame`) and reference padding (`PadReconstructedReference`) happen
-outside the parallel region under a single-threaded fence. Multi-slice
-pictures set `disable_deblocking_filter_idc=2` (filter within slice only).
+1. **Extends the source if needed.** See [Coded and display size](#coded-and-display-size).
+2. **Decides the picture type.** The picture is an IDR when it is the first frame, when
+   `forceKeyframe` is set, or when the frame index is a multiple of `KeyframeIntervalFrames`.
+   Otherwise it is a P picture.
+3. **Writes parameter sets.** SPS and PPS go ahead of IDR pictures only. Repeating them before
+   every P picture is unusual, and some hardware decoders handle it badly. The one exception is the
+   first frame of a gradual-intra-refresh wave, which repeats SPS and PPS and adds a
+   recovery-point SEI so that a decoder can join there.
+4. **Encodes the slices.** With one slice, `_sliceEncoders[0].EncodeSliceRbsp` runs on the calling
+   thread. With more, `EncodeFrameMultiSlice` runs them in parallel. See
+   [Slice threading](#slice-threading).
+5. **Wraps each slice in a NAL unit** and appends it to the caller's buffer.
+6. **Measures the content.** `UpdateContentActivity` derives the motion, texture and scene-change
+   signals that the rate controller reads (`LastFrameMotionComplexity` and its siblings).
 
-### Per-slice macroblock loop — `H264BaselineSliceEncoder`
+### Coded and display size
+
+The public API speaks *display* size: `Width` and `Height` are what the caller passed and what a
+decoder outputs. Everything below `H264BaselineEncoder` works in *coded* size, `CodedWidth` and
+`CodedHeight`, which is the display size rounded up to the 16×16 macroblock grid.
+
+When the two differ:
+
+- The SPS carries a frame-cropping block (§7.3.2.1.1) that signals the display size. Only the
+  right and bottom offsets are used, in units of 2 luma samples (§7.4.2.1.1, Table 6-1). That is
+  why dimensions must be even.
+- `H264SourcePlaneExtender` extends the caller's planes to coded size by replicating the last real
+  column and row. Replication matters: the padding is coded, deblocked and stored as reference,
+  and the loop filter (§8.7) reads it when it filters visible samples next to the crop edge.
+  Replicated padding also tends to code as `P_Skip`.
+- `LastReconstructedY`, `LastReconstructedU` and `LastReconstructedV` return the coded planes,
+  because that is what must match a decoder's reference pictures. `CopyLastReconstructedTo` gives
+  a display-sized copy.
+
+For dimensions that are already multiples of 16 the extension step is skipped.
+
+### The macroblock loop: `H264BaselineSliceEncoder`
 
 [`src/Kiln/Internal/H264/H264BaselineSliceEncoder.cs`](../src/Kiln/Internal/H264/H264BaselineSliceEncoder.cs)
-(~4,200 lines) does the real work, in `EncodeSliceRbsp`. Per macroblock, in
-raster order within the slice's row range:
+does the coding work, in `EncodeSliceRbsp`. For each macroblock in the slice, in raster order:
 
-1. **P-inter attempt** (P-slices with a valid reference only):
-   `TryEncodePInterMacroblock` calls into `H264MotionEstimator` for
-   integer-pel search (hex/diamond by default, exhaustive when
-   `FastSearch=false`) plus qpel refinement, SAD or SATD-scored
-   (`UseMotionSatd`), MV median prediction per §8.4.1.3.1, and 16×16 /
-   16×8 / 8×16 / 8×8 partition selection (`SearchMbSubPartitions`). Skip
-   (`P_Skip`) is decided here too. When `EnableIntraInPFallback` is set
-   (default), a Phase-2b step re-scores the inter winner against its best
-   Intra_16×16 candidate and lets the cheaper one win — this rescues
-   leading-edge scroll/occlusion/scene-change content invisible in every
-   reference.
-2. **Intra fallback** — `WriteMacroblock` for I-slice MBs and any P-slice MB
-   that didn't take the inter path: Intra_4×4 (9 modes, RD-selected via SAD
-   or SATD + λ) and Intra_16×16 (4 modes; `EncodeI16x16Macroblock` handles
-   the Hadamard-transformed luma DC path). Mode-candidate availability
-   follows §8.3.1.1/§8.3.1.2 neighbour rules.
-3. **Transform/quant** — `H264BlockTransform` (scalar) and its SIMD
-   counterparts `H264BlockTransformSimd` / `H264Dct4x4Simd` /
-   `H264BlockTransformDequantSimd` do forward 4×4 DCT, quantization, and
-   the luma-DC Hadamard for I16×16 (`H264LumaDcHadamard`) / chroma DC
-   (`H264ChromaDcScale`). `TrellisLevel=1` runs `H264TrellisQuant4x4`, a
-   greedy per-coefficient RD trellis pass.
-4. **Entropy coding (CAVLC)** — `H264CavlcResidual` walks each 4×4 (and
-   chroma-DC) block using tables from `H264CavlcTables`, writing directly
-   into the slice's bit buffer.
-5. **Bitstream assembly** — `H264RbspBitBuffer` is the MSB-first bit
-   accumulator; `H264RbspEmulation` applies emulation-prevention (EBSP);
-   `H264AnnexB.AppendNal` wraps each NAL with a start code.
-6. **Reconstruction & deblocking** — every MB's residual is added back into
-   the shared reconstruction planes as it's coded (needed as intra
-   prediction input for later MBs in the same slice/frame). After the MB
-   loop, `ApplyInLoopDeblock` (single-slice) or `ApplyInLoopDeblockScoped`
-   (multi-slice, row-range-bounded) runs `H264DeblockingFilter` /
-   `H264DeblockingFilterSimd`, skipped entirely when
-   `LightweightDeblocking=true`.
-7. **Reference handling** — `RotateDpbAndPad` (single-slice) or the
-   orchestrator's `PadReconstructedReference` call (multi-slice) rotates the
-   2-entry DPB (`H264FrameSharedState.MaxDpbSize`) and rebuilds the padded
-   reference halo via `H264ReferencePicturePadder` (§8.4.2.1 border
-   replication — 16px luma halo, 8px chroma halo, sized for the 6-tap qpel
-   and bilinear chroma filters).
+1. **Inter prediction** (P pictures with a valid reference). `TryEncodePInterMacroblock` asks
+   `H264MotionEstimator` for an integer-pel search (hexagon and diamond by default, exhaustive
+   when `FastSearch` is false) and then a quarter-pel refinement. Candidates are scored with SATD
+   or SAD (`UseMotionSatd`), with motion vectors predicted per §8.4.1.3. `SearchMbSubPartitions`
+   chooses among 16×16, 16×8, 8×16 and 8×8 partitions. `P_Skip` is decided here too.
+2. **Intra inside P pictures.** When `EnableIntraInPFallback` is set (the default), the inter
+   winner is scored against the best Intra 16×16 candidate and the cheaper one wins. Where inter
+   prediction did badly, Intra 4×4 is tried as well. This rescues content that no reference
+   contains, such as the leading edge of a scroll, an uncovered background or a scene change. The
+   code and the diagnostics call this step *Phase 2b*.
+3. **Intra coding.** `WriteMacroblock` handles every macroblock of an IDR picture and any
+   macroblock in a P picture that did not take the inter path. It chooses between Intra 4×4 (9
+   modes) and Intra 16×16 (4 modes) by cost. Which modes are available follows the neighbour rules
+   of §8.3.1.1 and §8.3.1.2.
+4. **Transform and quantization.** `H264BlockTransform` is the scalar 4×4 forward transform and
+   quantizer. `H264BlockTransformSimd`, `H264Dct4x4Simd` and `H264BlockTransformDequantSimd` are
+   the SIMD versions. `H264LumaDcHadamard` and `H264ChromaDcScale` handle the DC transforms.
+   `TrellisLevel = 1` adds `H264TrellisQuant4x4`, a greedy per-coefficient pass.
+5. **Entropy coding.** `H264CavlcResidual` writes each 4×4 block with the tables in
+   `H264CavlcTables`, directly into the slice's bit buffer (`H264RbspBitBuffer`).
+6. **Reconstruction.** The decoded residual is added back into the shared reconstruction planes as
+   each macroblock is coded, because later macroblocks predict from it.
 
-Per-MB QP comes from an internal, encoder-private `H264RateControl`
-([`Internal/H264/H264RateControl.cs`](../src/Kiln/Internal/H264/H264RateControl.cs)),
-a proportional controller active only when a per-frame bit budget is in
-effect — the constructor's `TargetBitsPerFrame`, or a positive per-picture
-override passed to `EncodeFrame(targetBitsPerFrame:)` (how the streaming
-session drives a live bitrate target); constant-QP otherwise. This is a
-different, lower-level thing than the public `Kiln.RateControl` namespace
-described below — see that section for how the two relate.
+After the loop:
 
-## SIMD kernel structure
+7. **Deblocking.** `H264DeblockingFilter` or `H264DeblockingFilterSimd` filters the slice's rows.
+   `LightweightDeblocking` skips this step and signals that in the slice header.
+8. **Reference update.** The reconstruction becomes a reference picture.
+   `H264ReferencePicturePadder` rebuilds the border around it (§8.4.2.1): 16 samples for luma and
+   8 for chroma, enough for the 6-tap luma and bilinear chroma interpolation filters. The encoder
+   keeps at most 2 reference pictures (`H264FrameSharedState.MaxDpbSize`).
 
-Every hot per-block/per-MB operation (SAD, SATD, intra prediction, DCT/quant,
-deblocking, qpel/bilinear interpolation, source gather) is abstracted behind
-[`IH264KernelSet`](../src/Kiln/Internal/H264/IH264KernelSet.cs), an internal
-interface. `H264BaselineSliceEncoder` holds one resolved `IH264KernelSet`
-per encoder instance — **no per-call ISA dispatch**, the kernel set is picked
-once at construction:
+Back in `H264BaselineEncoder`, `H264AnnexB.AppendNal` turns each slice's RBSP into a NAL unit:
+`H264RbspEmulation` inserts emulation-prevention bytes, and a start code and NAL header go in
+front.
 
-```csharp
-// H264KernelSet.CreateBest()
-if (Avx2.IsSupported)         return new Avx2KernelSet();
-if (Ssse3.IsSupported)        return new Ssse3KernelSet();
-if (AdvSimd.Arm64.IsSupported) return new Neon64KernelSet();
-if (AdvSimd.IsSupported)      return new NeonKernelSet();
-return new ScalarKernelSet();
+### Per-macroblock QP
+
+Inside the encoder, `H264RateControl`
+([`Internal/H264/H264RateControl.cs`](../src/Kiln/Internal/H264/H264RateControl.cs)) adjusts QP
+per macroblock. It is active only when a per-frame bit budget is set, either through
+`TargetBitsPerFrame` at construction or through `EncodeFrame(targetBitsPerFrame:)`. Without a
+budget the encoder runs at constant QP. Multi-slice frames give each slice a share of the budget.
+
+This is separate from the public `Kiln.RateControl` namespace, which decides *what the budget
+should be*. See [Rate control and recovery](#rate-control-and-recovery).
+
+## Slice threading
+
+```mermaid
+flowchart TB
+    caller["Caller thread: EncodeFrame"]
+    part["Choose slice boundaries<br/>(ComputeSlicePartition)"]
+    begin["Reset shared per-frame state<br/>(BeginFrame)"]
+    caller --> part --> begin
+
+    subgraph pool["Dedicated slice threads (Parallel.For)"]
+        direction LR
+        s0["Slice 0<br/>rows 0 to a"]
+        s1["Slice 1<br/>rows a to b"]
+        sn["Slice N-1<br/>rows c to end"]
+    end
+
+    begin --> pool
+    gather["Write slice NAL units in order"]
+    pad["Rotate and pad the reference<br/>(PadReconstructedReference)"]
+    pool --> gather --> pad
 ```
-([`Internal/H264/H264KernelSet.cs`](../src/Kiln/Internal/H264/H264KernelSet.cs))
 
-`H264BaselineEncoderOptions.PreferHardwareIntrinsics` (default `true`)
-gates this: when `false`, the encoder always uses `ScalarKernelSet`
-regardless of what the CPU supports.
+A frame is cut into horizontal bands of macroblock rows, one slice each. `SliceCount` sets how
+many. `null` means `min(macroblock rows, max(1, ProcessorCount − 1), 8)`.
 
-`SimdKernelSetBase` ([`Internal/H264/SimdKernelSetBase.cs`](../src/Kiln/Internal/H264/SimdKernelSetBase.cs))
-is an abstract base shared by every intrinsics-backed set: it implements
-SATD, intra prediction, transform/quant, deblocking, interpolation, and
-source gather identically (delegating to shared SIMD helper types like
-`H264MotionSatd`, `H264Intra4X4Prediction`, `H264QpelLumaInterp`), and leaves
-only the SAD family (`Sad16x16`/`Sad16x8`/`Sad8x16`/`Sad8x8`/`SadMany4x4`/
-`SadIntra16x16`/`SadChromaPair`) abstract for each platform tier to override
-with its own intrinsics. Concrete sets:
+**Threads.** Slices run under `Parallel.For` on a `LimitedConcurrencyLevelTaskScheduler`. This is
+a small pool of background threads that all encoders in the process share and that is separate
+from the .NET thread pool, which avoids the thread-pool's injection delays. It holds
+`min(8, max(1, ProcessorCount − 1))` threads.
 
-| Kernel set | ISA | File |
-|---|---|---|
-| `Avx2KernelSet` | x64 AVX2 | [`Internal/H264/Avx2KernelSet.cs`](../src/Kiln/Internal/H264/Avx2KernelSet.cs) |
-| `Ssse3KernelSet` | x64 SSSE3 | [`Internal/H264/Ssse3KernelSet.cs`](../src/Kiln/Internal/H264/Ssse3KernelSet.cs) |
-| `Neon64KernelSet` | arm64 AdvSimd.Arm64 | [`Internal/H264/Neon64KernelSet.cs`](../src/Kiln/Internal/H264/Neon64KernelSet.cs) |
-| `NeonKernelSet` | arm AdvSimd | [`Internal/H264/NeonKernelSet.cs`](../src/Kiln/Internal/H264/NeonKernelSet.cs) |
-| `ScalarKernelSet` | none (pure C#) | [`Internal/H264/ScalarKernelSet.cs`](../src/Kiln/Internal/H264/ScalarKernelSet.cs) |
+**Why it is race-free.** Each slice writes only its own rows of the shared reconstruction and
+per-macroblock arrays, so writes never overlap. The two steps that touch the whole frame,
+`BeginFrame` before and `PadReconstructedReference` after, run on the calling thread outside the
+parallel region. The caller's input planes are pinned for the duration so that worker threads can
+read them without a copy.
 
-**Parity-test philosophy.** Every SIMD code path has a corresponding scalar
-implementation, and every kernel has a test asserting they produce identical
-output — not just similar, bit-identical, since the encoder's reconstruction
-must stay in sync with what the CAVLC/bitstream layer commits to. Tests
-follow the pattern `<Thing>_simd_matches_scalar_when_intrinsics_available`
-and self-skip via an `IsSupported` check when the host CPU (or CI runner)
-lacks the target ISA. See `tests/Kiln.Tests/H264SimdParityTests.cs`,
+**Deblocking.** Multi-slice pictures set `disable_deblocking_filter_idc = 2`, which filters inside
+each slice but not across slice boundaries. That is what lets each slice deblock its own rows
+independently.
+
+**Where the boundaries go.** The frame takes as long as its slowest slice, and equal-height slices
+are rarely equal work, because motion tends to concentrate in part of the picture.
+`ComputeSlicePartition` therefore moves the boundaries so that slices carry similar predicted
+work. Its signal is the motion-search effort each macroblock row consumed over the previous 8
+frames. That is a count of candidate evaluations and not a time measurement, so the partition is
+the same on every run and the output stays deterministic. The spec leaves boundary placement to
+the encoder (§7.4.3). With SAD-scored search (`UseMotionSatd = false`) the slices stay equal in
+height.
+
+**The single-slice path** does not use the pool at all. One slice encoder does the reset, the
+macroblock loop, deblocking and the reference update on the calling thread.
+
+## SIMD kernel sets
+
+Every hot per-block operation sits behind one internal interface,
+[`IH264KernelSet`](../src/Kiln/Internal/H264/IH264KernelSet.cs): SAD, SATD, SSD, variance, intra
+prediction, transform and quantization, deblocking, and luma and chroma interpolation. An encoder
+resolves one kernel set at construction and uses it for its whole life. Nothing is dispatched per
+call.
+
+```mermaid
+flowchart TB
+    start(["H264KernelSet.CreateBest()"])
+    opt{"PreferHardwareIntrinsics?"}
+    avx2{"Avx2.IsSupported"}
+    ssse3{"Ssse3.IsSupported"}
+    neon64{"AdvSimd.Arm64.IsSupported"}
+    neon{"AdvSimd.IsSupported"}
+    A["Avx2KernelSet"]
+    S["Ssse3KernelSet"]
+    N64["Neon64KernelSet"]
+    N["NeonKernelSet"]
+    SC["ScalarKernelSet"]
+
+    start --> opt
+    opt -- no --> SC
+    opt -- yes --> avx2
+    avx2 -- yes --> A
+    avx2 -- no --> ssse3
+    ssse3 -- yes --> S
+    ssse3 -- no --> neon64
+    neon64 -- yes --> N64
+    neon64 -- no --> neon
+    neon -- yes --> N
+    neon -- no --> SC
+```
+
+| Kernel set | Target | Derives from | File |
+|---|---|---|---|
+| `Avx2KernelSet` | x64 with AVX2 | `Ssse3KernelSet` | [`Avx2KernelSet.cs`](../src/Kiln/Internal/H264/Avx2KernelSet.cs) |
+| `Ssse3KernelSet` | x64 with SSSE3 | `SimdKernelSetBase` | [`Ssse3KernelSet.cs`](../src/Kiln/Internal/H264/Ssse3KernelSet.cs) |
+| `Neon64KernelSet` | arm64 (`AdvSimd.Arm64`) | `NeonKernelSet` | [`Neon64KernelSet.cs`](../src/Kiln/Internal/H264/Neon64KernelSet.cs) |
+| `NeonKernelSet` | Arm (`AdvSimd`) | `SimdKernelSetBase` | [`NeonKernelSet.cs`](../src/Kiln/Internal/H264/NeonKernelSet.cs) |
+| `ScalarKernelSet` | any CPU | none | [`ScalarKernelSet.cs`](../src/Kiln/Internal/H264/ScalarKernelSet.cs) |
+
+[`SimdKernelSetBase`](../src/Kiln/Internal/H264/SimdKernelSetBase.cs) implements the kernels whose
+SIMD code is shared across architectures, by delegating to helper types such as `H264MotionSatd`,
+`H264Intra4X4Prediction` and `H264QpelLumaInterp`. It leaves the SAD family, the SSD kernels and
+`VarianceMb16x16` abstract for each architecture to supply. The wider set in each family
+(`Avx2KernelSet`, `Neon64KernelSet`) overrides only the kernels where the wider instructions help
+and inherits the rest.
+
+### Parity tests
+
+Every SIMD path has a scalar implementation, and tests assert that the two produce *identical*
+output. Close is not enough: the encoder's reconstruction has to match a decoder's exactly, or
+the error compounds through every later P picture.
+
+Parity tests check `IsSupported` and pass without asserting on a CPU that lacks the instruction
+set. They live in `tests/Kiln.Tests`, in files such as `H264SimdParityTests.cs`,
 `H264KernelSetPredictParityTests.cs`, `H264KernelSetTransformParityTests.cs`,
 `H264DeblockingFilterSimdParityTests.cs`, `H264QpelLumaInterpSimdParityTests.cs`,
-`H264BilinearChromaInterpSimdParityTests.cs`, `H264MotionSadAvx2ParityTests.cs`,
-`H264MotionSatdParityTests.cs`, and the `H264Intra4x4*`/`H264Intra16x16*` SIMD
-test files. CI runs the full suite on `ubuntu-latest` and `windows-latest`
-(x64: AVX2 and SSSE3) and `macos-latest` (arm64: NEON), so both ISA families
-are exercised on every push — see [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+`H264BilinearChromaInterpSimdParityTests.cs`, `H264MotionSadAvx2ParityTests.cs` and
+`H264MotionSatdParityTests.cs`.
 
-## Rate control & recovery (public, production-used)
+CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs the suite on `ubuntu-latest`
+and `windows-latest` (x64) and on `macos-latest` (arm64), so both instruction-set families run on
+every push. The x64 runners support AVX2, so `CreateBest()` returns `Avx2KernelSet` there.
 
-`Kiln.RateControl` ([`src/Kiln/RateControl/`](../src/Kiln/RateControl/)) and
-`Kiln.Recovery` ([`src/Kiln/Recovery/`](../src/Kiln/Recovery/)) are a
-frame-level decision layer above the encoder, and
-**`Kiln.H264StreamingSession`**
-([`src/Kiln/H264StreamingSession.cs`](../src/Kiln/H264StreamingSession.cs))
-is the feedback path connecting the two: it owns one `H264BaselineEncoder`
-plus one adaptive controller, and per frame turns `EncoderNetworkFeedback`
-into applied encoder settings — slice QP, a per-picture bit budget
-(`TargetBitrateBps / TargetFps`), recovery IDRs, and live speed-mode
-changes. A streaming server calls
-`session.EncodeFrame(y, u, v, …, annexB, feedback)` and gets adaptive
-encoding out without writing the glue itself. Callers who want to run their
-own loop can still drive `LowLatencyRateController.Decide(...)` directly
-and apply decisions with the same primitives the session uses
-(`EncodeFrame(sliceLumaQp:, targetBitsPerFrame:, forceKeyframe:)` and
-`ApplySpeedMode`/`ApplySpeedKnobs`).
+## Rate control and recovery
 
-- `LowLatencyRateController` ([`RateControl/LowLatencyRateController.cs`](../src/Kiln/RateControl/LowLatencyRateController.cs))
-  is the per-frame decision core (bitrate up/downshift, QP tracking ~+6 per
-  halving of the target bitrate, max-frame-bytes budget). Congestion is
-  declared on packet loss, NACK bursts, send-queue backlog, or an RTT spike —
-  the RTT test is relative to a tracked baseline (fastest sample seen, with
-  a slow deterministic upward drift so a route change becomes the new
-  baseline): spike when RTT exceeds both
-  `baseline × CongestionRttMultiplier` and the absolute
-  `CongestionRttFloor` (default 50 ms), so a high-propagation-RTT link is
-  not treated as permanently congested. Two further feedback inputs shape
-  the bitrate path: a caller-supplied transport bandwidth estimate
-  (`EncoderNetworkFeedback.EstimatedAvailableBitrateBps`, from GCC /
-  transport-cc / REMB; 0 = none supplied) is a hard ceiling — a collapsing
-  estimate caps the target immediately, the loss/RTT heuristics keep
-  cutting below it, and a recovering estimate only reopens the ordinary
-  stability-window upshift — and a jitter spike (jitter above both
-  `baseline × JitterSpikeMultiplier` and `JitterSpikeFloor`, the same
-  baseline-relative treatment) is a queueing early warning that holds the
-  upshift without ever cutting, since rising jitter without loss is
-  transient queueing, where backing off is the wrong response. **Ownership
-  contract:** it owns exactly one `H264RecoveryPolicy` instance and invokes
-  `DecideRecovery` exactly once per `Decide()` call, folding the result in.
-  Composing code must not call the recovery policy a second time or
-  construct a second instance — doing so double-advances the stateful IDR
-  cooldown and halves keyframe-storm protection (a regression this codebase
-  has hit before; see the class doc comment). Composing layers report what
-  they actually applied via `SyncAppliedState(width, height, fps, mode)`;
-  without it the controller's internal geometry state stays at its
-  constructor defaults and ladder-based adaptation walks from fiction.
-- `RateControlConfig` / `RateControlState` hold tunables (bitrate bounds, QP
-  bounds, burst allowance, downshift factor, `SupportedWidths`/`Heights`/
-  `Fps` ladder rungs) and mutable per-session state.
-- `Kiln.Recovery.H264RecoveryPolicy` ([`Recovery/H264RecoveryPolicy.cs`](../src/Kiln/Recovery/H264RecoveryPolicy.cs))
-  turns client PLI/FIR feedback into `ForceIdr`/`EnableIntraRefresh`
-  decisions, with an IDR cooldown to prevent keyframe storms (FIR takes
-  priority over PLI). Lowest priority: when the encoder reports the previous
-  frame was a scene cut (`EncoderPipelineStats.SceneChangeDetected`, a P
-  frame that coded a majority of MBs intra) and the cooldown is clear, the
-  next frame is forced to an IDR — a clean random-access point at the scene
-  boundary. In cooldown a scene change does nothing (nothing was lost, so
-  there is no intra-refresh fallback).
-- `IdrBudget` ([`Recovery/IdrBudget.cs`](../src/Kiln/Recovery/IdrBudget.cs))
-  computes the larger byte budget IDR frames are allowed (2× the normal
-  per-frame budget by default).
-- Gradual intra refresh is a real encoder feature (the former
-  `IIntraRefreshPolicy` interface and its no-op stub are gone): construct
-  the encoder with `H264BaselineEncoderOptions.IntraRefreshPeriodFrames > 0`
-  and call `H264BaselineEncoder.RequestIntraRefresh()` to start a wave — a
-  band of forced-intra MB columns sweeping the picture over up to N frames,
-  with `constrained_intra_pred_flag` in the PPS and motion vectors of
-  already-refreshed MBs restricted to the refreshed region of their
-  reference, so a decoder joining at the wave's first access unit (which
-  repeats SPS/PPS and carries a recovery-point SEI, `exact_match_flag=1`)
-  reconstructs the picture bit-exactly once the wave completes. The
-  session acts on a recovery decision that asks for intra refresh (a
-  PLI/FIR during IDR cooldown) by starting/queueing a wave when the
-  feature is enabled, and still surfaces the request on the per-frame
-  result as `IntraRefreshRequested`; with the feature disabled it encodes
-  a normal frame and only surfaces the request.
+Two public namespaces sit above the encoder and decide, frame by frame, what it should be asked to
+do: `Kiln.RateControl` ([`src/Kiln/RateControl/`](../src/Kiln/RateControl/)) and `Kiln.Recovery`
+([`src/Kiln/Recovery/`](../src/Kiln/Recovery/)).
+[`H264StreamingSession`](../src/Kiln/H264StreamingSession.cs) connects them to an encoder.
 
-### What can change when: the three adaptation tiers
+```mermaid
+flowchart LR
+    fb["EncoderNetworkFeedback<br/>(from your transport)"]
+    stats["EncoderPipelineStats<br/>(previous frame)"]
+    subgraph ctl["H264AdaptiveRateController (internal)"]
+        direction TB
+        ll["LowLatencyRateController<br/>bitrate, QP"]
+        rec["H264RecoveryPolicy<br/>IDR, intra refresh"]
+        ad["AdaptationPolicy<br/>speed mode, fps, resolution"]
+        ll --> rec
+    end
+    dec["EncoderAdaptationDecision"]
+    enc["H264BaselineEncoder"]
+    fb --> ctl
+    stats --> ctl
+    ctl --> dec --> enc
+    enc -. "bytes, QP, content signals" .-> stats
+```
 
-Every adaptation input falls into one of three tiers, and the tiering is
-what an integrator must understand to change anything mid-stream safely:
+Per frame the session builds `EncoderPipelineStats` from the previous frame, asks the controller
+for an `EncoderAdaptationDecision`, applies it, and encodes. What it applies:
 
-1. **Free per frame** — inputs that touch no bitstream-structural state.
-   Slice luma QP (`EncodeFrame(sliceLumaQp:)`, coded as `slice_qp_delta`),
-   the per-picture bit budget (`EncodeFrame(targetBitsPerFrame:)`, driving
-   the per-MB `mb_qp_delta` chain), forced IDRs
-   (`EncodeFrame(forceKeyframe: true)`), and the three search-only speed
-   knobs (`UseMotionSatd`, `SubPartitionRangeCap`,
-   `MotionSearchEffortCapPerMb`, reassigned live via
-   `H264BaselineEncoder.ApplySpeedMode`/`ApplySpeedKnobs`). Search knobs
-   change which prediction the encoder *chooses*, never how a choice is
-   coded, so any change at a frame boundary yields a stream a decoder reads
-   exactly as if those values had been set from the start.
-2. **Bounded by the SPS: the reference-frame count.** `max_num_ref_frames`
-   is signalled once in the SPS and a decoder sizes its DPB from it
-   (§7.4.2.1) — but it is an *upper bound*, not a per-slice requirement.
-   Below it, the operating reference count is a per-frame decision: each P
-   slice signals its own active count (`num_ref_idx_active_override_flag`,
-   §7.3.3), derived here from the encoder-side DPB occupancy. Lowering the
-   cap takes effect immediately (the occupancy is clamped); raising it takes
-   effect one frame later, after the reference rotation refills the retired
-   DPB slot from fresh reconstructions — the decoder's sliding window
-   (§8.2.5.3) retained both pictures throughout, so **no IDR is needed in
-   either direction**. This is why `SpeedMode` swaps freely mid-GOP.
-   The one hard rule: the cap can never exceed the signalled maximum, so
-   `ApplySpeedKnobs` clamps to it. The session therefore reserves the full
-   DPB in the SPS (signalling 2) unless the caller explicitly set
-   `MaxReferenceFrames` — an explicit value (e.g. 1 for strict hardware
-   decoders) is a compatibility contract that caps every mode for the whole
-   session. The v0.3.0 assessment that the DPB is "constructor-baked" was
-   true only of the signalled maximum, not the operating count.
-3. **Requires a new encoder: resolution.** A resolution change means a new
-   SPS and new buffers. `H264StreamingSession.ChangeResolution` handles it
-   by recreating the encoder transparently — the next frame is an IDR
-   carrying the new parameter sets, and decoders (ffmpeg verified)
-   reconfigure at that boundary. It cannot be automatic because Kiln has no
-   scaler: the controller's resolution recommendations are surfaced
-   (`ResolutionChangeRecommended`) until the caller can supply rescaled
-   frames and calls `ChangeResolution`.
+- the slice QP (`BaseQp`),
+- a bit budget for the picture (`TargetBitrateBps / TargetFps`),
+- a forced IDR or a gradual-intra-refresh wave,
+- a speed-mode change.
 
-Frame rate is not on the ladder at all: the SPS carries no VUI timing
-(`timing_info_present_flag = 0`), so `TargetFps` has zero bitstream effect.
-It is a pacing contract — the session budgets per-frame bits at the decided
-fps and the caller is expected to pace capture accordingly (pin
-`RateControlConfig.SupportedFps` to a single rung to keep it fixed).
+Callers who want their own loop can drive `LowLatencyRateController.Decide` directly and apply its
+decisions with the same calls the session uses: `EncodeFrame(sliceLumaQp:, targetBitsPerFrame:,
+forceKeyframe:)`, `ApplySpeedMode` and `ApplySpeedKnobs`.
 
-Determinism holds through all three tiers: adaptation inputs are ordinary
-inputs, applied between frames, so identical frames plus identical feedback
-produce identical bitstreams. The session derives `EncoderPipelineStats`
-from the encoder itself — bytes/QP/IDR of the previous frame plus its
-measured content signals (`MotionComplexity` from the mean inter MV
-magnitude, `TextureComplexity` from mean log₂ MB variance,
-`SceneChangeDetected` from the intra ratio of P frames; all pure functions
-of the supplied frames, also surfaced on `H264StreamingEncodeResult`) — and
-reports wall-clock fields as zero unless the caller passes
-`EncoderPipelineTimings` explicitly — timings are then inputs too, and
-replaying them replays the stream.
+### `LowLatencyRateController`
 
-Tests: `tests/Kiln.Tests/H264StreamingSessionTests.cs` (adaptation taking
-effect + ffmpeg oracle across every tier transition),
-`H264DynamicReconfigurationTests.cs` (mid-GOP knob/reference changes,
-byte-exact reconstruction parity), and
-`AdaptiveRateControlTests/Phase1..5` (controller-level behaviour).
+[`RateControl/LowLatencyRateController.cs`](../src/Kiln/RateControl/LowLatencyRateController.cs)
+decides the target bitrate, the QP and the per-frame byte ceiling.
 
-## Experimental subsystems
+**Congestion** is any of: packet loss above `CongestionPacketLossThreshold`, a NACK burst, a
+send-queue backlog above `MaxPendingRtpBytes`, or an RTT spike. On congestion the target bitrate
+is multiplied by `DownshiftFactor`. Each time `StabilityWindowFrames` pass without congestion
+it climbs by `UpshiftFactor`. QP follows the bitrate: about +6 for every halving of the target
+below `InitialTargetBitrateBps`.
 
-- **`Internal/H264/Adaptation/`** — resolution/fps ladder-based adaptation.
-  `ResolutionLadder` and `FpsLadder` (built from
-  `RateControlConfig.SupportedWidths`/`Heights`/`Fps`; defaults
-  1080p→900p→720p→540p→360p and 60→30→15) step one rung at a time;
-  `AdaptationPolicy` cascades down speed-mode → fps → resolution under
-  severe congestion and walks back up under sustained stability, with a
-  cooldown to prevent flapping. Both directions are baseline-relative on
-  RTT (the fixed 100 ms severe test and the fixed 40 ms recovery gate had
-  the same permanently-misclassifies-high-RTT-links defect as the old
-  50 ms congestion threshold): severe requires RTT above both
-  `baseline × SevereCongestionRttMultiplier` and `SevereCongestionRttFloor`,
-  and the walk-up accepts RTT within `baseline × RecoveryRttMultiplier`. A
-  client that reports it cannot decode within the frame interval
-  (`EncoderNetworkFeedback.ClientDecodeDelay` beyond
-  `ClientDecodeDelayBudgetFactor` of it; null = not measured) drives the
-  same cascade — complexity relief, never a bitrate cut, because lowering
-  bitrate does not help a decoder that cannot keep up — and a jitter spike
-  or a merely-marginal decoder defers the walk-up so recovery does not feed
-  a building queue. `H264AdaptiveRateController` composes
-  `LowLatencyRateController` (bitrate/QP/recovery) with `AdaptationPolicy`
-  into one `EncoderAdaptationDecision` per frame. **This layer is now
-  consumed in production by `H264StreamingSession`** (it is the session's
-  controller); the types themselves remain internal and may change shape.
+**The RTT test is relative to a baseline.** The controller tracks the fastest RTT it has seen and
+lets that baseline drift upward slowly, so that a route change eventually becomes the new
+baseline. An RTT is a spike only when it exceeds both `baseline × CongestionRttMultiplier` and the
+absolute `CongestionRttFloor` (50 ms by default). A link with a naturally high RTT is therefore
+not treated as permanently congested.
 
-Frame pacing and input dropping are deliberately **not** a library
-subsystem (an earlier `Internal/H264/Queue/` preview shipped unwired and
-has been removed): latest-frame-wins hand-off is a property of the caller's
-capture loop and buffer ownership — the capture sample's `Recorder`
-([`samples/Kiln.Capture/Recorder.cs`](../samples/Kiln.Capture/Recorder.cs))
-is the reference implementation (pooled buffer swap, blocking wait, dropped
-counter, no per-frame allocation), which a `T : class` queue type could not
-match. The library-side contract is the accounting: report your loop's
-`PendingInputFrames`/`DroppedInputFrames` via `EncoderPipelineTimings` and
-the rate controller sees your drops.
+**A bandwidth estimate is a ceiling.** If the transport supplies
+`EstimatedAvailableBitrateBps` (from GCC, transport-cc or REMB), the target never exceeds it. A
+falling estimate caps the target immediately. The loss and RTT tests can still cut below it. A
+recovering estimate does not raise the target by itself. It only allows the normal climb.
 
-## Diagnostics (`KILN_*` environment variables)
+**Jitter holds increases.** A jitter spike, tested against its own baseline with
+`JitterSpikeMultiplier` and `JitterSpikeFloor`, pauses the climb. It never causes a cut, because
+rising jitter without loss means queues are filling, and that is not a loss of capacity.
 
-All diagnostics are opt-in, read once at type initialization (not per-frame
-or per-MB), and off by default. Grep for `GetEnvironmentVariable` under
-`src/Kiln` to re-derive this list if it drifts.
+**Ownership of recovery.** The controller owns exactly one `H264RecoveryPolicy` and calls
+`DecideRecovery` once per `Decide`. Code that composes the controller must not call the policy a
+second time or create a second instance. Either mistake advances the IDR cooldown twice per frame
+and halves the protection against keyframe storms.
+
+**Reporting what was applied.** A composing layer tells the controller what it actually did
+through `SyncAppliedState(width, height, fps, mode)`. Without that call the controller keeps its
+constructor defaults (1920×1080 at 60 fps) and budgets against the wrong frame rate.
+
+`RateControlConfig` holds the tunables and `RateControlState` the controller's mutable state.
+
+### `H264RecoveryPolicy` and intra refresh
+
+[`Recovery/H264RecoveryPolicy.cs`](../src/Kiln/Recovery/H264RecoveryPolicy.cs) turns PLI and FIR
+feedback into recovery decisions, in this order of priority:
+
+1. **FIR**, then **PLI**. If no IDR was forced within the last `IdrCooldownFrames`, force one.
+   Otherwise ask for intra refresh instead.
+2. **Scene change.** When the encoder reports that the previous P picture coded most of its
+   macroblocks as intra (`EncoderPipelineStats.SceneChangeDetected`) and the cooldown is clear,
+   force an IDR so that the stream has a clean entry point at the cut. During the cooldown a scene
+   change does nothing, because nothing was lost.
+
+[`IdrBudget`](../src/Kiln/Recovery/IdrBudget.cs) computes the larger byte budget an IDR is allowed:
+twice the normal per-frame budget.
+
+**Gradual intra refresh** is an encoder feature. Construct the encoder with
+`IntraRefreshPeriodFrames = N` and call `RequestIntraRefresh()`:
+
+- A band of intra-coded macroblock columns sweeps the picture from left to right over up to N
+  frames.
+- The PPS sets `constrained_intra_pred_flag`, so intra macroblocks in the band never predict from
+  inter-coded neighbours.
+- Motion vectors of macroblocks already refreshed are restricted to the refreshed region of their
+  reference.
+- The first access unit of the wave repeats SPS and PPS and carries a recovery-point SEI with
+  `exact_match_flag = 1`.
+
+A decoder that joins at that access unit therefore has a bit-exact picture once the wave
+completes. A request made during a wave is queued and starts a new wave when the current one
+ends. An IDR cancels the wave.
+
+When a recovery decision asks for intra refresh, the session starts or queues a wave if the
+feature is enabled. If it is not, the session encodes a normal frame. Either way the request is
+reported as `IntraRefreshRequested` on the result.
+
+### The adaptation layer
+
+`Internal/H264/Adaptation/` adds speed-mode, frame-rate and resolution adaptation.
+`H264AdaptiveRateController` combines `LowLatencyRateController` with `AdaptationPolicy` and is
+the controller that `H264StreamingSession` uses. These types are internal and may change shape.
+
+- `ResolutionLadder` and `FpsLadder` are built from `RateControlConfig.SupportedWidths`,
+  `SupportedHeights` and `SupportedFps`. The defaults are 1080p, 900p, 720p, 540p and 360p, and
+  60, 30 and 15 fps. They move one rung at a time.
+- Under severe congestion `AdaptationPolicy` steps down, first through the speed modes, then frame
+  rate, then resolution. After sustained stability it walks back up in the reverse order.
+  `AdaptationCooldownFrames` stops it flapping.
+- "Severe" uses the same baseline-relative RTT test as congestion, with
+  `SevereCongestionRttMultiplier` and `SevereCongestionRttFloor`. The walk back up requires RTT
+  within `baseline × RecoveryRttMultiplier`.
+- A client that reports it cannot decode within the frame interval
+  (`EncoderNetworkFeedback.ClientDecodeDelay` beyond `ClientDecodeDelayBudgetFactor` of it) drives
+  the same step-down. Bitrate is left alone, because a lower bitrate does not help a decoder that
+  cannot keep up.
+- A jitter spike, or a client that is only just keeping up, defers the walk back up.
+
+### Frame pacing is the caller's job
+
+Kiln has no frame queue. Dropping late frames in favour of the newest one depends on who owns the
+buffers, and that is the capture loop. The `Recorder` in the capture sample
+([`samples/Kiln.Capture/Recorder.cs`](../samples/Kiln.Capture/Recorder.cs)) is the reference
+pattern: a pooled buffer swap, a blocking wait, a dropped-frame counter and no allocation per
+frame. Report `PendingInputFrames` and `DroppedInputFrames` through `EncoderPipelineTimings` and
+the controller sees them.
+
+## What can change mid-stream
+
+Every input falls into one of three tiers. The tier tells you when a change is safe.
+
+**1. Any frame.** These touch nothing structural in the bitstream:
+
+- the slice QP (`EncodeFrame(sliceLumaQp:)`, coded as `slice_qp_delta`),
+- the bit budget (`EncodeFrame(targetBitsPerFrame:)`, which drives `mb_qp_delta`),
+- a forced IDR (`EncodeFrame(forceKeyframe: true)`),
+- the three search-only speed options, `UseMotionSatd`, `SubPartitionRangeCap` and
+  `MotionSearchEffortCapPerMb`, through `ApplySpeedMode` or `ApplySpeedKnobs`.
+
+Search options change which prediction the encoder *chooses*. They never change how a choice is
+coded, so a decoder cannot tell that they changed.
+
+**2. Any frame, up to the SPS limit: the reference count.** The SPS signals
+`max_num_ref_frames` once, and a decoder sizes its picture buffer from it (§7.4.2.1). That value
+is an upper bound. Below it, each P slice signals its own active count
+(`num_ref_idx_active_override_flag`, §7.3.3).
+
+- Lowering the count takes effect on the next frame.
+- Raising it takes effect one frame later, once the encoder has refilled the reference slot it
+  had retired. The decoder kept both pictures in its sliding window throughout (§8.2.5.3).
+- No IDR is needed in either direction, which is why `SpeedMode` can change mid-GOP.
+- The count can never exceed the signalled maximum, so `ApplySpeedKnobs` clamps to it.
+
+The session signals 2 in the SPS so that every speed mode stays reachable. If the caller assigned
+`MaxReferenceFrames` explicitly, for example 1 for a strict hardware decoder, that value is
+signalled and caps every mode for the whole session.
+
+**3. New encoder: resolution.** A new resolution needs a new SPS and new buffers.
+`H264StreamingSession.ChangeResolution` recreates the encoder, and the next frame is an IDR with
+the new parameter sets. This cannot be automatic, because Kiln has no scaler. The controller's
+resolution decisions are reported as `ResolutionChangeRecommended` until the caller supplies
+frames at the new size and calls `ChangeResolution`.
+
+**Frame rate is in no tier.** The SPS carries no timing (`timing_info_present_flag = 0`), so
+`TargetFps` changes nothing in the bitstream. The session budgets bits per frame at the decided
+rate and expects the caller to pace capture to match. Set `RateControlConfig.SupportedFps` to a
+single value to keep it fixed.
+
+### Determinism
+
+Adaptation inputs are applied between frames, like any other input. Identical frames with
+identical feedback produce identical bytes.
+
+The session derives `EncoderPipelineStats` from the encoder itself: the previous frame's size, QP
+and type, and its content signals. `MotionComplexity` comes from the mean motion-vector magnitude,
+`TextureComplexity` from the mean log₂ macroblock variance, and `SceneChangeDetected` from the
+share of intra macroblocks in a P picture. All three are pure functions of the frames supplied.
+
+Wall-clock fields are zero unless the caller passes `EncoderPipelineTimings`. If it does, those
+timings are inputs too, and replaying a session exactly means replaying them.
+
+### Tests
+
+- `tests/Kiln.Tests/H264StreamingSessionTests.cs`: adaptation taking effect, with ffmpeg as a
+  decode check across every tier.
+- `H264DynamicReconfigurationTests.cs`: mid-GOP option and reference changes.
+- `H264IntraRefreshTests.cs`: refresh waves.
+- `AdaptiveRateControlTests/`: controller behaviour.
+
+## Diagnostics
+
+All diagnostics are opt-in and off by default. The environment variables are read once, when the
+owning type is first used, and never per frame.
 
 | Variable | Effect |
 |---|---|
-| `KILN_H264_GRC_INSTRUMENT=1` | Enables candidate-ranking collection in `H264MotionGraphResidualDiagnostics` — shadow instrumentation comparing graph-residual-cost motion-search ranking against SAD ranking (top-1/2/4 winner agreement, margin buckets). |
-| `KILN_H264_SATD_DAG_INSTRUMENT=1` | Enables `H264MotionSatdDagDiagnostics` — SATD atom-DAG and cache-reuse counters for motion estimation (atom computes/hits/misses by shape, partition composition/early-exit counts, candidate cache and ring-break stats, search-depth histogram). |
-| `KILN_H264_DIAG_DISABLE_P_INTER_PHASE2B=1` | Disables the Phase 2b intra-in-P rescoring step in `H264PInterDiagnostics`/`H264BaselineSliceEncoder` for A/B measurement (same effect as `H264PInterDiagnostics.DisablePhase2bManual` set from code, e.g. in benchmarks). |
-| `KILN_H264_P_INTER_TIMING=1` | Enables Phase 2 timing breakdown collection in `H264PInterDiagnostics` (ME / prediction / luma / chroma / write tick counters). |
-| `KILN_H264_DIAG_TRACE_MB=<frameNum>,<mbX>,<mbY>[;...]` | Enables per-macroblock trace line collection for the listed `(frameNum, mbX, mbY)` targets (use `frameNum=-1` to match every frame); multiple targets are `;`-separated. Parsed once by `H264PInterDiagnostics.ParseTraceMbTargets`. |
+| `KILN_H264_P_INTER_TIMING=1` | Collects a timing breakdown of P-macroblock coding (motion search, prediction, luma, chroma, write) in `H264PInterDiagnostics`. |
+| `KILN_H264_DIAG_DISABLE_P_INTER_PHASE2B=1` | Disables the intra-inside-P step (Phase 2b) for A/B measurement. |
+| `KILN_H264_DIAG_TRACE_MB=<frame>,<mbX>,<mbY>[;...]` | Collects trace lines for the listed macroblocks. A frame of `-1` matches every frame. |
+| `KILN_H264_SATD_DAG_INSTRUMENT=1` | Enables `H264MotionSatdDagDiagnostics`: counters for SATD reuse and caching during motion search. |
+| `KILN_H264_GRC_INSTRUMENT=1` | Enables `H264MotionGraphResidualDiagnostics`: compares an experimental graph-residual candidate ranking with the SAD ranking. It does not change the encoder's output. |
 
-`H264MotionGraphResidualDiagnostics.CollectCandidateRankings` and
-`H264PInterDiagnostics.DisablePhase2bManual` / trace-target registration also
-have code-level (non-env) toggles for use from benchmarks and tests without
-setting process environment variables.
+Three public static classes expose the same switches and their reports to code:
+`H264PInterInstrumentation`, `H264MotionSatdDagInstrumentation` and
+`H264MotionGraphResidualInstrumentation`. They are process-wide and meant for benchmarks and
+investigation.
 
+To re-derive this list, search `src/Kiln` for `GetEnvironmentVariable`.
