@@ -30,15 +30,16 @@ jobs:
             runner: '["self-hosted","macOS","ARM64","passwordlesssudo"]'
     name: build-test (${{ matrix.name }})
     runs-on: ${{ fromJSON(matrix.runner) }}
-    env:
-      # Self-hosted runners don't run as root, so install the SDK into the runner's own tool cache
-      # instead of setup-dotnet's system default (e.g. /usr/share/dotnet).
-      DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # MinVer needs tag history
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners don't run as root, so install the SDK into the runner's own tool
+          # cache instead of setup-dotnet's system default (e.g. /usr/share/dotnet). The runner
+          # context is only available at step level, not in job-level env.
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
         with:
           dotnet-version: 10.0.x
       - name: Restore
