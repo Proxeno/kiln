@@ -132,6 +132,7 @@ flowchart TB
         s0["Slice 0<br/>rows 0 to a"]
         s1["Slice 1<br/>rows a to b"]
         sn["Slice N-1<br/>rows c to end"]
+        s0 ~~~ s1 ~~~ sn
     end
 
     begin --> pool
@@ -178,40 +179,35 @@ prediction, transform and quantization, deblocking, and luma and chroma interpol
 resolves one kernel set at construction and uses it for its whole life. Nothing is dispatched per
 call.
 
-```mermaid
-flowchart TB
-    start(["H264KernelSet.CreateBest()"])
-    opt{"PreferHardwareIntrinsics?"}
-    avx2{"Avx2.IsSupported"}
-    ssse3{"Ssse3.IsSupported"}
-    neon64{"AdvSimd.Arm64.IsSupported"}
-    neon{"AdvSimd.IsSupported"}
-    A["Avx2KernelSet"]
-    S["Ssse3KernelSet"]
-    N64["Neon64KernelSet"]
-    N["NeonKernelSet"]
-    SC["ScalarKernelSet"]
+`H264KernelSet.CreateBest()` returns the first set in this table whose check passes. When
+`PreferHardwareIntrinsics` is false the encoder skips the checks and uses `ScalarKernelSet`.
 
-    start --> opt
-    opt -- no --> SC
-    opt -- yes --> avx2
-    avx2 -- yes --> A
-    avx2 -- no --> ssse3
-    ssse3 -- yes --> S
-    ssse3 -- no --> neon64
-    neon64 -- yes --> N64
-    neon64 -- no --> neon
-    neon -- yes --> N
-    neon -- no --> SC
-```
-
-| Kernel set | Target | Derives from | File |
+| Order | Check | Kernel set | Target |
 |---|---|---|---|
-| `Avx2KernelSet` | x64 with AVX2 | `Ssse3KernelSet` | [`Avx2KernelSet.cs`](../src/Kiln/Internal/H264/Avx2KernelSet.cs) |
-| `Ssse3KernelSet` | x64 with SSSE3 | `SimdKernelSetBase` | [`Ssse3KernelSet.cs`](../src/Kiln/Internal/H264/Ssse3KernelSet.cs) |
-| `Neon64KernelSet` | arm64 (`AdvSimd.Arm64`) | `NeonKernelSet` | [`Neon64KernelSet.cs`](../src/Kiln/Internal/H264/Neon64KernelSet.cs) |
-| `NeonKernelSet` | Arm (`AdvSimd`) | `SimdKernelSetBase` | [`NeonKernelSet.cs`](../src/Kiln/Internal/H264/NeonKernelSet.cs) |
-| `ScalarKernelSet` | any CPU | none | [`ScalarKernelSet.cs`](../src/Kiln/Internal/H264/ScalarKernelSet.cs) |
+| 1 | `Avx2.IsSupported` | [`Avx2KernelSet`](../src/Kiln/Internal/H264/Avx2KernelSet.cs) | x64 with AVX2 |
+| 2 | `Ssse3.IsSupported` | [`Ssse3KernelSet`](../src/Kiln/Internal/H264/Ssse3KernelSet.cs) | x64 without AVX2 |
+| 3 | `AdvSimd.Arm64.IsSupported` | [`Neon64KernelSet`](../src/Kiln/Internal/H264/Neon64KernelSet.cs) | arm64 |
+| 4 | `AdvSimd.IsSupported` | [`NeonKernelSet`](../src/Kiln/Internal/H264/NeonKernelSet.cs) | 32-bit Arm with NEON |
+| 5 | none | [`ScalarKernelSet`](../src/Kiln/Internal/H264/ScalarKernelSet.cs) | any CPU |
+
+The sets share code through inheritance:
+
+```mermaid
+classDiagram
+    direction TB
+    class IH264KernelSet {
+        <<interface>>
+    }
+    class SimdKernelSetBase {
+        <<abstract>>
+    }
+    IH264KernelSet <|.. ScalarKernelSet
+    IH264KernelSet <|.. SimdKernelSetBase
+    SimdKernelSetBase <|-- Ssse3KernelSet
+    Ssse3KernelSet <|-- Avx2KernelSet
+    SimdKernelSetBase <|-- NeonKernelSet
+    NeonKernelSet <|-- Neon64KernelSet
+```
 
 [`SimdKernelSetBase`](../src/Kiln/Internal/H264/SimdKernelSetBase.cs) implements the kernels whose
 SIMD code is shared across architectures, by delegating to helper types such as `H264MotionSatd`,
@@ -245,22 +241,20 @@ do: `Kiln.RateControl` ([`src/Kiln/RateControl/`](../src/Kiln/RateControl/)) and
 [`H264StreamingSession`](../src/Kiln/H264StreamingSession.cs) connects them to an encoder.
 
 ```mermaid
-flowchart LR
-    fb["EncoderNetworkFeedback<br/>(from your transport)"]
-    stats["EncoderPipelineStats<br/>(previous frame)"]
+flowchart TB
+    fb["EncoderNetworkFeedback<br/>from your transport"]
     subgraph ctl["H264AdaptiveRateController (internal)"]
-        direction TB
-        ll["LowLatencyRateController<br/>bitrate, QP"]
-        rec["H264RecoveryPolicy<br/>IDR, intra refresh"]
+        direction LR
+        ll["LowLatencyRateController<br/>bitrate and QP"]
+        rec["H264RecoveryPolicy<br/>IDR or intra refresh"]
         ad["AdaptationPolicy<br/>speed mode, fps, resolution"]
         ll --> rec
+        rec ~~~ ad
     end
     dec["EncoderAdaptationDecision"]
     enc["H264BaselineEncoder"]
-    fb --> ctl
-    stats --> ctl
-    ctl --> dec --> enc
-    enc -. "bytes, QP, content signals" .-> stats
+    fb --> ctl --> dec --> enc
+    enc -. "EncoderPipelineStats: size, QP and content signals of the frame just encoded" .-> ctl
 ```
 
 Per frame the session builds `EncoderPipelineStats` from the previous frame, asks the controller
