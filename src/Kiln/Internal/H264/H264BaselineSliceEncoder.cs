@@ -2283,6 +2283,19 @@ internal sealed class H264BaselineSliceEncoder
         if (collectPhase2Timing)
             phase2MeTicks = Stopwatch.GetTimestamp() - phase2MeStartTicks;
 
+        // Phase 2 is about to reconstruct the inter prediction it will code. When the search picked
+        // the same 16x16, refIdx-0 MV the skip test used, that reconstruction would reproduce
+        // predY/predU/predV byte for byte: the padded references do not change within a frame and
+        // ReconstructInterPredPerPartition calls the same reconstructor with the same arguments.
+        // Reuse the Phase-1 prediction instead of rebuilding it.
+        var phase2PredDuplicatesPhase1 =
+            phase1PredBuilt
+            && winRefIdx == 0
+            && partResult.Partition == H264MotionEstimator.McPartition.Mb16x16
+            && partResult.Mv0.X == mvSkipPred.X
+            && partResult.Mv0.Y == mvSkipPred.Y;
+        var reusePhase1Pred = phase2PredDuplicatesPhase1 && !H264PInterDiagnostics.DisablePhase2PredReuse;
+
         var interPredReconstructed = false;
         // Intra-in-P fallback (§7.4.5: a P slice may contain I_16×16 macroblocks). When inter
         // prediction is poor — most often the leading edge of a scroll, an occlusion, or a local
@@ -2294,15 +2307,17 @@ internal sealed class H264BaselineSliceEncoder
         // switch. Runs before the inter residual loop so the loser path is never reconstructed.
         if (_enableIntraInPFallback && !H264PInterDiagnostics.ShouldDisablePhase2b())
         {
-            if (collectPhase1Timing)
+            if (reusePhase1Pred)
             {
-                H264PInterDiagnostics.NotifyPhase2InterPredRebuild(
-                    phase1PredBuilt && winRefIdx == 0 &&
-                    partResult.Partition == H264MotionEstimator.McPartition.Mb16x16 &&
-                    partResult.Mv0.X == mvSkipPred.X && partResult.Mv0.Y == mvSkipPred.Y);
+                H264PInterDiagnostics.NotifyPhase2InterPredReused();
             }
-            ReconstructInterPredPerPartition(
-                partResult, winRefIdx, mbX, mbY, chromaMbX, chromaMbY, predY, predU, predV, _kernels);
+            else
+            {
+                if (collectPhase1Timing)
+                    H264PInterDiagnostics.NotifyPhase2InterPredRebuild(phase2PredDuplicatesPhase1);
+                ReconstructInterPredPerPartition(
+                    partResult, winRefIdx, mbX, mbY, chromaMbX, chromaMbY, predY, predU, predV, _kernels);
+            }
             interPredReconstructed = true;
 
             Span<byte> i16SrcFlat = stackalloc byte[256];
@@ -2408,17 +2423,19 @@ internal sealed class H264BaselineSliceEncoder
         var phase2PredStartTicks = collectPhase2Timing ? Stopwatch.GetTimestamp() : 0;
         if (!interPredReconstructed)
         {
-            if (collectPhase1Timing)
+            if (reusePhase1Pred)
             {
-                H264PInterDiagnostics.NotifyPhase2InterPredRebuild(
-                    phase1PredBuilt && winRefIdx == 0 &&
-                    partResult.Partition == H264MotionEstimator.McPartition.Mb16x16 &&
-                    partResult.Mv0.X == mvSkipPred.X && partResult.Mv0.Y == mvSkipPred.Y);
+                H264PInterDiagnostics.NotifyPhase2InterPredReused();
             }
-            // Reconstruct luma/chroma per-partition, filling the 16×16 predY and 8×8 predU/predV buffers.
-            // The residual loop below reads these without knowing the partition shape.
-            ReconstructInterPredPerPartition(
-                partResult, winRefIdx, mbX, mbY, chromaMbX, chromaMbY, predY, predU, predV, _kernels);
+            else
+            {
+                if (collectPhase1Timing)
+                    H264PInterDiagnostics.NotifyPhase2InterPredRebuild(phase2PredDuplicatesPhase1);
+                // Reconstruct luma/chroma per-partition, filling the 16×16 predY and 8×8 predU/predV buffers.
+                // The residual loop below reads these without knowing the partition shape.
+                ReconstructInterPredPerPartition(
+                    partResult, winRefIdx, mbX, mbY, chromaMbX, chromaMbY, predY, predU, predV, _kernels);
+            }
         }
         if (collectPhase2Timing)
             phase2PredTicks = Stopwatch.GetTimestamp() - phase2PredStartTicks;
