@@ -1117,9 +1117,12 @@ internal static class H264MotionEstimator
         int scoreCeilingExclusive = int.MaxValue)
     {
         // Integer search from here to RefineFrac, then the fractional refinement. Suppressed inside
-        // a whole-sub-partition region (t_inSubPartition), where the outer timer owns the cost.
-        var stageProfile = t_stageProfile && !t_inSubPartition;
+        // a whole-sub-partition region (t_inSubPartition), where the outer timer owns the cost. The
+        // flag is read once here; the ring loop counts into a local and publishes it once below.
+        var stageProfilingOn = t_stageProfile;
+        var stageProfile = stageProfilingOn && !t_inSubPartition;
         var integerStageStart = stageProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long integerCandidates = 0;
         if (stageProfile)
             H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.MeInteger;
 
@@ -1229,8 +1232,8 @@ internal static class H264MotionEstimator
                             continue;
                     }
 
-                    if (t_stageProfile)
-                        t_meIntegerCandidates++;
+                    if (stageProfilingOn)
+                        integerCandidates++;
 
                     int s;
                     if (useMotionSatd &&
@@ -1265,6 +1268,9 @@ internal static class H264MotionEstimator
                 }
             }
         }
+
+        if (stageProfilingOn)
+            t_meIntegerCandidates += integerCandidates;
 
         if (bestSad == int.MaxValue)
         {
@@ -1328,9 +1334,12 @@ internal static class H264MotionEstimator
     {
         H264PInterDiagnostics.NotifyMeHexSearch();
         // Hex seed search: integer search from here to RefineFrac, then fractional refinement.
-        // Suppressed inside a whole-sub-partition region (the outer timer owns that cost).
-        var stageProfileHex = t_stageProfile && !t_inSubPartition;
+        // Suppressed inside a whole-sub-partition region (the outer timer owns that cost). The flag
+        // is read once here; each scored candidate increments a local that is published once below.
+        var stageProfilingOnHex = t_stageProfile;
+        var stageProfileHex = stageProfilingOnHex && !t_inSubPartition;
         var hexIntegerStart = stageProfileHex ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long integerCandidates = 0;
         if (stageProfileHex)
             H264PInterDiagnostics.t_profileStage = (int)H264ProfileStage.MeInteger;
         var picW = referenceStride;
@@ -1357,6 +1366,7 @@ internal static class H264MotionEstimator
             mbX, mbY, predIx, predIy, mvPredictor.X, mvPredictor.Y, bw, bh, picW, picH, maxRange,
             curDx, curDy, lambda, kernels, blockShape, useMotionSatd,
             checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
+            stageProfilingOnHex, ref integerCandidates,
             scoreStopAfter: int.MaxValue,
             cacheKey: cacheKey,
             cacheSad: cacheSad,
@@ -1377,6 +1387,8 @@ internal static class H264MotionEstimator
                 fractionalPelRefinementRounds,
                 useMotionSatd, lambda);
             EndHexSubpelStage(emptySubpelStart);
+            if (stageProfilingOnHex)
+                t_meIntegerCandidates += integerCandidates;
             return emptyRefined;
         }
 
@@ -1398,6 +1410,7 @@ internal static class H264MotionEstimator
                     mbX, mbY, predIx, predIy, mvPredictor.X, mvPredictor.Y, bw, bh, picW, picH, maxRange,
                     ndx, ndy, lambda, kernels, blockShape, useMotionSatd,
                     checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
+                    stageProfilingOnHex, ref integerCandidates,
                     scoreStopAfter: bestScore,
                     cacheKey: cacheKey,
                     cacheSad: cacheSad,
@@ -1444,6 +1457,7 @@ internal static class H264MotionEstimator
                     mbX, mbY, predIx, predIy, mvPredictor.X, mvPredictor.Y, bw, bh, picW, picH, maxRange,
                     ndx, ndy, lambda, kernels, blockShape, useMotionSatd,
                     checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
+                    stageProfilingOnHex, ref integerCandidates,
                     scoreStopAfter: bestScore,
                     cacheKey: cacheKey,
                     cacheSad: cacheSad,
@@ -1481,6 +1495,8 @@ internal static class H264MotionEstimator
             fractionalPelRefinementRounds,
             useMotionSatd, lambda);
         EndHexSubpelStage(hexSubpelStart);
+        if (stageProfilingOnHex)
+            t_meIntegerCandidates += integerCandidates;
         return hexRefined;
 
         long EndHexIntegerStage()
@@ -1520,6 +1536,8 @@ internal static class H264MotionEstimator
         int pictureHeight,
         int mbUnpaddedX,
         int mbUnpaddedY,
+        bool countCandidate,
+        ref long integerCandidates,
         int scoreStopAfter,
         out int s,
         out int score,
@@ -1552,8 +1570,8 @@ internal static class H264MotionEstimator
         }
         var mvCost = MotionVectorCost(lambda, mv.X - mvpX, mv.Y - mvpY);
         var refWin = OffsetWindow(reference, referenceStride, rx, ry);
-        if (t_stageProfile)
-            t_meIntegerCandidates++;
+        if (countCandidate)
+            integerCandidates++;
         if (useMotionSatd && scoreStopAfter != int.MaxValue)
         {
             var satdStopAfter = scoreStopAfter - mvCost;
@@ -1604,6 +1622,8 @@ internal static class H264MotionEstimator
         int pictureHeight,
         int mbUnpaddedX,
         int mbUnpaddedY,
+        bool countCandidate,
+        ref long integerCandidates,
         int scoreStopAfter,
         Span<int> cacheKey,
         Span<int> cacheSad,
@@ -1639,6 +1659,7 @@ internal static class H264MotionEstimator
                     mbX, mbY, predIx, predIy, mvpX, mvpY, bw, bh, picW, picH, maxRange,
                     dx, dy, lambda, kernels, blockShape, useMotionSatd,
                     checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
+                    countCandidate, ref integerCandidates,
                     scoreStopAfter,
                     out s, out score, out mv);
 
@@ -1662,6 +1683,7 @@ internal static class H264MotionEstimator
             mbX, mbY, predIx, predIy, mvpX, mvpY, bw, bh, picW, picH, maxRange,
             dx, dy, lambda, kernels, blockShape, useMotionSatd,
             checkChroma, pictureWidth, pictureHeight, mbUnpaddedX, mbUnpaddedY,
+            countCandidate, ref integerCandidates,
             scoreStopAfter,
             out s, out score, out mv);
     }
@@ -1944,6 +1966,9 @@ internal static class H264MotionEstimator
 
         refinementRounds = Math.Clamp(refinementRounds, 1, 2);
         var collectDiag = H264MotionSatdDagDiagnostics.IsEnabled;
+        // Read once here; every evaluated fractional candidate counts into a local published below.
+        var stageProfilingOn = t_stageProfile;
+        long subpelCandidates = 0;
 
         var stride = bw;
         var blockSize = bh * stride;
@@ -2063,8 +2088,8 @@ internal static class H264MotionEstimator
                         if (mvCost > bestScore)
                             continue;
 
-                        if (t_stageProfile)
-                            t_meSubpelCandidates++;
+                        if (stageProfilingOn)
+                            subpelCandidates++;
                         EnsureQpelBlock(kernels, reference, referenceStride, originX, originY, fx, fy,
                             bw, bh, stride, qpelBatch, blockSize,
                             ref qpelBatchValidMask, ref qpelBatchOriginX, ref qpelBatchOriginY);
@@ -2103,8 +2128,8 @@ internal static class H264MotionEstimator
                     }
                     else
                     {
-                        if (t_stageProfile)
-                            t_meSubpelCandidates++;
+                        if (stageProfilingOn)
+                            subpelCandidates++;
                         EnsureQpelBlock(kernels, reference, referenceStride, originX, originY, fx, fy,
                             bw, bh, stride, qpelBatch, blockSize,
                             ref qpelBatchValidMask, ref qpelBatchOriginX, ref qpelBatchOriginY);
@@ -2122,6 +2147,9 @@ internal static class H264MotionEstimator
                 }
             }
         }
+
+        if (stageProfilingOn)
+            t_meSubpelCandidates += subpelCandidates;
 
         return new SearchResult(bestMv, bestSad);
     }
