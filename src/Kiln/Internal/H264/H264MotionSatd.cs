@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -251,8 +252,27 @@ internal static class H264MotionSatd
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int Satd4x4FromTransformed(ReadOnlySpan<short> sourceCoefficients, ReadOnlySpan<short> referenceCoefficients)
     {
+        // |difference| summed over the sixteen transform coefficients. Exact integer arithmetic, so
+        // the vector path returns bit-identical values to the scalar tail below.
         var sum = 0;
-        for (var i = 0; i < Transform4x4CoefficientCount; i++)
+        var i = 0;
+        if (Vector.IsHardwareAccelerated && Vector<short>.IsSupported)
+        {
+            var accumulator = Vector<int>.Zero;
+            var step = Vector<short>.Count;
+            for (; i + step <= Transform4x4CoefficientCount; i += step)
+            {
+                var difference =
+                    new Vector<short>(sourceCoefficients.Slice(i, step)) -
+                    new Vector<short>(referenceCoefficients.Slice(i, step));
+                Vector.Widen(difference, out var low, out var high);
+                accumulator += Vector.Abs(low) + Vector.Abs(high);
+            }
+
+            sum = Vector.Sum(accumulator);
+        }
+
+        for (; i < Transform4x4CoefficientCount; i++)
             sum += Math.Abs(sourceCoefficients[i] - referenceCoefficients[i]);
         return (sum + 1) >> 1;
     }
