@@ -451,7 +451,9 @@ public sealed class H264BaselineEncoder : IDisposable
             maxReferenceFrames: Math.Clamp(_options.MaxReferenceFrames, 1, H264FrameSharedState.MaxDpbSize),
             useMotionSatd: _options.UseMotionSatd);
         _frameShared = sharedState;
-        var kernels = _options.PreferHardwareIntrinsics ? H264KernelSet.CreateBest() : new ScalarKernelSet();
+        var kernels = _options.PreferHardwareIntrinsics
+            ? H264KernelSet.CreateBest()
+            : H264KernelSetHooks.Decorate(new ScalarKernelSet());
         _kernels = kernels;
         var encoderCount = Math.Max(1, Math.Min(MaxSliceEncoders, _mbH));
         // Live speed-knob state starts as the constructor options and may be reassigned between
@@ -1047,6 +1049,8 @@ public sealed class H264BaselineEncoder : IDisposable
 
         var collectFramePhases = H264PInterDiagnostics.CollectFramePhases;
         var tFrameStart = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var collectStage = H264PInterDiagnostics.CollectStageProfile;
+        var tStageFrameStart = collectStage ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Cost-balanced slice partition: the frame wall clock is the *slowest* slice, and with
         // equal-height slices the band containing the moving content runs 2x+ longer than the rest
@@ -1063,6 +1067,8 @@ public sealed class H264BaselineEncoder : IDisposable
         _sliceEncoders[0].BeginFrame(isIdr);
 
         var tAfterBegin = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.FramePrologue, System.Diagnostics.Stopwatch.GetTimestamp() - tStageFrameStart);
 
         // Pin the caller's source planes so the parallel workers can reconstitute ReadOnlySpans
         // from raw pointers. The pin scope encloses Parallel.For (which is synchronous), so the
@@ -1117,6 +1123,7 @@ public sealed class H264BaselineEncoder : IDisposable
         }
 
         var tAfterParallel = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var tStageParallel = collectStage ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Gather NALs in raster (slice-index) order. WriteNal must run sequentially because each
         // call advances `pos` and writes into the shared output buffer.
@@ -1126,6 +1133,8 @@ public sealed class H264BaselineEncoder : IDisposable
         }
 
         var tAfterGather = collectFramePhases ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (collectStage)
+            H264PInterDiagnostics.NotifyStage(H264ProfileStage.NalGather, System.Diagnostics.Stopwatch.GetTimestamp() - tStageParallel);
 
         _sliceEncoders[0].PadReconstructedReference();
 
