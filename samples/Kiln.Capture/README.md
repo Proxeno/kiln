@@ -1,7 +1,7 @@
 # Kiln.Capture
 
-A console app that enumerates the machine's video capture devices and records one to a playable
-`.m4v` file, using Kiln as the encoder.
+A console app that lists the machine's video capture devices and records one of them to a playable
+`.m4v` file, with Kiln as the encoder. Run it from the repository root:
 
 ```
 dotnet run --project samples/Kiln.Capture -- list
@@ -26,30 +26,40 @@ Options for record:
 
 ## What this demonstrates
 
-The whole pipeline — capture, colour conversion, H.264 encode, MP4 mux — runs in managed code with
-no native binaries. [FlashCap](https://github.com/kekyo/FlashCap) (Apache-2.0) provides camera access
-by P/Invoking the OS APIs directly on macOS (AVFoundation), Linux (V4L2) and Windows
-(DirectShow / Media Foundation); everything downstream of it is in this repository.
+The whole pipeline runs in managed code and ships no native binaries: capture, colour conversion,
+H.264 encoding and MP4 muxing. [FlashCap](https://github.com/kekyo/FlashCap) (Apache-2.0) provides
+camera access by calling the operating system's capture APIs directly, on macOS (AVFoundation),
+Linux (V4L2) and Windows (DirectShow and Media Foundation). Everything after capture is in this
+repository.
 
-`src/Kiln` takes no dependency on FlashCap. The reference lives only in this sample.
+The Kiln library does not depend on FlashCap. Only this sample references it.
 
 ## How it fits together
 
 | File | Role |
 |---|---|
-| `Program.cs` | Argument parsing, `list` and `record` verbs |
+| `Program.cs` | Argument parsing, and the `list` and `record` verbs |
 | `DeviceCatalog.cs` | Device enumeration and capture-format selection |
+| `Recorder.cs` | Drives capture, encoding and muxing for one recording |
 | `CapturedFrameFormat.cs` | Works out the layout frames are *actually* delivered in |
-| `FrameConverter.cs` | YUYV / UYVY / NV12 / RGB → planar I420 |
-| `H264Levels.cs` | Picks a `level_idc` that admits the frame size |
+| `FrameConverter.cs` | YUYV, UYVY, NV12 and RGB to planar I420 |
 | `Mp4/AnnexBReader.cs` | Splits Annex B access units into NAL units |
 | `Mp4/BoxWriter.cs` | Big-endian ISO base media file format box writer |
 | `Mp4/Mp4Writer.cs` | The muxer: `ftyp` / `mdat` / `moov` |
 
-Kiln emits Annex B only, so producing a container is the sample's job: SPS and PPS are parsed back
-out of the first IDR access unit into the `avcC` record, start codes are rewritten as 4-byte NAL
-lengths, and the sample tables (`stts`, `stss`, `stsc`, `stsz`, `stco`) are accumulated in memory
-while media data streams to disk.
+The encoder is created with the requested QP and slice count and an IDR every two seconds. The level
+is left for Kiln to choose.
+
+**Hand-off between capture and encode.** The capture callback runs on FlashCap's thread and must not
+block, so it only copies the frame and swaps buffers. If encoding falls behind the camera, the
+newest frame replaces the waiting one and the older frame is counted as dropped. Latency therefore
+stays bounded, and the summary at the end reports the count. `Recorder.cs` is a useful pattern for
+any real-time capture loop that feeds Kiln.
+
+**Muxing.** Kiln emits Annex B only, so producing a container is the sample's job. SPS and PPS are
+parsed out of the first IDR access unit into the `avcC` record, start codes are rewritten as 4-byte
+NAL lengths, and the sample tables (`stts`, `stss`, `stsc`, `stsz`, `stco`) are built in memory
+while the media data streams to disk.
 
 The muxer is covered by `tests/Kiln.Tests/Mp4WriterTests.cs`, which runs without a camera.
 
@@ -84,7 +94,8 @@ own clock — a wrong value there corrupts the container's `stts` table.
 
 ## Performance note
 
-Real camera content is far heavier to encode than the synthetic near-static frames in
-`bench/Kiln.Benchmarks`. Expect roughly 10 ms/frame at 720p and 35-60 ms/frame at 1080p on Apple
-silicon with `--slices 4`. When encoding cannot keep up with the camera the newest frame wins and
-the older one is counted as dropped, so latency stays bounded; the summary reports the count.
+Real camera content, with its sensor noise, is heavier to encode than the near-static frames behind
+the committed benchmark baseline. As a rough guide from running this sample on Apple silicon with
+`--slices 4`, expect about 10 ms per frame at 720p and 35–60 ms per frame at 1080p. These are
+informal observations and not benchmark results. The summary printed at the end of a recording
+shows what your own machine and camera achieve.

@@ -1,8 +1,8 @@
 namespace Kiln.RateControl;
 
 /// <summary>
-/// Internal mutable state maintained by the rate controller across decision calls.
-/// Not exposed externally; used by LowLatencyRateController to track current encoder configuration.
+/// Mutable state that <see cref="LowLatencyRateController"/> carries from one decision to the
+/// next: the current targets and the tracked network baselines.
 /// </summary>
 public sealed class RateControlState
 {

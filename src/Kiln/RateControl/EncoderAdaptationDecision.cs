@@ -1,34 +1,27 @@
 namespace Kiln.RateControl;
 
 /// <summary>
-/// Output of the rate controller decision logic. Specifies what the encoder should do
-/// in response to current network and pipeline state.
+/// The rate controller's decision for one frame: what the encoder should do in response to the
+/// current network and pipeline state.
 /// </summary>
+/// <param name="TargetBitrateBps">Target bitrate in bits per second.</param>
+/// <param name="MaxFrameBytes">Largest size, in bytes, a single frame should reach to stay within
+/// the bitrate budget.</param>
+/// <param name="TargetFps">Frame rate the caller should pace capture at.</param>
+/// <param name="Width">Recommended output width in pixels.</param>
+/// <param name="Height">Recommended output height in pixels.</param>
+/// <param name="BaseQp">Slice QP for this frame (0-51; lower is higher quality).</param>
+/// <param name="ForceIdr">True when this frame should be encoded as an IDR.</param>
+/// <param name="EnableIntraRefresh">True when recovery was requested while an IDR is in cooldown,
+/// so gradual intra refresh should be used instead.</param>
+/// <param name="SpeedMode">Speed mode the encoder should use.</param>
 public sealed record EncoderAdaptationDecision(
-    /// <summary>Target bitrate for this frame/period (bps).</summary>
     int TargetBitrateBps,
-
-    /// <summary>Maximum byte size a single frame should not exceed to stay within bitrate budget.</summary>
     int MaxFrameBytes,
-
-    /// <summary>Desired frame rate (fps) for encoding output (1-120).</summary>
     int TargetFps,
-
-    /// <summary>Desired output video width in pixels.</summary>
     int Width,
-
-    /// <summary>Desired output video height in pixels.</summary>
     int Height,
-
-    /// <summary>Base quantization parameter for this frame (0-51, lower = higher quality).</summary>
     int BaseQp,
-
-    /// <summary>Should the encoder emit an IDR (I-frame) on the next encoded frame?</summary>
     bool ForceIdr,
-
-    /// <summary>Should the encoder use intra refresh instead of full IDR for error recovery?</summary>
     bool EnableIntraRefresh,
-
-    /// <summary>Encoder speed/quality trade-off mode to use.</summary>
-    EncoderSpeedMode SpeedMode
-);
+    EncoderSpeedMode SpeedMode);

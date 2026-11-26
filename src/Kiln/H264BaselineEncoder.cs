@@ -6,10 +6,13 @@ using Kiln.RateControl;
 
 namespace Kiln;
 
-/// <summary>Encoder options (baseline profile, CAVLC).</summary>
+/// <summary>
+/// Options for <see cref="H264BaselineEncoder"/>. The encoder reads them once, at construction;
+/// changing an instance afterwards has no effect on an encoder already built from it.
+/// </summary>
 public sealed class H264BaselineEncoderOptions
 {
-    /// <summary>QP [0,51].</summary>
+    /// <summary>Base quantization parameter, 0 to 51 (clamped). Lower is higher quality and more bits. Default 28.</summary>
     public int QuantizationParameter { get; set; } = 28;
 
     /// <summary>
@@ -31,9 +34,13 @@ public sealed class H264BaselineEncoderOptions
     /// </summary>
     public EncoderSpeedMode SpeedMode { get; set; } = EncoderSpeedMode.HighQuality;
 
-    /// <summary>IDR NAL every N coded frames (first frame is always IDR).</summary>
+    /// <summary>An IDR picture every N coded frames. The first frame is always an IDR. Default 60.</summary>
     public int KeyframeIntervalFrames { get; set; } = 60;
 
+    /// <summary>
+    /// H.264 <c>profile_idc</c> to signal. Only 66 (Baseline, the default) is supported; any other
+    /// value makes the <see cref="H264BaselineEncoder"/> constructor throw.
+    /// </summary>
     public byte ProfileIdc { get; set; } = 66;
 
     /// <summary>
@@ -74,11 +81,15 @@ public sealed class H264BaselineEncoderOptions
 
     /// <summary>
     /// SAD-domain λ for intra-4×4 mode selection (<c>J = SAD + λ·R</c>). If null, derived from <see cref="QuantizationParameter"/>
-    /// via the encoder's per-QP table. Senior tunes this via the lambda sweep harness; ordinary callers pass null.
+    /// via the encoder's per-QP table. An expert override for tuning; leave it null.
     /// </summary>
     public int? Intra4x4SadLambda { get; set; }
 
-    /// <summary>When true (default), use hardware SIMD where available for DCT, quant, and intra SAD.</summary>
+    /// <summary>
+    /// When true (default), the encoder uses the best SIMD kernel set the CPU supports (AVX2 or
+    /// SSSE3 on x64, NEON on Arm). When false it uses the scalar kernels, which produce the same
+    /// bitstream.
+    /// </summary>
     public bool PreferHardwareIntrinsics { get; set; } = true;
 
     /// <summary>
@@ -298,7 +309,15 @@ public sealed class H264BaselineEncoderOptions
     internal H264BaselineEncoderOptions Clone() => (H264BaselineEncoderOptions)MemberwiseClone();
 }
 
-/// <summary>Baseline H.264 encoder (I and P slices, intra macroblocks only in P). Emits Annex B byte stream.</summary>
+/// <summary>
+/// H.264 Constrained Baseline encoder: IDR and P pictures, CAVLC, 8-bit 4:2:0. Takes planar I420
+/// frames and returns one Annex B access unit per <see cref="EncodeFrame"/> call, with no frame
+/// delay.
+/// <para>
+/// An instance encodes one frame at a time. Calls on the same instance must not overlap; use
+/// external synchronisation if several threads share one. Separate instances are independent.
+/// </para>
+/// </summary>
 public sealed class H264BaselineEncoder : IDisposable
 {
     /// <summary>Maximum parallel slice encoders allocated up-front (matches the auto-derived cap in <see cref="GetEffectiveSliceCount"/>).</summary>
@@ -379,6 +398,17 @@ public sealed class H264BaselineEncoder : IDisposable
     private int _subPartitionRangeCap;
     private int _motionSearchEffortCapPerMb;
 
+    /// <summary>Creates an encoder for frames of the given display size.</summary>
+    /// <param name="width">Frame width in luma samples. Must be even and at least 2; need not be a multiple of 16.</param>
+    /// <param name="height">Frame height in luma samples. Must be even and at least 2; need not be a multiple of 16.</param>
+    /// <param name="options">Encoder options, or null for the defaults.</param>
+    /// <exception cref="ArgumentException">
+    /// A dimension is odd or smaller than 2, or the frame is too large for the requested
+    /// <see cref="H264BaselineEncoderOptions.LevelIdc"/> or for any H.264 level.
+    /// </exception>
+    /// <exception cref="NotSupportedException">
+    /// <see cref="H264BaselineEncoderOptions.ProfileIdc"/> is not 66.
+    /// </exception>
     public H264BaselineEncoder(
         int width,
         int height,
@@ -615,12 +645,21 @@ public sealed class H264BaselineEncoder : IDisposable
     public bool LastFrameSceneChange { get; private set; }
 
     /// <summary>
-    /// Encode one frame into Annex B. Returns number of bytes written.
-    /// Planar I420 at <em>display</em> size (<see cref="Width"/> × <see cref="Height"/>):
-    /// <paramref name="u"/> / <paramref name="v"/> are half dimensions; strides may exceed width/2.
-    /// When display ≠ coded dimensions the encoder extends the planes to the macroblock grid
-    /// internally (edge replication); callers never supply padded planes.
+    /// Encodes one frame and writes it to <paramref name="annexB"/> as a complete Annex B access
+    /// unit. SPS and PPS are included ahead of every IDR.
+    /// <para>
+    /// Input is planar I420 at <em>display</em> size (<see cref="Width"/> × <see cref="Height"/>).
+    /// When that is not a multiple of 16 the encoder pads the planes to the macroblock grid
+    /// itself; callers never supply padded planes.
+    /// </para>
     /// </summary>
+    /// <param name="y">Luma plane: <see cref="Height"/> rows of <paramref name="strideY"/> bytes.</param>
+    /// <param name="u">U plane at half width and half height: rows of <paramref name="strideUv"/> bytes.</param>
+    /// <param name="v">V plane, laid out like <paramref name="u"/>.</param>
+    /// <param name="strideY">Bytes per luma row (at least <see cref="Width"/>).</param>
+    /// <param name="strideUv">Bytes per chroma row (at least <see cref="Width"/>/2).</param>
+    /// <param name="forceKeyframe">When true, this frame is encoded as an IDR regardless of the keyframe interval.</param>
+    /// <returns>The number of bytes written to <paramref name="annexB"/>.</returns>
     /// <param name="annexB">
     /// Destination for the complete Annex B access unit. Allocate at least
     /// <see cref="RecommendedOutputBufferSize"/> bytes to be safe for any frame; a smaller span
@@ -692,7 +731,7 @@ public sealed class H264BaselineEncoder : IDisposable
         var pos = 0;
         // Emit SPS/PPS only ahead of IDR access units. Repeating parameter sets before every P-frame is
         // non-conventional and some hardware decoders (VideoToolbox) mishandle the repeated in-band sets.
-        // A 1s GOP already carries SPS/PPS at each IDR for mid-stream join / loss recovery.
+        // Every IDR carries SPS/PPS, which is what mid-stream join and loss recovery need.
         if (isIdr)
         {
             pos += WriteNal(annexB[pos..], 3, 7, _spsRbsp);
@@ -1011,9 +1050,9 @@ public sealed class H264BaselineEncoder : IDisposable
 
         // Cost-balanced slice partition: the frame wall clock is the *slowest* slice, and with
         // equal-height slices the band containing the moving content runs 2x+ longer than the rest
-        // (measured 6.7/15.0/15.7/7.2 ms at 1080p s=4 — see notes/05-phase-attribution.txt). Weight
-        // each MB row by the previous frame's skip map (read before BeginFrame clears it) so row
-        // bands equalise predicted work instead of height. Deterministic for a given input sequence;
+        // (measured 6.7/15.0/15.7/7.2 ms at 1080p s=4). Weight each MB row by the motion-search
+        // effort it consumed in recent frames (see ComputeSlicePartition) so row bands equalise
+        // predicted work instead of height. Deterministic for a given input sequence;
         // slice partitioning is an encoder-side choice with no normative constraint on where
         // first_mb_in_slice boundaries fall (§7.4.3 only requires slices to tile the picture).
         ComputeSlicePartition(sliceCount);
@@ -1119,7 +1158,7 @@ public sealed class H264BaselineEncoder : IDisposable
     /// Baseline cost per macroblock, in the candidate-evaluation units of
     /// <see cref="H264MotionEstimator.ThreadSearchEffort"/>, covering the work motion search does
     /// not account for (P_Skip validation, reconstruction, CAVLC, deblocking). Calibrated against
-    /// per-row wall times at 1080p (notes/05-phase-attribution.txt).
+    /// per-row wall times at 1080p.
     /// </summary>
     private const int RowBaseEffortPerMb = 8;
 
@@ -1138,7 +1177,7 @@ public sealed class H264BaselineEncoder : IDisposable
     /// Update <see cref="_slicePartitionRows"/> (slice k covers MB rows [rows[k], rows[k+1])) so
     /// slice costs equalise. The frame wall clock is the *slowest* slice, and with fixed
     /// equal-height slices the band containing the moving content runs 2x+ longer than the rest
-    /// (measured 6.7/15.0/15.7/7.2 ms at 1080p s=4 — notes/05-phase-attribution.txt).
+    /// (measured 6.7/15.0/15.7/7.2 ms at 1080p s=4).
     ///
     /// The cost signal is the previous frames' per-row motion-search effort
     /// (<see cref="H264FrameSharedState.RowMeEffort"/>) — a deterministic count of candidate
@@ -1229,6 +1268,11 @@ public sealed class H264BaselineEncoder : IDisposable
     private int WriteNal(Span<byte> dest, byte nri, byte nalType, ReadOnlySpan<byte> rbsp) =>
         H264AnnexB.AppendNal(dest, nri, nalType, rbsp, _ebspScratch);
 
+    /// <summary>
+    /// Marks the encoder as disposed; later calls throw <see cref="ObjectDisposedException"/>. The
+    /// encoder holds only managed memory, and the slice threads are shared by all encoders in the
+    /// process, so there is nothing else to release.
+    /// </summary>
     public void Dispose()
     {
         _disposed = true;

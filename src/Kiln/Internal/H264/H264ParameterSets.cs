@@ -6,9 +6,9 @@ internal static class H264ParameterSets
     /// <summary>
     /// <c>log2_max_frame_num_minus4</c> written to the SPS (§7.3.2.1) and read by the slice
     /// header writer to determine <c>frame_num</c> bit width (§7.3.3). Single source of truth
-    /// so SPS and slice writer always agree. Value 0 → frame_num field is 4 bits wide,
-    /// supporting up to 16 distinct frame numbers before wrap (adequate for CBP Baseline
-    /// streaming where IDR period is ≤ 16 frames).
+    /// so SPS and slice writer always agree. Value 0 → frame_num field is 4 bits wide, so
+    /// frame_num wraps modulo 16 (MaxFrameNum, §7.4.3). The wrap is legal at any IDR period:
+    /// every picture is a reference picture and none are dropped, so there are no gaps.
     /// </summary>
     public const int Log2MaxFrameNumMinus4 = 0;
 

@@ -1,17 +1,18 @@
 # Contributing to Kiln
 
-Kiln is a pure-managed, SIMD-accelerated H.264 baseline-profile encoder.
-It exists specifically so it can be embedded under Apache-2.0 in products
-where GPL/LGPL codec linkage is a problem. Contributions are held to that
-bar — see Originality and citations below.
+Kiln is an H.264 Baseline encoder written entirely in C#. It exists so that
+it can be embedded under Apache-2.0 in products where GPL or LGPL codec
+linkage is a problem, and contributions are held to that bar. See
+[Originality and citations](#originality-and-citations).
 
 ## Getting set up
 
-You need the **.NET 10 SDK** and nothing else to build and run the test
-suite. `ffmpeg` on `PATH` is an **optional** dependency used by a handful of
-decode-oracle tests (see below); those tests detect its absence and pass
-without asserting, so a clean checkout with no `ffmpeg` installed still
-passes `dotnet test`.
+You need the **.NET 10 SDK** to build and to run the tests. Nothing else is
+required.
+
+`ffmpeg` on `PATH` is optional. A few tests use it as an independent decoder.
+Without it those tests pass without asserting anything, so a clean checkout
+still passes `dotnet test`.
 
 ```bash
 git clone https://github.com/Proxeno/kiln.git
@@ -22,97 +23,101 @@ dotnet build -c Release
 dotnet test -c Release
 ```
 
-`dotnet build` must report zero warnings — see [Style](#style) below.
+`dotnet build` must report zero warnings. See [Style](#style).
 
 ## Repository layout
 
-- [`src/Kiln`](src/Kiln) — the library. `Kiln`, `Kiln.RateControl`,
-  `Kiln.Recovery` are the public namespaces; `Kiln.Internal.H264` is
-  internal (accessible to `Kiln.Tests` and `Kiln.Benchmarks` via
-  `InternalsVisibleTo`) and holds the actual codec implementation, including
-  the experimental `Internal/H264/Adaptation` and `Internal/H264/Queue`
-  subsystems.
-- [`tests/Kiln.Tests`](tests/Kiln.Tests) — xunit test project.
-- [`bench/Kiln.Benchmarks`](bench/Kiln.Benchmarks) — BenchmarkDotNet
-  benchmarks used by the perf gate (below) and for ad hoc profiling.
-- [`samples/Kiln.Capture`](samples/Kiln.Capture) — console sample that records
-  a camera to `.m4v`. It is the only project with a third-party runtime
-  dependency (FlashCap, for camera access); the library itself must stay
-  dependency-free. Its MP4 muxer is sample code, not public API.
-- [`docs/architecture.md`](docs/architecture.md) — pipeline stages, SIMD
-  kernel structure, and which subsystems are production vs. experimental.
-  Read this before making non-trivial changes to the encoder.
+- [`src/Kiln`](src/Kiln) is the library. The public namespaces are `Kiln`,
+  `Kiln.RateControl` and `Kiln.Recovery`. The codec itself lives in the
+  internal namespace `Kiln.Internal.H264`, which `Kiln.Tests` and
+  `Kiln.Benchmarks` reach through `InternalsVisibleTo`.
+- [`tests/Kiln.Tests`](tests/Kiln.Tests) is the xunit test project.
+- [`bench/Kiln.Benchmarks`](bench/Kiln.Benchmarks) holds the BenchmarkDotNet
+  benchmarks behind the performance gate, plus stopwatch harnesses for ad hoc
+  measurement.
+- [`samples/Kiln.Capture`](samples/Kiln.Capture) is a console sample that
+  records a camera to `.m4v`. Its MP4 muxer is sample code, not public API.
+- [`docs/architecture.md`](docs/architecture.md) describes the encode
+  pipeline, slice threading, the SIMD kernel sets and the rate controller.
+  Read it before making a non-trivial change to the encoder.
+
+**Dependencies.** The library must have no native dependencies. Its only
+package dependency is `Microsoft.Extensions.Logging.Abstractions`. Do not add
+another without discussing it first. The capture sample is the one project
+that uses a third-party package (FlashCap, for camera access).
 
 ## Test layout
 
-`tests/Kiln.Tests` is organized by what's under test, not by test type; a
-few conventions to know:
+`tests/Kiln.Tests` is organised by what is under test. The kinds of test you
+will meet:
 
-- **SIMD/scalar parity tests** — assert a SIMD kernel produces bit-identical
-  output to its scalar counterpart. Named
-  `<Thing>_simd_matches_scalar_when_intrinsics_available` and self-skip via
-  an `IsSupported` check on hosts/CI runners lacking the target ISA. Every
-  `IH264KernelSet` member needs one of these; see
-  [docs/architecture.md](docs/architecture.md#simd-kernel-structure).
-- **Spec-roundtrip / CAVLC decode tests** (`H264CavlcSpecDecode.cs`,
-  `H264CavlcSpecRoundtripTests.cs`, `H264SpecInverse4x4ParityTests.cs`, …) —
-  decode Kiln's own bitstream output against an independent
-  spec-clause-derived reference implementation in the test project, not
-  against any external decoder library.
-- **Golden-frame regression** (`H264GoldenFrameRegressionTests.cs`, fixtures
-  under `tests/Kiln.Tests/Fixtures/H264Golden`) — byte-for-byte or
-  PSNR-floor comparisons against committed reference output. If you
-  intentionally change encoder output (new RD heuristic, new default), you
-  will need to regenerate and review these fixtures — do not update them
-  reflexively to make a failing test pass.
-- **Decode-oracle / ffmpeg smoke tests** (`H264FfmpegDecodeSmokeTests.cs`,
-  `H264ChromaDcEncoderFfmpegParityTests.cs`) — shell out to an `ffmpeg`
-  binary on `PATH` to decode Kiln's Annex B output as an independent
-  correctness oracle. These exit early (pass) when `ffmpeg` isn't found;
-  install ffmpeg locally if you're touching bitstream syntax or
-  reconstruction and want this coverage to actually run.
-- **Adaptive rate control** (`AdaptiveRateControlTests/Phase1_InterfacesTests.cs`
-  through `Phase5_AdaptationTests.cs`) — cover the experimental
-  `Adaptation`/`Queue` subsystems and the public `RateControl`/`Recovery`
-  layer they build on.
+- **SIMD and scalar parity tests** assert that a SIMD kernel produces output
+  bit-identical to its scalar counterpart. They check `IsSupported` and pass
+  without asserting on a CPU that lacks the instruction set. Every
+  `IH264KernelSet` member needs one. See
+  [docs/architecture.md](docs/architecture.md#parity-tests).
+- **Spec round-trip tests** (`H264CavlcSpecDecode.cs`,
+  `H264CavlcSpecRoundtripTests.cs`, `H264SpecInverse4x4ParityTests.cs` and
+  others) decode Kiln's output with a reference implementation that lives in
+  the test project and was written from the spec clauses. They use no
+  external decoder.
+- **Golden-frame regression tests** (`H264GoldenFrameRegressionTests.cs`,
+  with fixtures under `tests/Kiln.Tests/Fixtures/H264Golden`) compare output
+  against committed reference data, byte for byte or against a PSNR floor.
+  If you change encoder output on purpose, regenerate the fixtures and review
+  the difference. Never update them just to make a failing test pass.
+- **ffmpeg decode tests** (`H264FfmpegDecodeSmokeTests.cs`,
+  `H264ChromaDcEncoderFfmpegParityTests.cs` and others) run an `ffmpeg`
+  binary from `PATH` to decode Kiln's Annex B output as an independent check.
+  They pass without asserting when `ffmpeg` is not found. Install ffmpeg if
+  you are touching bitstream syntax or reconstruction, so that this coverage
+  actually runs.
+- **Rate-control tests** (`AdaptiveRateControlTests/`) cover the public
+  `Kiln.RateControl` and `Kiln.Recovery` types and the internal adaptation
+  layer built on them.
 
-Test collections run non-parallel within the project
-(`tests/Kiln.Tests/xunit.runner.json`); several tests exercise process-wide
-state (env-var-gated diagnostics, static kernel dispatch) that isn't safe
-under concurrent test execution.
+Test collections do not run in parallel
+(`tests/Kiln.Tests/xunit.runner.json`). Several tests touch process-wide
+state, such as the diagnostics switches, and are not safe to run
+concurrently.
 
 ## Benchmarks and the perf gate
 
 `bench/Kiln.Benchmarks` holds BenchmarkDotNet benchmarks for the SIMD hot
-paths (SAD/SATD kernels, motion search, P-inter end-to-end). Changes to
-`Kiln.Internal.H264` kernel code, motion estimation, or the P-inter Phase 2b
-path should be checked against the committed performance baseline before
-merging:
+paths: the SAD and SATD kernels, motion search, and a full P-picture encode.
+If you change kernel code, motion estimation or the P-macroblock path, check
+the change against the committed baseline before you open a pull request:
 
 ```bash
 scripts/h264-simd-perf-gate.sh
 ```
 
-See [docs/perf-gate.md](docs/perf-gate.md) for exactly what this runs, the
-regression thresholds, and how to refresh
-`perf/h264-simd-perf-baseline-latest.json` when a change intentionally moves
-the numbers. Get SIMD/scalar parity tests green first — the perf gate only
-measures speed, not correctness.
+The committed baseline was captured on an arm64 Mac, so the comparison only
+means something on similar hardware. On another machine, capture your own
+baseline from `main` first. [docs/perf-gate.md](docs/perf-gate.md) explains
+what the gate runs, its thresholds, and how to refresh the baseline when a
+change moves the numbers on purpose.
+
+Get the parity tests green first. The gate measures speed, not correctness.
 
 ## Style
 
-The build is strict on purpose, project-wide (`Directory.Build.props`):
+The build is strict on purpose. These settings apply to every project
+(`Directory.Build.props`):
 
-- `TreatWarningsAsErrors` is on, at `AnalysisLevel=latest`. No warnings are
-  tolerated — `dotnet build` must report zero warnings, zero errors.
-- `EnforceCodeStyleInBuild` is on — style violations fail the build.
-- `Nullable` is enabled project-wide.
-- `InvariantGlobalization` is on — comparisons must be ordinal.
-- `AllowUnsafeBlocks` is on in `src/Kiln` and the test/benchmark projects,
-  because the SIMD kernels use hardware intrinsics and pointer-based span
-  reconstruction for the multi-slice fast path. Keep `unsafe` scoped as
-  tightly as the existing code does; don't spread it beyond where it's
-  actually needed for intrinsics or pinning.
+- `TreatWarningsAsErrors` is on, with `AnalysisLevel` set to `latest`. The
+  build must report zero warnings and zero errors.
+- `EnforceCodeStyleInBuild` is on, so style violations fail the build.
+- `Nullable` is enabled.
+- `InvariantGlobalization` is on.
+
+`AllowUnsafeBlocks` is on where SIMD code needs it. Keep `unsafe` as tightly
+scoped as the existing code does, and use it only where intrinsics or pinning
+require it.
+
+Comments and XML documentation describe the code as it is. Leave out history,
+and leave out references to notes or documents that are not in the
+repository.
 
 ## Originality and citations
 
@@ -151,9 +156,11 @@ that it may be distributed under the project's license.
 ## Continuous integration
 
 CI (`.github/workflows/ci.yml`) builds and tests on `ubuntu-latest`,
-`windows-latest`, and `macos-latest` on every push and PR to `main`. This
-matrix exists specifically to exercise both SIMD ISA families: Linux and
-Windows runners are x64 (AVX2 and SSSE3 kernel sets), macOS runners are
-arm64 (NEON). A change that only builds/tests clean on one architecture is
-not done — if you can't test arm64 locally, say so in the PR and rely on the
-macOS CI leg.
+`windows-latest` and `macos-latest` for every push and pull request to
+`main`. The matrix exists to cover both instruction-set families: the Linux
+and Windows runners are x64 and use the AVX2 kernel set, and the macOS
+runners are arm64 and use NEON.
+
+A change that builds and passes on only one architecture is not finished. If
+you cannot test the other one locally, say so in the pull request and rely on
+CI for it.

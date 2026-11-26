@@ -1,4 +1,4 @@
-![Kiln](https://raw.githubusercontent.com/Proxeno/kiln/main/docs/assets/hero.png)
+![Kiln](https://raw.githubusercontent.com/Proxeno/kiln/main/docs/assets/hero.jpg)
 
 # Kiln
 
@@ -8,322 +8,396 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-e8912d)](https://github.com/Proxeno/kiln/blob/main/LICENSE)
 [![.NET 10](https://img.shields.io/badge/.NET-10-e8912d)](https://dotnet.microsoft.com)
 
-**A from-scratch H.264 encoder for .NET.** Pure managed, SIMD-accelerated C#, zero native
-dependencies, Apache-2.0. Feed it raw frames and it hands back a standards-compliant H.264 baseline
-bitstream — the whole codec (bitstream, transforms, intra/inter prediction, motion search, entropy
-coding, deblocking) is implemented here, in this repository, against the ITU-T H.264 specification.
-No native codec to cross-compile, ship, or keep patched.
+**Kiln is an H.264 Baseline encoder written entirely in C#, for .NET applications that need
+low-latency video without shipping a native codec.** You hand it raw I420 frames and it returns
+Annex B access units. Motion search, transforms, CAVLC and deblocking are all implemented in this
+repository against the ITU-T H.264 specification, with NEON, AVX2 and SSSE3 kernels and a scalar
+fallback.
 
-> **Status: pre-release (0.x).** APIs will change. Every capability listed here is backed by a test
-> in this repository — including smoke tests that decode every produced stream with an independent
-> reference decoder as an oracle — and the [What Kiln is not](#what-kiln-is-not) section says plainly
-> what isn't here.
+> **Status: pre-release (0.x).** The API can still change between minor versions.
 
-## What you can build
+## Contents
 
-Kiln is the **encode** step: one .NET process turns rendered or captured frames into an H.264 stream
-you can send anywhere, with no native runtime on the box. It's built for low-latency, real-time
-video, such as:
-
-- **Game & cloud-gaming streaming** — render and encode on a server, play in a browser or thin
-  client with well-under-a-second glass-to-glass latency.
-- **Screen capture & remote desktop** — a headless host encoding its own output frame by frame.
-- **Camera & robotics video** — live feeds from cameras, drones, or robots to an operator's screen.
-- **A source for a WebRTC / RTP pipeline** — Kiln emits Annex B access units that drop straight into
-  a stack like [Keryx](https://www.nuget.org/packages/Proxeno.Keryx) or any RTP packetizer.
-- **Anywhere** you need low-latency managed H.264 inside a .NET process without bundling a native
-  codec or taking on GPL/LGPL linkage.
-
-## Goals
-
-- **Pure managed.** 100% C# on .NET 10 with hardware intrinsics — NEON/AdvSimd on arm64, AVX2 and
-  SSSE3 on x64, scalar fallback everywhere else. No native library to cross-compile, ship, or patch.
-- **Genuinely open.** Apache-2.0, original work that links no copyleft code — embed it in commercial
-  or proprietary products where GPL/LGPL codec linkage is a problem. That's exactly why it exists.
-- **Faithful to the spec.** Written against ITU-T H.264 (ISO/IEC 14496-10); every numeric table that
-  originates in the spec carries its clause/table citation in the source (`Table 9-4`, `§8.5.9`,
-  `§9.2.1`, …).
-- **Real-time first.** Predictable per-frame latency over maximum compression: a steady stream of
-  low-latency frames beats a slow exhaustive search.
-- **Honest about scope.** A 0.x that tells you exactly what is proven and what isn't here yet.
+- [Quick start](#quick-start)
+- [Platforms and SIMD](#platforms-and-simd)
+- [What the encoder does and does not do](#what-the-encoder-does-and-does-not-do)
+- [Options](#options)
+- [Adaptive streaming](#adaptive-streaming)
+- [Performance](#performance)
+- [Kiln or a native encoder?](#kiln-or-a-native-encoder)
+- [Sample, documentation and contributing](#sample-documentation-and-contributing)
+- [License](#license)
 
 ## Quick start
-
-```csharp
-using Kiln;
-using Kiln.RateControl;
-
-var encoder = new H264BaselineEncoder(1280, 720, new H264BaselineEncoderOptions
-{
-    QuantizationParameter = 28,
-    KeyframeIntervalFrames = 120,
-    SliceCount = 4,                         // parallel slice encoding
-    SpeedMode = EncoderSpeedMode.Balanced,  // measured speed/quality preset
-});
-
-var annexB = new byte[1280 * 720 * 2];
-
-// Planar I420 input; u/v are half-resolution planes.
-var written = encoder.EncodeFrame(y, u, v, strideY: 1280, strideUv: 640, annexB);
-var wasIdr = encoder.LastFrameWasIdr;
-// annexB[0..written] is a complete Annex B access unit (SPS/PPS included on IDR).
-```
-
-## What you get
-
-A real encoder, not a toy — the parts a low-latency streaming server actually needs:
-
-- **Baseline bitstream that just plays.** Constrained baseline profile, IDR + P-frames, CAVLC
-  entropy coding, Annex B output (SPS/PPS carried on every IDR) that streams straight into a WebRTC
-  or RTP packetizer and decodes on browsers and hardware decoders.
-- **Genuine coding tools.** Intra 4×4 / 16×16 with RD mode selection, P-slice inter prediction with
-  sub-pel SATD motion search, P_Skip, and multiple reference frames.
-- **Quality knobs.** In-loop deblocking, optional greedy trellis quantization, variance-based
-  spatial adaptive QP, and per-frame rate control.
-- **A measured speed ladder.** Four `SpeedMode` presets over the motion-search knobs, each a
-  measured point on the speed/quality curve, plus a deterministic per-frame motion-search work
-  budget that bounds the worst-case frame time without making bitstreams timing-dependent.
-- **Parallelism built in.** Multi-slice frames encode their slices in parallel and bound the region a
-  lost packet can damage.
-- **SIMD with a safety net.** NEON/AdvSimd, AVX2 and SSSE3 kernels selected at runtime, each covered
-  by parity tests against a scalar reference; CI runs the full suite on Linux, Windows and macOS so
-  both architectures stay green.
-- **A wired adaptation loop.** `H264StreamingSession` connects `Kiln.RateControl` (low-latency
-  rate controller with network feedback) and `Kiln.Recovery` (IDR budgeting / keyframe recovery)
-  to the encoder: feed it network feedback per frame — loss, RTT, queue depth, PLI/FIR, a
-  transport bandwidth estimate that hard-caps the target bitrate, jitter as a queueing early
-  warning, and client decode delay for complexity (not bitrate) relief — and get adaptive QP,
-  bitrate, IDRs, and live speed-mode changes out, deterministically, with no glue code on your
-  side.
-- **Verified.** 2,292 tests — spec-roundtrip decoding, SIMD/scalar parity, golden-frame regression,
-  PSNR fidelity floors, adversarial neighbour-availability sweeps, byte-exact
-  reconstruction-vs-ffmpeg conformance oracles, and independent-decoder smoke tests over every
-  produced stream.
-
-## Options reference
-
-| Option | Default | What it does |
-|---|---|---|
-| `QuantizationParameter` | 28 | Base QP, 0–51. |
-| `SpeedMode` | `HighQuality` | Measured speed/quality preset ladder (`HighQuality`/`Balanced`/`Fast`/`VeryFast`) over `MaxReferenceFrames`, `UseMotionSatd`, `SubPartitionRangeCap` and `MotionSearchEffortCapPerMb`. Any of those four you assign explicitly wins over the mode; other options are never touched. See [Performance](#performance) for what each rung buys and costs. |
-| `KeyframeIntervalFrames` | 60 | IDR every N coded frames (frame 0 is always IDR). `EncodeFrame(forceKeyframe: true)` overrides. |
-| `SliceCount` | 1 | Slices per frame; >1 encodes slices in parallel and bounds loss regions. |
-| `MaxReferenceFrames` | 2 | 1 = single-ref (WebRTC / hardware-decoder safe), 2 = multi-reference P. Sets the SPS ceiling; below it the operating count follows live `ApplySpeedMode`/`ApplySpeedKnobs` calls, mid-GOP, no IDR needed. |
-| `TargetBitsPerFrame` | 0 (off) | Per-MB QP adaptation toward a per-frame bit budget. Overridable per picture via `EncodeFrame(targetBitsPerFrame:)` — how the streaming session drives a live bitrate target. |
-| `FastSearch` | true | Hex/diamond integer ME + qpel refinement; false = exhaustive integer search. |
-| `UseMotionSatd` | true | SATD scoring for integer-pel ME candidates (SAD for fractional refinement). |
-| `EnableIntraInPFallback` | true | Allows I16x16/I4x4 macroblocks inside P-frames when inter prediction fails. |
-| `IntraRefreshPeriodFrames` | 0 (off) | Gradual intra refresh: N > 0 enables it (sets `constrained_intra_pred_flag` in the PPS) and spreads each `RequestIntraRefresh()` wave over up to N frames — an intra MB-column band sweeps the picture with motion vectors of refreshed MBs restricted to the refreshed reference region, so a decoder joining at the wave start converges byte-exactly without an IDR. Measured at 640×480 QP 30 on motion content: recovery costs a max of ~2.7× a typical P-frame per frame for N frames instead of one ~14× IDR spike; the standing cost of the flag with no wave running is ≈ +0.3–1.1% bits, ±0.1 dB. |
-| `TrellisLevel` | 0 | 1 = greedy per-coefficient trellis quantization (better RD, ~5% CPU). |
-| `AdaptiveQuantStrength` | 0.0 | Variance-based spatial AQ; 1.0 = standard, typical 0.5–1.5. |
-| `PreferRealtimeLatencyTuning` | false | Skips chroma-DC RD refinement for inter-coded chroma. Does not bound motion-search cost — that's `MotionSearchEffortCapPerMb`. |
-| `LightweightDeblocking` | false | Disables in-loop deblocking (bitstream-signalled) to cut CPU. |
-| `PreferHardwareIntrinsics` | true | Runtime SIMD kernel selection; false forces scalar. |
-| `SubPartitionRangeCap` | 16 | Sub-partition ME radius cap (per-frame complexity budget applies). A speed knob: 8 is ~20% faster per frame and 4 ~30% faster. Quality-neutral (±0.01 dB) on coherent motion; on divergent motion 8 costs about −0.17 dB / +13.5% bits at QP 24. |
-| `MotionSearchEffortCapPerMb` | 0 (off) | Deterministic worst-case frame-time bound: caps motion-search work per frame (units/MB; each slice gets an equal share) and degrades the search in steps as the budget depletes, paying bitrate/PSNR only when the cap binds. Bitstreams stay reproducible — the count is algorithmic work, not wall clock. Set by the non-default `SpeedMode` presets; see [Performance](#performance) for measured bounds and prices. |
-| `ProfileIdc` / `LevelIdc` | 66 / 0 (auto) | Signalled profile (baseline) and level. `LevelIdc = 0` auto-selects the lowest level whose MaxFS admits the frame, floored at 3.1; set explicitly to pin a level. |
-| `ChromaDcRdLambda`, `Intra4x4SadLambda` | derived | Expert RD-lambda overrides; leave null. |
-
-## Performance
-
-Measured on Apple M5 Max (arm64, NEON/AdvSimd), .NET 10, quiet machine, QP 28, steady P-frames
-over deterministic synthetic content. Every number is reproducible from the harnesses in
-`bench/Kiln.Benchmarks` (`--slice-quick`, `--speed-modes`, `--speed-modes-timing`,
-`--speed-modes-tiers`), with competing configurations interleaved in one process so scheduling
-drift hits every arm equally. Three questions, in the order a deployment asks them: what does the
-default cost, what can a speed mode buy, and what is the worst case.
-
-### Default quality on realistic content
-
-Steady P-frame medians on textured scroll-plus-noise content ("coherent motion" — a camera pan or
-game scroll; neither a best case nor a stress case), default options:
-
-| Resolution | 1 slice | 2 slices | 4 slices | 8 slices |
-|---|---:|---:|---:|---:|
-| 640x480 | 17.3 ms | 8.6 ms | 5.6 ms | 4.0 ms |
-| 1280x720 | 19.9 ms | 16.0 ms | 9.4 ms | 7.5 ms |
-| 1920x1080 | 24.4 ms | 16.9 ms | 10.9 ms | 10.8 ms |
-
-Slices do not divide the work cleanly. Four slices buy about 2.2x at 1080p — not 4x — and eight
-buy essentially nothing beyond four: per-slice motion cost doesn't balance perfectly, and the
-frame still pays serial per-frame work. Slices also cost bits, because slice boundaries reset
-MV/skip prediction: measured +5% to +26% bitrate at QP 28 going from 1 to 4 slices depending on
-content (up to ~+40% on cheap coherent frames at QP 23). Choose `SliceCount` for latency and
-packet-loss confinement and budget for both costs; do not expect linear returns.
-
-### The speed-mode ladder: best achievable and its price
-
-`H264BaselineEncoderOptions.SpeedMode` selects a measured preset over four motion-search knobs
-(`MaxReferenceFrames`, `UseMotionSatd`, `SubPartitionRangeCap`, `MotionSearchEffortCapPerMb`); any
-of those you assign explicitly wins over the mode. All rungs keep bitstreams deterministic — the
-effort budgets count algorithmic work, never wall clock. 1080p steady-P medians:
-
-| Mode | Sets | Coherent, s=1 / s=4 | Divergent worst case, s=1 / s=4 |
-|---|---|---:|---:|
-| `HighQuality` (default) | 2 refs, SATD ME, full sub-partition range, no cap | 26.6 / 10.0 ms | 205 / 70 ms |
-| `Balanced` | 1 ref, effort cap 512/MB | 18.8 / 8.2 ms | 80 / 30 ms |
-| `Fast` | + sub-partition radius 8, cap 256 | 15.6 / 7.7 ms | 64 / 24 ms |
-| `VeryFast` | + SAD-scored ME, cap 128 | 8.9 / 4.0 ms | 20 / 7.8 ms |
-
-And the quality price, 1080p QP 28, PSNR / bitrate versus `HighQuality` by content class:
-
-| Mode | Static | Coherent motion | High motion | Scene cut | Divergent motion |
-|---|---|---|---|---|---|
-| `Balanced` | 0 | −0.1 dB, +1% | −1.6 dB, +12% | +0.3 dB, −3% | −0.4 dB, +40% |
-| `Fast` | 0 | −0.1 dB, +1% | −1.7 dB, +11% | +0.4 dB, −4% | −0.5 dB, +55% |
-| `VeryFast` | 0 | −1.2 dB, +7% | −3.5 dB, +21% | −0.9 dB, +2% | −1.5 dB, +64% |
-
-Read it as: on static and coherent content `Balanced` and `Fast` are near-free and `VeryFast`
-costs about a decibel; when content turns violent, the capped modes hold their frame time and pay
-in quality and bits exactly there. The price concentrates at low QP, where frames that genuinely
-need a wide search are cut off hardest — at QP 23 `Balanced` measures −6.8 dB on the high-motion
-generator and −3.7 dB on scene cuts. If you run QP ≤ 23 on demanding content, prefer
-`HighQuality`, or compose your own point on the curve (e.g. `SpeedMode = Balanced` with an
-explicit, higher `MotionSearchEffortCapPerMb` — the explicit knob wins).
-
-### Worst case
-
-The number that breaks a real-time deployment is not the mean but the hostile frame. On the
-divergent-motion stress generator (opposing half-screen scrolls plus counter-moving blocks) the
-default configuration measures **205 ms/frame** at 1080p single-slice (70 ms at 4 slices) against
-27/10 ms on coherent content in the same run — a ~7x content-dependent swing with no bound. The bound is
-`MotionSearchEffortCapPerMb` (set by every non-default speed mode): a deterministic per-frame
-work budget that degrades the search in steps as it depletes, cutting that worst case to 80 ms
-(`Balanced`) / 64 ms (`Fast`) / 20 ms (`VeryFast`) single-slice, while charging quality only when
-it actually binds. If your content is unusual, size the cap yourself — the
-`--speed-modes-tiers` harness shows how hard a given cap binds per content class.
-
-**For most real-time use, bound the tail without taking the quality trade.** The default
-`HighQuality` is the only mode that leaves `MotionSearchEffortCapPerMb` at 0, so it is also the only
-one with no worst-case bound — 10 ms typical at 1080p 4-slice, but 70 ms (14 fps) on a hostile
-frame. Because an explicitly-set option always beats the mode, you can keep every `HighQuality`
-coding decision and add just the bound:
-
-```csharp
-var encoder = new H264BaselineEncoder(1920, 1080, new H264BaselineEncoderOptions
-{
-    SpeedMode = EncoderSpeedMode.HighQuality,   // 2 refs, SATD ME, full sub-partition range
-    MotionSearchEffortCapPerMb = 512,           // explicit assignment overrides the mode's 0
-});
-```
-
-That costs about −0.01 dB on coherent content — the cap charges quality only where it binds — and
-pulls the hostile case in to roughly 35-40 ms at 4 slices. Prefer it over `Balanced` when you want
-the bound but not the single-reference trade, which is what costs `Balanced` its −0.7 to −2.9 dB on
-high-motion content at QP ≤ 28.
-
-### Microbenchmarks and the perf gate
-
-The committed perf-gate baselines (`perf/`, BenchmarkDotNet):
-
-| Benchmark | Mean | Min |
-|---|---:|---:|
-| SATD 4x4 kernel (`Satd4x4_Once`) | 11.2 ns | 11.1 ns |
-| SATD 4x4 x 9 intra modes (`SatdMany4x4_9Modes`) | 99.3 ns | 99.2 ns |
-| SAD 8x8 dispatch | 3.5 ns | 3.4 ns |
-| SAD 16x16 dispatch (stride 720) | 6.4 ns | 6.4 ns |
-| Full-MB 16x16 ME search, range 8 | 76.4 us | 76.1 us |
-| Steady P-frame encode, 1280x720, 1 slice | 2.24 ms | 2.20 ms |
-
-That 2.24 ms row is measured on **near-static synthetic content** — size deployments from the
-realistic-content tables above, not from it. Perf discipline is part of the repo:
-`bench/Kiln.Benchmarks` plus `scripts/h264-simd-capture-baseline.sh` and
-`scripts/h264-simd-perf-gate.sh` gate changes against the committed baseline in `perf/`. See
-[docs/perf-gate.md](docs/perf-gate.md).
-
-## What Kiln is not
-
-Not an x264 competitor. No B-frames, no CABAC, no 8×8 transform, no interlace; 4:2:0 8-bit only.
-If you need maximum compression at any CPU cost, use a full-profile encoder. If you need
-clean-licensed, dependency-free, low-latency H.264 inside a .NET process, you are in the right place.
-
-Frame dimensions need not be multiples of 16: sizes like 1920×1080 or 1366×768 are supported via
-SPS frame cropping — the encoder pads to the 16×16 macroblock grid internally and signals the true
-display size, which is what decoders output. Dimensions must be **even** (4:2:0 chroma is
-subsampled 2×2, so odd extents are unrepresentable). By default the encoder signals the lowest
-H.264 level whose frame-size limit (MaxFS, Annex A Table A-1) admits the *padded* picture, floored
-at Level 3.1 — 1920×1080 codes as 1920×1088 (8160 macroblocks) and signals Level 4.0 automatically.
-Set `H264BaselineEncoderOptions.LevelIdc` explicitly to pin a level; an explicit level that is too
-small for the frame throws, naming the lowest sufficient level. The chosen level is readable from
-`H264BaselineEncoder.LevelIdc`.
-
-> **0.x behavioural change:** `LevelIdc` previously defaulted to 31 (Level 3.1) and the constructor
-> threw for frames above 1280×720. The default is now 0 = auto-select. Streams ≤720p with default
-> options are byte-identical to before (the auto floor is still 3.1); larger frames now construct
-> and encode instead of throwing. `EncodeFrame`'s output span now has a documented recommended size,
-> `H264BaselineEncoder.RecommendedOutputBufferSize`.
-
-> **0.x conformance fix:** two deblocking bugs made the encoder's reconstruction drift from every
-> conformant decoder's — the luma filter ignored the §8.7.2.2 QP average across macroblock edges,
-> and boundary-strength derivation inverted §8.7.2.1's precedence of coded coefficients over MV
-> differences. Streams using per-MB QP (`TargetBitsPerFrame`, `AdaptiveQuantStrength`) and
-> constant-QP streams at QPs where Table 8-17 distinguishes bS 1 from 2 (e.g. 31, 32, 35, 36)
-> produce different — now correct — bytes. Default-option streams and QP 23/28/33/34 constant-QP
-> streams are unaffected. Verified byte-exact against both ffmpeg and VideoToolbox.
-
-On the real-time story, be precise about what is wired and what is not. The adaptation loop is
-wired: `H264StreamingSession` owns an encoder plus the rate controller, and per frame turns
-`EncoderNetworkFeedback` — loss, RTT, queue depth, PLI/FIR, and, when the transport supplies
-them, a bandwidth estimate (a hard ceiling on the target bitrate), jitter (a queueing early
-warning that tempers upshifts), and client decode delay (complexity relief via the speed/fps/
-resolution cascade, never a bitrate cut) — into applied settings — slice QP, a
-per-picture bit budget, recovery IDRs, and live `SpeedMode` changes, including the reference-count
-component, which swaps mid-GOP without an IDR because the SPS-signalled DPB size is an upper
-bound the operating count may sit below:
-
-```csharp
-using var session = new H264StreamingSession(1280, 720);
-var buffer = new byte[session.RecommendedOutputBufferSize];
-// Each frame: pass the latest transport snapshot, get adaptive encoding out.
-var result = session.EncodeFrame(y, u, v, strideY, strideUv, buffer, feedback);
-// result.WasIdr, result.AppliedSliceQp, result.Decision.TargetBitrateBps, …
-```
-
-The session is deterministic (identical frames + feedback → identical bytes; wall-clock load
-figures participate only if you pass them in), and it is honest about its limits: resolution
-decisions are surfaced as recommendations until you can supply rescaled frames and call
-`ChangeResolution` (Kiln has no scaler; the session recreates the encoder and the next frame is an
-IDR with the new SPS), and `TargetFps` is a pacing contract for your capture loop (the SPS carries
-no timing info). Gradual intra refresh is implemented: construct with
-`IntraRefreshPeriodFrames = N` and a recovery request that lands in the IDR cooldown starts a
-refresh wave — a band of intra MB columns sweeping the picture over up to N frames, with
-`constrained_intra_pred_flag` and motion vectors restricted to the refreshed region, so a decoder
-joining at the wave start (SPS/PPS and a recovery-point SEI are repeated there) reconstructs
-byte-exactly once the wave completes, for a bounded per-frame premium instead of an IDR-sized
-spike. With the option at its default 0 the flag is off and streams are byte-identical to previous
-releases. Frame pacing and input dropping stay in your capture loop by design (the capture sample
-shows a latest-frame-wins hand-off; report your drops via `EncoderPipelineTimings` and the
-controller sees them). The full taxonomy of what may change mid-stream at which boundary is in
-[docs/architecture.md](docs/architecture.md).
-
-## Installing
-
-Published on [nuget.org](https://www.nuget.org/packages/Proxeno.Kiln) as `Proxeno.Kiln`. The package
-id is `Proxeno.Kiln`; the assembly and namespace stay `Kiln`, so code uses `using Kiln;`.
 
 ```
 dotnet add package Proxeno.Kiln
 ```
 
-## Try it
+The package id is `Proxeno.Kiln`. The assembly and namespace are `Kiln`, and the package targets
+.NET 10.
 
-[`samples/Kiln.Capture`](samples/Kiln.Capture) records your camera to a playable `.m4v` — capture,
-colour conversion, H.264 encode and MP4 muxing, all managed, no native binaries anywhere in the
-pipeline:
+This is a complete console program. It encodes two seconds of a scrolling gradient at 720p and
+writes a raw H.264 stream:
 
+```csharp
+using Kiln;
+
+const int width = 1280, height = 720;
+
+using var encoder = new H264BaselineEncoder(width, height, new H264BaselineEncoderOptions
+{
+    QuantizationParameter = 28,    // 0-51; lower is higher quality
+    KeyframeIntervalFrames = 120,  // an IDR every 120 frames
+    SliceCount = 4,                // four slices, encoded in parallel
+});
+
+// Planar I420: full-resolution luma, half-resolution chroma.
+var y = new byte[width * height];
+var u = new byte[width / 2 * (height / 2)];
+var v = new byte[width / 2 * (height / 2)];
+u.AsSpan().Fill(128);
+v.AsSpan().Fill(128);
+
+var annexB = new byte[encoder.RecommendedOutputBufferSize];
+using var file = File.Create("out.h264");
+
+for (var frame = 0; frame < 120; frame++)
+{
+    // Stand-in for your capture or render step: a scrolling gradient.
+    for (var row = 0; row < height; row++)
+    {
+        for (var col = 0; col < width; col++)
+        {
+            y[row * width + col] = (byte)(col + row + frame * 4);
+        }
+    }
+
+    var written = encoder.EncodeFrame(y, u, v, strideY: width, strideUv: width / 2, annexB);
+    file.Write(annexB, 0, written);  // one complete Annex B access unit
+}
 ```
-dotnet run --project samples/Kiln.Capture -- list
-dotnet run --project samples/Kiln.Capture -- record --seconds 10 --output capture.m4v
+
+Play the result with `ffplay out.h264`, or wrap it in a container with
+`ffmpeg -framerate 60 -i out.h264 -c copy out.mp4`.
+
+What to know about `EncodeFrame`:
+
+- Each call returns one complete access unit. There is no lookahead and no frame delay.
+- SPS and PPS are written ahead of every IDR, so a decoder can join at any keyframe.
+- `encoder.LastFrameWasIdr` tells you whether the frame just written was a keyframe, and
+  `EncodeFrame(..., forceKeyframe: true)` requests one.
+- An encoder instance encodes one frame at a time. Calls on the same instance must not overlap.
+
+## Platforms and SIMD
+
+Kiln has no native code and no platform-specific code, so it runs wherever .NET 10 does. The
+encoder picks one kernel set when it is constructed:
+
+| CPU | Kernel set | Chosen when |
+|---|---|---|
+| x64 with AVX2 | `Avx2KernelSet` | `Avx2.IsSupported` |
+| x64 without AVX2 | `Ssse3KernelSet` | `Ssse3.IsSupported` |
+| arm64 | `Neon64KernelSet` | `AdvSimd.Arm64.IsSupported` |
+| 32-bit Arm with NEON | `NeonKernelSet` | `AdvSimd.IsSupported` |
+| anything else | `ScalarKernelSet` | always available |
+
+Setting `PreferHardwareIntrinsics = false` forces the scalar set. SIMD kernels are tested for
+bit-identical output against their scalar counterparts.
+
+CI builds and runs the test suite on Linux and Windows (x64) and on macOS (arm64). The hosted x64
+runners support AVX2, so the SSSE3-only and 32-bit Arm selections are not exercised as the active
+kernel set in CI.
+
+The library's only package dependency is `Microsoft.Extensions.Logging.Abstractions`, which the
+rate-control layer uses for optional logging.
+
+## What the encoder does and does not do
+
+Kiln produces Constrained Baseline streams (`profile_idc` 66 with `constraint_set0_flag` and
+`constraint_set1_flag` set).
+
+![Encode pipeline: an I420 frame goes through frame setup, then slices encoded in parallel (predict, transform and quantize, CAVLC, reconstruct), then NAL packaging into an Annex B access unit](https://raw.githubusercontent.com/Proxeno/kiln/main/docs/assets/pipeline.svg)
+
+| | Supported | Not supported |
+|---|---|---|
+| **Pictures** | IDR and P pictures, progressive frames | B-frames, interlaced or field coding |
+| **Entropy coding** | CAVLC | CABAC |
+| **Transform** | 4×4 integer transform | 8×8 transform |
+| **Intra prediction** | Intra 4×4 (9 modes), Intra 16×16 (4 modes), intra macroblocks inside P pictures | |
+| **Inter prediction** | 16×16, 16×8, 8×16 and 8×8 partitions, quarter-pel motion vectors, `P_Skip`, up to 2 reference frames | Partitions below 8×8, weighted prediction, long-term references |
+| **Loop filter** | In-loop deblocking (can be switched off) | |
+| **Slices** | 1 to 8 slices per frame, encoded in parallel | FMO, ASO, redundant slices |
+| **Input** | Planar I420, 8-bit 4:2:0 | Other chroma formats or bit depths, colour conversion, scaling |
+| **Output** | Annex B byte stream | MP4 or any other container, RTP packetization |
+| **Rate control** | Constant QP, a per-frame bit budget, variance-based adaptive QP | HRD or VBV conformance |
+| **Error recovery** | Forced IDR, gradual intra refresh with a recovery-point SEI | |
+
+Other limits and behaviours worth knowing:
+
+- **Frame size.** Width and height must be even. They need not be multiples of 16: Kiln pads to the
+  macroblock grid internally and signals the true size through SPS cropping, so 1920×1080 or
+  1366×768 decode at exactly that size. The largest coded picture is 36,864 macroblocks (the
+  Level 5.2 limit).
+- **Level.** With `LevelIdc = 0` (the default) Kiln signals the lowest level whose frame-size limit
+  (MaxFS) fits the padded picture, and never less than Level 3.1. 1920×1080 signals Level 4.0. Only
+  the frame-size limit is checked. Bitrate and macroblock-rate limits are not enforced.
+- **Colour and timing.** The SPS describes the video as BT.601, limited range. It carries no timing
+  information, so frame rate lives in your container or transport.
+- **Decoder.** Kiln is an encoder only.
+
+## Options
+
+`H264BaselineEncoderOptions` is read once, when the encoder is constructed.
+
+| Option | Default | What it does |
+|---|---|---|
+| `QuantizationParameter` | 28 | Base QP, 0–51. Lower is higher quality and more bits. |
+| `KeyframeIntervalFrames` | 60 | An IDR every N frames. The first frame is always an IDR. |
+| `SliceCount` | 1 | Slices per frame, 1–8. More than one encodes slices in parallel and limits how much of a frame a lost packet can damage. `null` picks `min(macroblock rows, max(1, ProcessorCount − 1), 8)`. |
+| `SpeedMode` | `HighQuality` | Preset over the four motion-search options marked † below: `HighQuality`, `Balanced`, `Fast` or `VeryFast`. See [Speed modes](#speed-modes). |
+| `MaxReferenceFrames` † | 2 | Reference frames, 1 or 2. Use 1 for decoders that expect single-reference streams. |
+| `UseMotionSatd` † | true | Score integer-pel motion candidates with SATD instead of SAD. |
+| `SubPartitionRangeCap` † | 16 | Search radius, in pixels, for partitions smaller than 16×16. |
+| `MotionSearchEffortCapPerMb` † | 0 (off) | Caps motion-search work per frame. See [Worst case](#worst-case). |
+| `FastSearch` | true | Hexagon and diamond integer search with quarter-pel refinement. `false` searches exhaustively. |
+| `EnableIntraInPFallback` | true | Lets a P picture code a macroblock as intra when inter prediction is poor. |
+| `TargetBitsPerFrame` | 0 (off) | Per-frame bit budget. The encoder adjusts QP per macroblock to approach it. Can be overridden per call with `EncodeFrame(targetBitsPerFrame:)`. |
+| `AdaptiveQuantStrength` | 0.0 (off) | Variance-based adaptive QP. 1.0 is standard strength. Typical values are 0.5–1.5. |
+| `TrellisLevel` | 0 (off) | 1 enables greedy per-coefficient trellis quantization. |
+| `IntraRefreshPeriodFrames` | 0 (off) | N > 0 enables gradual intra refresh and spreads each refresh wave over up to N frames. See [Loss recovery](#loss-recovery). |
+| `LightweightDeblocking` | false | Turns the deblocking filter off, in the encoder and (through the slice header) in the decoder. |
+| `PreferRealtimeLatencyTuning` | false | Skips chroma-DC rate-distortion refinement on inter-coded chroma. |
+| `PreferHardwareIntrinsics` | true | `false` forces the scalar kernels. |
+| `LevelIdc` | 0 (auto) | `level_idc` to signal. A level too small for the frame makes the constructor throw. |
+| `ProfileIdc` | 66 | Baseline. No other value is accepted. |
+| `ChromaDcRdLambda`, `Intra4x4SadLambda` | null | Rate-distortion weight overrides. Leave them unset. |
+| `ExperimentalZeroMvSkipSadThreshold` | null | Experimental. Leave it unset. |
+
+† An option you assign explicitly always wins over `SpeedMode`. The mode only fills in the ones
+you leave alone.
+
+Three things can also be changed on a live encoder, between frames and without an IDR: the slice
+QP (`EncodeFrame(sliceLumaQp:)`), the bit budget (`EncodeFrame(targetBitsPerFrame:)`), and the
+four † options (`ApplySpeedMode` and `ApplySpeedKnobs`). The reference count can never exceed
+the value the encoder was constructed with.
+
+### Loss recovery
+
+A forced IDR is the simple way to recover a decoder after packet loss, but an IDR is many times
+larger than a P picture. Gradual intra refresh spreads the cost: construct the encoder with
+`IntraRefreshPeriodFrames = N`, call `RequestIntraRefresh()`, and a band of intra-coded macroblock
+columns sweeps across the picture over up to N frames. A decoder that joins at the first frame of
+the wave, where Kiln repeats SPS and PPS and adds a recovery-point SEI, has a bit-exact picture
+once the wave completes.
+
+Enabling the option sets `constrained_intra_pred_flag` for the whole stream, which costs a little
+quality even when no wave is running. Measured at 640×480, QP 30, on motion content: a wave peaks
+at about 2.7× a typical P picture per frame where an IDR costs about 14×, and the standing cost of
+the flag is +0.3% to +1.1% bits.
+
+## Adaptive streaming
+
+`H264StreamingSession` wraps an encoder and a rate controller. Each frame you give it the latest
+network feedback, and it chooses the QP, the bit budget, the speed mode and when to send an IDR:
+
+```csharp
+using Kiln;
+using Kiln.RateControl;
+
+const int width = 1280, height = 720;
+var y = new byte[width * height];
+var u = new byte[width / 2 * (height / 2)];
+var v = new byte[width / 2 * (height / 2)];
+
+using var session = new H264StreamingSession(width, height);
+var annexB = new byte[session.RecommendedOutputBufferSize];
+
+// Each frame: pass the latest transport snapshot, get an adapted access unit back.
+var feedback = new EncoderNetworkFeedback(
+    EstimatedAvailableBitrateBps: 6_000_000,   // 0 = no estimate
+    PacketLossRatio: 0.0,
+    RoundTripTime: TimeSpan.FromMilliseconds(30),
+    Jitter: TimeSpan.Zero,                     // zero = not measured
+    PendingRtpBytes: 0,
+    NackCount: 0,
+    PictureLossIndication: false,              // set for exactly one frame per PLI
+    FullIntraRequest: false,
+    ClientDecodeDelay: null);
+
+var result = session.EncodeFrame(y, u, v, strideY: width, strideUv: width / 2, annexB, feedback);
+
+Console.WriteLine($"{result.BytesWritten} bytes, IDR={result.WasIdr}, QP={result.AppliedSliceQp}, " +
+                  $"target={result.Decision.TargetBitrateBps} bps, mode={result.AppliedSpeedMode}");
 ```
 
-## Documentation
+How the session uses each input:
 
-- [samples/Kiln.Capture](samples/Kiln.Capture) — camera → `.m4v` sample, and how the MP4 muxing works
-- [docs/architecture.md](docs/architecture.md) — pipeline stages, SIMD kernel structure, subsystems
-- [docs/perf-gate.md](docs/perf-gate.md) — benchmark baseline + regression gate workflow
-- [CONTRIBUTING.md](CONTRIBUTING.md) — build, test, and contribution rules
-- [SECURITY.md](SECURITY.md) — reporting vulnerabilities
+| Feedback | Effect |
+|---|---|
+| Packet loss, NACKs, send-queue backlog, an RTT spike | Congestion: the target bitrate steps down, then climbs back after a stable period. |
+| `EstimatedAvailableBitrateBps` | A hard ceiling on the target bitrate. |
+| `Jitter` | A spike holds bitrate increases. It never causes a cut. |
+| `ClientDecodeDelay` | A client that cannot keep up gets a cheaper stream to decode (speed mode, then frame rate, then resolution). Bitrate is not cut. |
+| `PictureLossIndication`, `FullIntraRequest` | An IDR, or a refresh wave if an IDR was sent too recently and intra refresh is enabled. |
+
+Things the session leaves to you:
+
+- **Resolution.** Kiln has no scaler. When the controller wants a different size, the result sets
+  `ResolutionChangeRecommended`. If you can supply frames at that size, call `ChangeResolution`.
+  The next frame is then an IDR with a new SPS.
+- **Frame rate.** `TargetFps` is a pacing request for your capture loop. It changes the per-frame
+  bit budget but nothing in the bitstream.
+- **Frame dropping.** Pacing and dropping late frames belong to your capture loop. Report drops
+  through `EncoderPipelineTimings` and the controller takes them into account.
+
+`RateControlConfig` defaults suit 1080p60 game streaming (8 Mbps initial target, 0.5–50 Mbps
+range, a 60/30/15 fps ladder). Set it for your own link and content.
+
+The session is deterministic: the same frames and the same feedback produce the same bytes.
+[docs/architecture.md](https://github.com/Proxeno/kiln/blob/main/docs/architecture.md#rate-control-and-recovery)
+describes the controller and exactly what may change mid-stream.
+
+## Performance
+
+Every figure in this section was measured on one machine: an Apple M5 Max (arm64, NEON), .NET 10,
+with the machine otherwise idle. They are steady-state P-picture times at QP 28 on synthetic
+content, taken with the harnesses in
+[`bench/Kiln.Benchmarks`](https://github.com/Proxeno/kiln/tree/main/bench/Kiln.Benchmarks). No
+x64 figures are published yet. Measure on your own hardware and content before sizing a
+deployment.
+
+### Slices
+
+Median P-picture time with default options on a textured scroll with noise, which stands in for a
+camera pan or a scrolling game (`--slice-quick`):
+
+| Resolution | 1 slice | 2 slices | 4 slices | 8 slices |
+|---|---:|---:|---:|---:|
+| 640×480 | 17.3 ms | 8.6 ms | 5.6 ms | 4.0 ms |
+| 1280×720 | 19.9 ms | 16.0 ms | 9.4 ms | 7.5 ms |
+| 1920×1080 | 24.4 ms | 16.9 ms | 10.9 ms | 10.8 ms |
+
+Slices do not scale linearly. At 1080p, four slices are about 2.2× faster than one, and eight add
+almost nothing over four. Slices also cost bits, because prediction does not cross a slice
+boundary: going from 1 to 4 slices measured +5% to +26% bitrate at QP 28, depending on content.
+Choose `SliceCount` for latency and loss confinement, and budget for both costs.
+
+### Speed modes
+
+`SpeedMode` trades compression for speed. Median 1080p P-picture times (`--speed-modes-timing`),
+on the same scroll content ("coherent") and on a stress pattern of opposing scrolls with
+counter-moving blocks ("divergent"):
+
+| Mode | What it sets | Coherent, 1 / 4 slices | Divergent, 1 / 4 slices |
+|---|---|---:|---:|
+| `HighQuality` (default) | 2 references, SATD search, radius 16, no effort cap | 26.6 / 10.0 ms | 205 / 70 ms |
+| `Balanced` | 1 reference, effort cap 512 | 18.8 / 8.2 ms | 80 / 30 ms |
+| `Fast` | 1 reference, radius 8, effort cap 256 | 15.6 / 7.7 ms | 64 / 24 ms |
+| `VeryFast` | 1 reference, SAD search, radius 8, effort cap 128 | 8.9 / 4.0 ms | 20 / 7.8 ms |
+
+The quality cost against `HighQuality`, as PSNR and bitrate at 1080p, QP 28 (`--speed-modes`):
+
+| Mode | Static | Coherent motion | High motion | Scene cut | Divergent motion |
+|---|---|---|---|---|---|
+| `Balanced` | none | −0.1 dB, +1% | −1.6 dB, +12% | +0.3 dB, −3% | −0.4 dB, +40% |
+| `Fast` | none | −0.1 dB, +1% | −1.7 dB, +11% | +0.4 dB, −4% | −0.5 dB, +55% |
+| `VeryFast` | none | −1.2 dB, +7% | −3.5 dB, +21% | −0.9 dB, +2% | −1.5 dB, +64% |
+
+On static and gently moving content `Balanced` and `Fast` cost almost nothing. On violent content
+the capped modes hold their frame time and pay for it in quality and bits. The cost is larger at
+low QP: at QP 23, `Balanced` measured −6.8 dB on the high-motion content and −3.7 dB on scene
+cuts.
+
+### Worst case
+
+With default options, frame time depends heavily on content: 205 ms on the divergent pattern
+against 27 ms on coherent motion, at 1080p with one slice. `HighQuality` is the only mode with no
+bound on that.
+
+`MotionSearchEffortCapPerMb` is the bound. It is a budget of motion-search work per frame, and as
+a frame uses it up the search narrows in steps. It counts work rather than time, so output stays
+deterministic, and it costs quality only on frames that reach it.
+
+To keep the `HighQuality` settings and still bound the worst case, set the cap yourself:
+
+```csharp
+using Kiln;
+using Kiln.RateControl;
+
+var encoder = new H264BaselineEncoder(1920, 1080, new H264BaselineEncoderOptions
+{
+    SpeedMode = EncoderSpeedMode.HighQuality,
+    MotionSearchEffortCapPerMb = 512,  // an explicit value wins over the mode
+    SliceCount = 4,
+});
+```
+
+In the same measurements that costs about 0.01 dB on coherent content and brings the divergent
+case down from 70 ms to roughly 35–40 ms at 4 slices.
+
+### Kernel benchmarks
+
+The repository gates changes against a committed BenchmarkDotNet baseline,
+[`perf/h264-simd-perf-baseline-latest.json`](https://github.com/Proxeno/kiln/blob/main/perf/h264-simd-perf-baseline-latest.json),
+captured on an arm64 Mac:
+
+| Benchmark | Mean |
+|---|---:|
+| SATD 4×4 | 11.2 ns |
+| SATD 4×4 over 9 intra modes | 99.3 ns |
+| SAD 8×8 | 3.5 ns |
+| SAD 16×16 | 6.4 ns |
+| 16×16 motion search, range 8 | 76.4 µs |
+| P picture, 1280×720, 1 slice, near-static content | 2.24 ms |
+
+The last row uses near-static content, so it is a regression guard and not a number to size a
+deployment from.
+[docs/perf-gate.md](https://github.com/Proxeno/kiln/blob/main/docs/perf-gate.md) explains the gate.
+
+## Kiln or a native encoder?
+
+Native encoders such as x264 and OpenH264, and hardware encoders such as NVENC, Quick Sync and
+VideoToolbox, are faster and compress better. They implement Main and High profile tools that Kiln
+lacks (B-frames, CABAC, the 8×8 transform), and the software ones have had many years of tuning.
+This repository publishes no head-to-head measurements against them.
+
+Choose Kiln when what you need is:
+
+- **One managed dependency.** No native binary to build, sign or ship per platform, and no
+  P/Invoke. A NuGet reference is the whole deployment.
+- **Apache-2.0 source.** Kiln links no GPL or LGPL code.
+- **Low, predictable latency.** One frame in, one access unit out, no lookahead, a deterministic
+  bound on worst-case work, and a rate controller built for interactive streams.
+- **Baseline output.** Constrained Baseline is the H.264 profile every WebRTC endpoint that
+  offers H.264 must support.
+
+Choose a native or hardware encoder when you need the smallest stream for a given quality, High
+profile, the highest resolutions and frame rates on modest CPUs, or offline transcoding.
+
+One caution: Apache-2.0 covers Kiln's source code. It does not grant rights to patents on the
+H.264 standard that are held by third parties. Check whether your use needs a licence for those.
+
+## Sample, documentation and contributing
+
+- [`samples/Kiln.Capture`](https://github.com/Proxeno/kiln/tree/main/samples/Kiln.Capture) records
+  a camera to a playable `.m4v`, with capture, colour conversion, encoding and MP4 muxing all in
+  managed code:
+
+  ```
+  dotnet run --project samples/Kiln.Capture -- list
+  dotnet run --project samples/Kiln.Capture -- record --seconds 10 --output capture.m4v
+  ```
+
+- [docs/architecture.md](https://github.com/Proxeno/kiln/blob/main/docs/architecture.md) covers the
+  encode pipeline, slice threading, the SIMD kernel sets and the rate controller.
+- [docs/perf-gate.md](https://github.com/Proxeno/kiln/blob/main/docs/perf-gate.md) covers the
+  benchmark baseline and the regression gate.
+- [CONTRIBUTING.md](https://github.com/Proxeno/kiln/blob/main/CONTRIBUTING.md) covers building,
+  testing and the rules for contributions.
+- [SECURITY.md](https://github.com/Proxeno/kiln/blob/main/SECURITY.md) covers reporting a
+  vulnerability.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE). © Kiln contributors.
+Apache-2.0. See [LICENSE](https://github.com/Proxeno/kiln/blob/main/LICENSE). © Kiln contributors.
