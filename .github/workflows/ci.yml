@@ -8,6 +8,9 @@ on:
 
 jobs:
   build-test:
+    # GitHub-hosted CI. Skipped in any repository whose KILN_CI variable is 'self-hosted';
+    # those run self-hosted-ci.yml instead. Forks and this repository are unaffected.
+    if: vars.KILN_CI != 'self-hosted'
     strategy:
       fail-fast: false
       matrix:

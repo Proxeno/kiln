@@ -16,6 +16,9 @@ permissions:
 
 jobs:
   pack-publish:
+    # Publish only from Proxeno/kiln, the repository nuget.org Trusted Publishing is bound to.
+    # Forks and copies carrying the same tags never publish.
+    if: github.repository == 'Proxeno/kiln'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

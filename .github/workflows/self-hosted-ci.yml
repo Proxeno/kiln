@@ -1,0 +1,54 @@
+name: Self-hosted CI
+
+# Runs only in repositories whose KILN_CI variable is 'self-hosted', only on self-hosted runners,
+# and only for pull requests into main (plus manual dispatch). Everywhere else, ci.yml runs on
+# GitHub-hosted runners.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: self-hosted-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    if: vars.KILN_CI == 'self-hosted'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same three SIMD families as ci.yml: arm64 NEON/AdvSimd on macOS, x64 AVX2/SSSE3 on
+        # Linux and Windows. Runner labels select the intended machines.
+        include:
+          - name: linux-x64
+            runner: '["self-hosted","Linux","X64","build","playwright"]'
+          - name: windows-x64
+            runner: '["self-hosted","Windows","X64"]'
+          - name: macos-arm64
+            runner: '["self-hosted","macOS","ARM64","passwordlesssudo"]'
+    name: build-test (${{ matrix.name }})
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # MinVer needs tag history
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Restore
+        run: dotnet restore
+      - name: Build (warnings are errors)
+        run: dotnet build --no-restore -c Release
+      - name: Test
+        run: dotnet test --no-build -c Release --logger "trx" --results-directory artifacts/test-results
+      # Results are uploaded only on failure, kept 3 days, and never fail the job.
+      - name: Upload test results (failures only)
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.name }}
+          path: artifacts/test-results
+          retention-days: 3
