@@ -14,21 +14,21 @@ namespace Kiln.RateControl;
 /// session bit-exactly then requires replaying the recorded timings, not re-measuring.
 /// </para>
 /// </summary>
+/// <param name="LastEncodeDuration">How long the most recent frame took to encode (wall
+/// clock).</param>
+/// <param name="AverageEncodeDuration">Rolling average encode duration over the caller's chosen
+/// window.</param>
+/// <param name="PendingInputFrames">Raw input frames currently pending encoding in the caller's
+/// pipeline.</param>
+/// <param name="PendingEncodedFrames">Encoded frames waiting to be sent to the network.</param>
+/// <param name="DroppedInputFrames">Cumulative input frames dropped due to encoding
+/// backpressure.</param>
+/// <param name="DroppedEncodedFrames">Cumulative encoded frames dropped (e.g. network queue
+/// full).</param>
 public sealed record EncoderPipelineTimings(
-    /// <summary>How long the most recent frame took to encode (wall clock).</summary>
     TimeSpan LastEncodeDuration,
-
-    /// <summary>Rolling average encode duration over the caller's chosen window.</summary>
     TimeSpan AverageEncodeDuration,
-
-    /// <summary>Raw input frames currently pending encoding in the caller's pipeline.</summary>
     int PendingInputFrames = 0,
-
-    /// <summary>Encoded frames waiting to be sent to the network.</summary>
     int PendingEncodedFrames = 0,
-
-    /// <summary>Cumulative input frames dropped due to encoding backpressure.</summary>
     int DroppedInputFrames = 0,
-
-    /// <summary>Cumulative encoded frames dropped (e.g. network queue full).</summary>
     int DroppedEncodedFrames = 0);

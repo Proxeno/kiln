@@ -13,12 +13,12 @@ Keep PRs focused; unrelated changes are easier to review split apart.
 
 ## Checklist
 
-- [ ] `dotnet build` and `dotnet test` pass locally (see CONTRIBUTING.md)
-- [ ] SIMD changes keep scalar/SIMD parity tests green (NEON and AVX2/SSSE3 as applicable)
-- [ ] Perf-sensitive changes were checked against the committed baseline (`perf/`, see docs/perf-gate.md)
-- [ ] Spec-derived tables/constants carry their ITU-T H.264 clause/table citation
-- [ ] Public API changes are documented (README / XML docs)
-- [ ] Commits are scoped and messages explain the "why"
+- [ ] `dotnet build -c Release` reports zero warnings and `dotnet test -c Release` passes locally (see CONTRIBUTING.md)
+- [ ] SIMD changes keep the SIMD and scalar parity tests green, and new kernels come with a parity test
+- [ ] Performance-sensitive changes were checked with `scripts/h264-simd-perf-gate.sh` (see docs/perf-gate.md)
+- [ ] Tables and constants taken from the spec cite their ITU-T H.264 clause or table
+- [ ] Public API changes are reflected in the XML docs and, where relevant, the README
+- [ ] Commits are signed off (`git commit -s`), focused, and explain why the change is needed
 
 ## Notes for reviewers
 

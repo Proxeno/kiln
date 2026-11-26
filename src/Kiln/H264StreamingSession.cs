@@ -10,55 +10,46 @@ namespace Kiln;
 /// Per-frame outcome of <see cref="H264StreamingSession.EncodeFrame"/>: what was encoded, what the
 /// controller decided, and which parts of the decision the session could not apply by itself.
 /// </summary>
+/// <param name="BytesWritten">Annex B bytes written for this access unit.</param>
+/// <param name="WasIdr">True when this frame was coded as an IDR (scheduled, forced, or
+/// recovery-driven).</param>
+/// <param name="AppliedSliceQp">Slice luma QP the session applied (the controller's <c>BaseQp</c>,
+/// clamped to [0, 51]).</param>
+/// <param name="AppliedTargetBitsPerFrame">Picture bit budget the session applied
+/// (<c>TargetBitrateBps / TargetFps</c>).</param>
+/// <param name="AppliedSpeedMode">Speed mode in effect for this frame (applied before
+/// encoding).</param>
+/// <param name="ResolutionChangeRecommended">True when the controller recommends a different output
+/// resolution than the session is currently encoding (<see
+/// cref="Decision"/>.<c>Width</c>/<c>Height</c>). The session cannot rescale frames; the caller
+/// acts on it by supplying rescaled frames after calling
+/// <see cref="H264StreamingSession.ChangeResolution"/>. Until then the recommendation repeats.</param>
+/// <param name="IntraRefreshRequested">True when the recovery policy asked for gradual intra
+/// refresh instead of an IDR (typically a PLI/FIR during IDR cooldown). When the session's encoder
+/// options enable the feature (<see cref="H264BaselineEncoderOptions.IntraRefreshPeriodFrames"/>
+/// &gt; 0) the session acts on it — a refresh wave starts with this frame (or is queued behind an
+/// in-flight wave) via <see cref="H264BaselineEncoder.RequestIntraRefresh"/>. With the feature
+/// disabled the session encodes a normal frame and only surfaces the request; such callers should
+/// treat it as "recovery is pending until the cooldown permits the next IDR".</param>
+/// <param name="Decision">The full controller decision this frame was encoded under.</param>
+/// <param name="MotionComplexity">Content motion complexity of this frame in [0, 1] (see
+/// <see cref="H264BaselineEncoder.LastFrameMotionComplexity"/>).</param>
+/// <param name="TextureComplexity">Content texture complexity of this frame in [0, 1] (see
+/// <see cref="H264BaselineEncoder.LastFrameTextureComplexity"/>).</param>
+/// <param name="SceneChangeDetected">True when this frame's encoding detected a scene cut (see
+/// <see cref="H264BaselineEncoder.LastFrameSceneChange"/>). The controller reacts on the next frame: the
+/// recovery policy schedules an IDR there, subject to the IDR cooldown.</param>
 public readonly record struct H264StreamingEncodeResult(
-    /// <summary>Annex B bytes written for this access unit.</summary>
     int BytesWritten,
-
-    /// <summary>True when this frame was coded as an IDR (scheduled, forced, or recovery-driven).</summary>
     bool WasIdr,
-
-    /// <summary>Slice luma QP the session applied (the controller's <c>BaseQp</c>, clamped to [0, 51]).</summary>
     int AppliedSliceQp,
-
-    /// <summary>Picture bit budget the session applied (<c>TargetBitrateBps / TargetFps</c>).</summary>
     int AppliedTargetBitsPerFrame,
-
-    /// <summary>Speed mode in effect for this frame (applied before encoding).</summary>
     EncoderSpeedMode AppliedSpeedMode,
-
-    /// <summary>
-    /// True when the controller recommends a different output resolution than the session is
-    /// currently encoding (<see cref="Decision"/>.<c>Width</c>/<c>Height</c>). The session cannot
-    /// rescale frames; the caller acts on it by supplying rescaled frames after calling
-    /// <see cref="H264StreamingSession.ChangeResolution"/>. Until then the recommendation repeats.
-    /// </summary>
     bool ResolutionChangeRecommended,
-
-    /// <summary>
-    /// True when the recovery policy asked for gradual intra refresh instead of an IDR (typically a
-    /// PLI/FIR during IDR cooldown). When the session's encoder options enable the feature
-    /// (<see cref="H264BaselineEncoderOptions.IntraRefreshPeriodFrames"/> &gt; 0) the session acts
-    /// on it — a refresh wave starts with this frame (or is queued behind an in-flight wave) via
-    /// <see cref="H264BaselineEncoder.RequestIntraRefresh"/>. With the feature disabled the session
-    /// encodes a normal frame and only surfaces the request; such callers should treat it as
-    /// "recovery is pending until the cooldown permits the next IDR".
-    /// </summary>
     bool IntraRefreshRequested,
-
-    /// <summary>The full controller decision this frame was encoded under.</summary>
     EncoderAdaptationDecision Decision,
-
-    /// <summary>Content motion complexity of this frame in [0, 1]
-    /// (see <see cref="H264BaselineEncoder.LastFrameMotionComplexity"/>).</summary>
     double MotionComplexity,
-
-    /// <summary>Content texture complexity of this frame in [0, 1]
-    /// (see <see cref="H264BaselineEncoder.LastFrameTextureComplexity"/>).</summary>
     double TextureComplexity,
-
-    /// <summary>True when this frame's encoding detected a scene cut
-    /// (see <see cref="H264BaselineEncoder.LastFrameSceneChange"/>). The controller reacts on the
-    /// next frame: the recovery policy schedules an IDR there, subject to the IDR cooldown.</summary>
     bool SceneChangeDetected);
 
 /// <summary>
@@ -344,6 +335,7 @@ public sealed class H264StreamingSession : IDisposable
     /// encoder and its GOP position are not touched.</summary>
     public void ResetControllerState() => _controller.Reset();
 
+    /// <summary>Disposes the session and the encoder it owns.</summary>
     public void Dispose()
     {
         if (_disposed)

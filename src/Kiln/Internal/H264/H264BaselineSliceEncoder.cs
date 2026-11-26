@@ -370,7 +370,7 @@ internal sealed class H264BaselineSliceEncoder
         _chromaDcRdLambda = _chromaDcRdLambdaUserOverride
             ? chromaDcRdLambda
             : H264ChromaDcScale.DefaultChromaDcRdLambdaFromLumaQp(_qp);
-        // Lambda for SAD-domain mode RDO. With the full Intra4x4 9-mode set (Junior-C) live, the
+        // Lambda for SAD-domain mode RDO. With the full Intra4x4 9-mode set live, the
         // bit-cost penalty becomes meaningful — SAD-pure selection over-fits to directional modes
         // whose residuals quantize worse than DC/V/H. See LambdaSadForQp for the QP-indexed table
         // tuned against the committed golden fixtures.
@@ -2040,7 +2040,7 @@ internal sealed class H264BaselineSliceEncoder
         // consumption is this slice's own accumulated search effort, so the tier for a given MB
         // depends only on previously encoded MBs of the same slice — never on wall clock or thread
         // scheduling. Each tier sheds the costliest remaining content-scaled term first (measured
-        // on divergent-motion 1080p, notes/07): the 65x65 exhaustive fallback, then the second
+        // on divergent-motion 1080p): the 65x65 exhaustive fallback, then the second
         // reference and the wide seed window, then the sub-partition shapes entirely. Encoder
         // search policy only; every output remains a normatively valid P-macroblock.
         var seedSearchRangeThisMb = 32;
@@ -3887,9 +3887,9 @@ internal sealed class H264BaselineSliceEncoder
             // Phase 4 — variance fast-path: skip directional modes 3–8 for low-activity blocks.
             var isFlat = H264VarianceFastPath.IsLowVariance4x4(srcBlk, threshold: H264VarianceFastPath.VarianceThreshold);
 
-            // All 9 Intra_4x4 modes (0..8) per H.264 8.3.1.2 are now bit-exact against the senior's
-            // per-(x,y) parity oracle (see H264Intra4x4PredictorParityTests). Junior-C verified modes
-            // 4..8 needed no code change; this widening lets the encoder consider the full mode set.
+            // All 9 Intra_4x4 modes (0..8) per H.264 8.3.1.2 are bit-exact against the per-(x,y)
+            // parity oracle (see H264Intra4x4PredictorParityTests), so the encoder considers the
+            // full mode set.
             var numValid = 0;
             for (var cand = 0; cand <= 8; cand++)
             {

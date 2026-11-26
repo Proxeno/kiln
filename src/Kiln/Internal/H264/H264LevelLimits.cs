@@ -2,9 +2,8 @@ namespace Kiln.Internal.H264;
 
 /// <summary>
 /// Annex A (Table A-1) level limits for the H.264 levels that Kiln may signal.
-/// Only the frame-size (MaxFS) constraint is enforced here; MaxMBPS, MaxBR, MaxCPB
-/// and HRD conformance are documented as intentionally not enforced (no VUI HRD
-/// present — see <c>24-annex-e-vui-hrd-presence.md</c>).
+/// Only the frame-size (MaxFS) constraint is enforced here. MaxMBPS, MaxBR, MaxCPB
+/// and HRD conformance are intentionally not enforced: the SPS carries no HRD parameters.
 /// </summary>
 /// <remarks>
 /// Validation is best-effort: if <c>levelIdc</c> is unknown to this table, the check
