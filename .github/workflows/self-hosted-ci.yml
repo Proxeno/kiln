@@ -30,6 +30,10 @@ jobs:
             runner: '["self-hosted","macOS","ARM64","passwordlesssudo"]'
     name: build-test (${{ matrix.name }})
     runs-on: ${{ fromJSON(matrix.runner) }}
+    env:
+      # Self-hosted runners don't run as root, so install the SDK into the runner's own tool cache
+      # instead of setup-dotnet's system default (e.g. /usr/share/dotnet).
+      DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
     steps:
       - uses: actions/checkout@v4
         with:
