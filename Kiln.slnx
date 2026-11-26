@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/bench/">
+    <Project Path="bench/Kiln.AbHarness/Kiln.AbHarness.csproj" />
     <Project Path="bench/Kiln.Benchmarks/Kiln.Benchmarks.csproj" />
   </Folder>
   <Folder Name="/samples/">

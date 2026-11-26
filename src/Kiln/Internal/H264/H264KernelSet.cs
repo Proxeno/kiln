@@ -5,7 +5,13 @@ namespace Kiln.Internal.H264;
 
 internal static class H264KernelSet
 {
-    public static IH264KernelSet CreateBest()
+    /// <summary>
+    /// The best kernel set this CPU supports. The measurement hook is applied here so a benchmark
+    /// decorator wraps whichever set the encoder would otherwise have used.
+    /// </summary>
+    public static IH264KernelSet CreateBest() => H264KernelSetHooks.Decorate(CreateBestCore());
+
+    private static IH264KernelSet CreateBestCore()
     {
         if (Avx2.IsSupported) return new Avx2KernelSet();
         if (Ssse3.IsSupported) return new Ssse3KernelSet();
