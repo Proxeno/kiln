@@ -19,7 +19,7 @@ jobs:
     # Publish only from Proxeno/kiln, the repository nuget.org Trusted Publishing is bound to.
     # Forks and copies carrying the same tags never publish.
     if: github.repository == 'Proxeno/kiln'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,6 +27,8 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
       - name: Build
         run: dotnet build -c Release src/Kiln/Kiln.csproj
         env:

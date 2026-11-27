@@ -8,16 +8,24 @@ on:
 
 jobs:
   build-test:
-    # GitHub-hosted CI. Skipped in any repository whose KILN_CI variable is 'self-hosted';
+    # Self-hosted CI (owner, 2026-11-27: no GitHub-hosted minutes). Skipped in any repository whose KILN_CI variable is 'self-hosted';
     # those run self-hosted-ci.yml instead. Forks and this repository are unaffected.
     if: vars.KILN_CI != 'self-hosted'
     strategy:
       fail-fast: false
       matrix:
-        # SIMD paths differ per arch: macos-latest is arm64 (NEON/AdvSimd),
-        # ubuntu/windows are x64 (AVX2/SSSE3). All three must stay green.
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        # SIMD paths differ per arch: macOS is arm64 (NEON/AdvSimd),
+        # Linux/Windows are x64 (AVX2/SSSE3). All three must stay green.
+        # `docker` keeps Linux off the weft-vast-ci boxes; `passwordlesssudo` selects the Mac mini.
+        include:
+          - os: linux
+            runs_on: [self-hosted, Linux, X64, docker]
+          - os: windows
+            runs_on: [self-hosted, Windows, X64]
+          - os: macos
+            runs_on: [self-hosted, macOS, ARM64, passwordlesssudo]
+    name: build-test (${{ matrix.os }})
+    runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,6 +33,8 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
       - name: Restore
         run: dotnet restore
       - name: Build (warnings are errors)
